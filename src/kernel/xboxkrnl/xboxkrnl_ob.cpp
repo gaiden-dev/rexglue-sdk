@@ -84,6 +84,11 @@ dword_result_t ObLookupThreadByThreadId_entry(dword_t thread_id,
   return X_STATUS_SUCCESS;
 }
 
+// Stub
+dword_result_t ObReferenceObject_entry() {
+    return X_STATUS_SUCCESS;
+}
+
 dword_result_t ObReferenceObjectByHandle_entry(dword_t handle,
                                                dword_t object_type_ptr,
                                                lpdword_t out_object_ptr) {
@@ -179,6 +184,11 @@ dword_result_t ObDeleteSymbolicLink_entry(pointer_t<X_ANSI_STRING> path_ptr) {
   return X_STATUS_SUCCESS;
 }
 
+// Stub
+dword_result_t ObIsTitleObject_entry() {
+    return X_STATUS_SUCCESS;
+}
+
 dword_result_t NtDuplicateObject_entry(dword_t handle, lpdword_t new_handle_ptr,
                                        dword_t options) {
   // NOTE: new_handle_ptr can be zero to just close a handle.
@@ -215,10 +225,12 @@ dword_result_t NtClose_entry(dword_t handle) {
 GUEST_FUNCTION_HOOK(__imp__ObOpenObjectByName, rex::kernel::xboxkrnl::ObOpenObjectByName_entry)
 GUEST_FUNCTION_HOOK(__imp__ObOpenObjectByPointer, rex::kernel::xboxkrnl::ObOpenObjectByPointer_entry)
 GUEST_FUNCTION_HOOK(__imp__ObLookupThreadByThreadId, rex::kernel::xboxkrnl::ObLookupThreadByThreadId_entry)
+GUEST_FUNCTION_HOOK(__imp__ObReferenceObject, rex::kernel::xboxkrnl::ObReferenceObject_entry)
 GUEST_FUNCTION_HOOK(__imp__ObReferenceObjectByHandle, rex::kernel::xboxkrnl::ObReferenceObjectByHandle_entry)
 GUEST_FUNCTION_HOOK(__imp__ObReferenceObjectByName, rex::kernel::xboxkrnl::ObReferenceObjectByName_entry)
 GUEST_FUNCTION_HOOK(__imp__ObDereferenceObject, rex::kernel::xboxkrnl::ObDereferenceObject_entry)
 GUEST_FUNCTION_HOOK(__imp__ObCreateSymbolicLink, rex::kernel::xboxkrnl::ObCreateSymbolicLink_entry)
 GUEST_FUNCTION_HOOK(__imp__ObDeleteSymbolicLink, rex::kernel::xboxkrnl::ObDeleteSymbolicLink_entry)
+GUEST_FUNCTION_HOOK(__imp__ObIsTitleObject, rex::kernel::xboxkrnl::ObIsTitleObject_entry)
 GUEST_FUNCTION_HOOK(__imp__NtDuplicateObject, rex::kernel::xboxkrnl::NtDuplicateObject_entry)
 GUEST_FUNCTION_HOOK(__imp__NtClose, rex::kernel::xboxkrnl::NtClose_entry)

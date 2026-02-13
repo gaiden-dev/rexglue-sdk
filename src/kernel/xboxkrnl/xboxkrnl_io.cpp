@@ -728,6 +728,16 @@ dword_result_t NtDeviceIoControlFile_entry(
   return X_STATUS_SUCCESS;
 }
 
+// Stub
+dword_result_t IoDismountVolume_entry() {
+    return X_STATUS_SUCCESS;
+}
+
+// Stub
+dword_result_t IoInvalidDeviceRequest_entry() {
+    return X_STATUS_SUCCESS;
+}
+
 dword_result_t IoCreateDevice_entry(dword_t device_struct, dword_t r4,
                                     dword_t r5, dword_t r6, dword_t r7,
                                     lpdword_t out_struct) {
@@ -750,6 +760,16 @@ dword_result_t IoCreateDevice_entry(dword_t device_struct, dword_t r4,
   return X_STATUS_SUCCESS;
 }
 
+// Stub
+dword_result_t IoDeleteDevice_entry() {
+    return X_STATUS_SUCCESS;
+}
+
+// Stub
+dword_result_t IoCompleteRequest_entry() {
+    return X_STATUS_SUCCESS;
+}
+
 dword_result_t IoDismountVolumeByFileHandle_entry(dword_t handle) {
   REXKRNL_WARN("IoDismountVolumeByFileHandle({:#x}) - stub", (uint32_t)handle);
   return X_STATUS_SUCCESS;
@@ -758,6 +778,21 @@ dword_result_t IoDismountVolumeByFileHandle_entry(dword_t handle) {
 dword_result_t IoDismountVolumeByName_entry(pointer_t<X_ANSI_STRING> name) {
   REXKRNL_WARN("IoDismountVolumeByName - stub");
   return X_STATUS_SUCCESS;
+}
+
+// Stub
+dword_result_t IoCheckShareAccess_entry() {
+    return X_STATUS_SUCCESS;
+}
+
+// Stub
+dword_result_t IoSetShareAccess_entry() {
+    return X_STATUS_SUCCESS;
+}
+
+// Stub
+dword_result_t IoRemoveShareAccess_entry() {
+    return X_STATUS_SUCCESS;
 }
 
 dword_result_t IoSynchronousDeviceIoControlRequest_entry(
@@ -800,9 +835,16 @@ GUEST_FUNCTION_HOOK(__imp__NtQuerySymbolicLinkObject, rex::kernel::xboxkrnl::NtQ
 GUEST_FUNCTION_HOOK(__imp__FscGetCacheElementCount, rex::kernel::xboxkrnl::FscGetCacheElementCount_entry)
 GUEST_FUNCTION_HOOK(__imp__FscSetCacheElementCount, rex::kernel::xboxkrnl::FscSetCacheElementCount_entry)
 GUEST_FUNCTION_HOOK(__imp__NtDeviceIoControlFile, rex::kernel::xboxkrnl::NtDeviceIoControlFile_entry)
+GUEST_FUNCTION_HOOK(__imp__IoDismountVolume, rex::kernel::xboxkrnl::IoDismountVolume_entry)
+GUEST_FUNCTION_HOOK(__imp__IoInvalidDeviceRequest, rex::kernel::xboxkrnl::IoInvalidDeviceRequest_entry)
 GUEST_FUNCTION_HOOK(__imp__IoCreateDevice, rex::kernel::xboxkrnl::IoCreateDevice_entry)
+GUEST_FUNCTION_HOOK(__imp__IoDeleteDevice, rex::kernel::xboxkrnl::IoDeleteDevice_entry)
+GUEST_FUNCTION_HOOK(__imp__IoCompleteRequest, rex::kernel::xboxkrnl::IoCompleteRequest_entry)
 GUEST_FUNCTION_HOOK(__imp__IoDismountVolumeByFileHandle, rex::kernel::xboxkrnl::IoDismountVolumeByFileHandle_entry)
 GUEST_FUNCTION_HOOK(__imp__IoDismountVolumeByName, rex::kernel::xboxkrnl::IoDismountVolumeByName_entry)
+GUEST_FUNCTION_HOOK(__imp__IoCheckShareAccess, rex::kernel::xboxkrnl::IoCheckShareAccess_entry)
+GUEST_FUNCTION_HOOK(__imp__IoSetShareAccess, rex::kernel::xboxkrnl::IoSetShareAccess_entry)
+GUEST_FUNCTION_HOOK(__imp__IoRemoveShareAccess, rex::kernel::xboxkrnl::IoRemoveShareAccess_entry)
 GUEST_FUNCTION_HOOK(__imp__IoSynchronousDeviceIoControlRequest, rex::kernel::xboxkrnl::IoSynchronousDeviceIoControlRequest_entry)
 GUEST_FUNCTION_HOOK(__imp__StfsCreateDevice, rex::kernel::xboxkrnl::StfsCreateDevice_entry)
 GUEST_FUNCTION_HOOK(__imp__StfsControlDevice, rex::kernel::xboxkrnl::StfsControlDevice_entry)

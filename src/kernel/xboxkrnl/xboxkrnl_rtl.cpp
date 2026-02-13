@@ -106,6 +106,11 @@ dword_result_t RtlLowerChar_entry(dword_t in) {
   return c;
 }
 
+// Stub
+dword_result_t RtlUpcaseUnicodeChar_entry() {
+    return 0; // ?
+}
+
 dword_result_t RtlCompareString_entry(lpstring_t string_1, lpstring_t string_2,
                                       dword_t case_insensitive) {
   int ret = case_insensitive ? rex::string::compare_case(string_1, string_2)
@@ -626,6 +631,7 @@ GUEST_FUNCTION_HOOK(__imp__RtlCompareMemoryUlong, rex::kernel::xboxkrnl::RtlComp
 GUEST_FUNCTION_HOOK(__imp__RtlFillMemoryUlong, rex::kernel::xboxkrnl::RtlFillMemoryUlong_entry)
 GUEST_FUNCTION_HOOK(__imp__RtlUpperChar, rex::kernel::xboxkrnl::RtlUpperChar_entry)
 GUEST_FUNCTION_HOOK(__imp__RtlLowerChar, rex::kernel::xboxkrnl::RtlLowerChar_entry)
+GUEST_FUNCTION_HOOK(__imp__RtlUpcaseUnicodeChar, rex::kernel::xboxkrnl::RtlUpcaseUnicodeChar_entry)
 GUEST_FUNCTION_HOOK(__imp__RtlCompareString, rex::kernel::xboxkrnl::RtlCompareString_entry)
 GUEST_FUNCTION_HOOK(__imp__RtlCompareStringN, rex::kernel::xboxkrnl::RtlCompareStringN_entry)
 GUEST_FUNCTION_HOOK(__imp__RtlInitAnsiString, rex::kernel::xboxkrnl::RtlInitAnsiString_entry)
