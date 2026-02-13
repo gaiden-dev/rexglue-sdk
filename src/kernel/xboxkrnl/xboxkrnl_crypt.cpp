@@ -235,6 +235,16 @@ typedef struct {
 } XECRYPT_RSA;
 static_assert_size(XECRYPT_RSA, 0x10);
 
+// Stub
+dword_result_t XeCryptBnQwBeSigVerify_entry() {
+    return 0;
+}
+
+// Stub
+dword_result_t XeCryptRotSumSha_entry() {
+    return 0;
+}
+
 dword_result_t XeCryptBnQwNeRsaPubCrypt_entry(pointer_t<uint64_t> qw_a,
                                               pointer_t<uint64_t> qw_b,
                                               pointer_t<XECRYPT_RSA> rsa) {
@@ -645,6 +655,11 @@ dword_result_t XeKeysObscureKey_entry(lpvoid_t input, lpvoid_t output) {
   return X_STATUS_SUCCESS;
 }
 
+// Stub
+dword_result_t XeKeysGetKey_entry() {
+    return X_STATUS_SUCCESS;
+}
+
 dword_result_t XeKeysHmacShaUsingKey_entry(lpvoid_t obscured_key,
                                            lpvoid_t inp_1, dword_t inp_1_size,
                                            lpvoid_t inp_2, dword_t inp_2_size,
@@ -690,6 +705,8 @@ GUEST_FUNCTION_HOOK(__imp__XeCryptSha256Init, rex::kernel::xboxkrnl::XeCryptSha2
 GUEST_FUNCTION_HOOK(__imp__XeCryptSha256Update, rex::kernel::xboxkrnl::XeCryptSha256Update_entry)
 GUEST_FUNCTION_HOOK(__imp__XeCryptSha256Final, rex::kernel::xboxkrnl::XeCryptSha256Final_entry)
 GUEST_FUNCTION_HOOK(__imp__XeCryptBnQw_SwapDwQwLeBe, rex::kernel::xboxkrnl::XeCryptBnQw_SwapDwQwLeBe_entry)
+GUEST_FUNCTION_HOOK(__imp__XeCryptBnQwBeSigVerify, rex::kernel::xboxkrnl::XeCryptBnQwBeSigVerify_entry)
+GUEST_FUNCTION_HOOK(__imp__XeCryptRotSumSha, rex::kernel::xboxkrnl::XeCryptRotSumSha_entry)
 GUEST_FUNCTION_HOOK(__imp__XeCryptBnQwNeRsaPubCrypt, rex::kernel::xboxkrnl::XeCryptBnQwNeRsaPubCrypt_entry)
 GUEST_FUNCTION_HOOK(__imp__XeCryptBnDwLePkcs1Verify, rex::kernel::xboxkrnl::XeCryptBnDwLePkcs1Verify_entry)
 GUEST_FUNCTION_HOOK(__imp__XeCryptRandom, rex::kernel::xboxkrnl::XeCryptRandom_entry)
@@ -704,6 +721,7 @@ GUEST_FUNCTION_HOOK(__imp__XeCryptHmacSha, rex::kernel::xboxkrnl::XeCryptHmacSha
 GUEST_FUNCTION_HOOK(__imp__XeKeysHmacSha, rex::kernel::xboxkrnl::XeKeysHmacSha_entry)
 GUEST_FUNCTION_HOOK(__imp__XeKeysAesCbcUsingKey, rex::kernel::xboxkrnl::XeKeysAesCbcUsingKey_entry)
 GUEST_FUNCTION_HOOK(__imp__XeKeysObscureKey, rex::kernel::xboxkrnl::XeKeysObscureKey_entry)
+GUEST_FUNCTION_HOOK(__imp__XeKeysGetKey, rex::kernel::xboxkrnl::XeKeysGetKey_entry)
 GUEST_FUNCTION_HOOK(__imp__XeKeysHmacShaUsingKey, rex::kernel::xboxkrnl::XeKeysHmacShaUsingKey_entry)
 GUEST_FUNCTION_HOOK(__imp__XeKeysConsolePrivateKeySign, rex::kernel::xboxkrnl::XeKeysConsolePrivateKeySign_entry)
 GUEST_FUNCTION_HOOK(__imp__XeKeysConsoleSignatureVerification, rex::kernel::xboxkrnl::XeKeysConsoleSignatureVerification_entry)

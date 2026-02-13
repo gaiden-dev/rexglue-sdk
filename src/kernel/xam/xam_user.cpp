@@ -523,6 +523,21 @@ dword_result_t XamShowSigninUI_entry(dword_t unk, dword_t unk_mask) {
   return X_ERROR_SUCCESS;
 }
 
+// Stub
+dword_result_t XamShowGamerCardUIForXUID_entry() {
+    return X_ERROR_SUCCESS;
+}
+
+// Stub
+dword_result_t XamShowMarketplaceUI_entry() {
+    return X_ERROR_SUCCESS;
+}
+
+// Stub
+dword_result_t XamUserCreateStatsEnumerator_entry() {
+    return X_ERROR_SUCCESS;
+}
+
 // TODO(gibbed): probably a FILETIME/LARGE_INTEGER, unknown currently
 struct X_ACHIEVEMENT_UNLOCK_TIME {
   rex::be<uint32_t> unk_0;
@@ -770,6 +785,9 @@ GUEST_FUNCTION_HOOK(__imp__XamUserIsOnlineEnabled, rex::kernel::xam::XamUserIsOn
 GUEST_FUNCTION_HOOK(__imp__XamUserGetMembershipTier, rex::kernel::xam::XamUserGetMembershipTier_entry)
 GUEST_FUNCTION_HOOK(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFriends_entry)
 GUEST_FUNCTION_HOOK(__imp__XamShowSigninUI, rex::kernel::xam::XamShowSigninUI_entry)
+GUEST_FUNCTION_HOOK(__imp__XamShowGamerCardUIForXUID, rex::kernel::xam::XamShowGamerCardUIForXUID_entry)
+GUEST_FUNCTION_HOOK(__imp__XamShowMarketplaceUI, rex::kernel::xam::XamShowMarketplaceUI_entry)
+GUEST_FUNCTION_HOOK(__imp__XamUserCreateStatsEnumerator, rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 GUEST_FUNCTION_HOOK(__imp__XamUserCreateAchievementEnumerator, rex::kernel::xam::XamUserCreateAchievementEnumerator_entry)
 GUEST_FUNCTION_HOOK(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
 GUEST_FUNCTION_HOOK(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_entry)
