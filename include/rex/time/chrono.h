@@ -24,11 +24,6 @@ namespace chrono {
 
 using hundrednanoseconds = std::chrono::duration<int64_t, hundrednano>;
 
-// https://docs.microsoft.com/en-us/windows/win32/sysinfo/converting-a-time-t-value-to-a-file-time
-//  Don't forget the 89 leap days.
-static constexpr std::chrono::seconds seconds_1601_to_1970 =
-    (396 * 365 + 89) * std::chrono::seconds(60 * 60 * 24);
-
 // TODO(JoelLinn) define xstead_clock xsystem_clock etc.
 
 namespace detail {

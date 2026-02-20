@@ -18,7 +18,6 @@
 #include <rex/time/chrono.h>
 
 using rex::chrono::WinSystemClock;
-using rex::chrono::seconds_1601_to_1970;
 
 // =============================================================================
 // Known FILETIME constants
@@ -45,13 +44,6 @@ TEST_CASE("unix_epoch_delta computes correct 1601-to-1970 offset", "[chrono]") {
   // The delta should be negative (1601 is before 1970)
   CHECK(WinSystemClock::unix_epoch_delta().count() == -expected_seconds);
   CHECK(WinSystemClock::unix_epoch_delta().count() < 0);
-}
-
-TEST_CASE("seconds_1601_to_1970 constant matches its formula", "[chrono]") {
-  // NOTE: chrono.h uses 396 in the formula (known discrepancy with the
-  // 369-year span). This test pins the current constant value.
-  constexpr int64_t formula_seconds = (396LL * 365 + 89) * 86400LL;
-  CHECK(seconds_1601_to_1970.count() == formula_seconds);
 }
 
 // =============================================================================
