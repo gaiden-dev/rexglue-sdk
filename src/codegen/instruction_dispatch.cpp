@@ -106,6 +106,9 @@ static const std::unordered_map<int, Builder>& GetDispatchTable()
 		{ PPC_INST_CRNOR, build_crnor },
         { PPC_INST_CROR, build_cror },
         { PPC_INST_CRORC, build_crorc },
+		{ PPC_INST_CRXOR, build_crxor },
+
+        //=====================================================================
         // Comparison
         //=====================================================================
         { PPC_INST_CMPD, build_cmpd },

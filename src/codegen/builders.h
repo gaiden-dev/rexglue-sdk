@@ -109,6 +109,8 @@ bool build_crnand(BuilderContext& ctx);
 bool build_crnor(BuilderContext& ctx);
 bool build_cror(BuilderContext& ctx);
 bool build_crorc(BuilderContext& ctx);
+bool build_crxor(BuilderContext& ctx);
+
 // Equivalence (XNOR)
 bool build_eqv(BuilderContext& ctx);
 

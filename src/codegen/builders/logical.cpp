@@ -558,4 +558,11 @@ bool build_crorc(BuilderContext& ctx)
     return true;
 }
 
+bool build_crxor(BuilderContext& ctx)
+{
+    // crxor: CR[crD] = CR[crA] ^ CR[crB]
+    emitCRBitOperation(ctx, "^");
+    return true;
+}
+
 } // namespace rexglue::codegen::builders
