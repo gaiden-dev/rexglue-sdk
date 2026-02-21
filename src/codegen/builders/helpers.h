@@ -83,6 +83,57 @@ inline void emitRecordFormCompare(BuilderContext& ctx)
     }
 }
 
+/**
+ * Emit a CR bit operation: crD = crA <op> crB
+ *
+ * CR bit operations work on individual CR bits (0-31). This helper:
+ * - Maps bit indices to CR field (0-7) and field bit (0-3)
+ * - Emits code to access CR fields by bit name
+ *
+ * @param ctx The builder context
+ * @param op The operation symbol as a string (e.g., "|", "&", "^")
+ * @param invertA If true, invert the value of crA before the operation
+ * @param invertB If true, invert the value of crB before the operation
+ * @param invertResult If true, invert the final result before storing in crD
+ */
+inline void emitCRBitOperation(BuilderContext& ctx, std::string_view op,
+    bool invertA = false, bool invertB = false, bool invertResult = false)
+{
+    uint32_t crD = ctx.insn.operands[0];
+    uint32_t crA = ctx.insn.operands[1];
+    uint32_t crB = ctx.insn.operands[2];
+
+    uint32_t crField_D = crD / 4;
+    uint32_t crBit_D = crD % 4;
+    uint32_t crField_A = crA / 4;
+    uint32_t crBit_A = crA % 4;
+    uint32_t crField_B = crB / 4;
+    uint32_t crBit_B = crB % 4;
+
+    std::string aExpr = fmt::format(
+        "{}.{}",
+        ctx.cr(crField_A),
+        crBitName(crBit_A));
+
+    std::string bExpr = fmt::format(
+        "{}.{}",
+        ctx.cr(crField_B),
+        crBitName(crBit_B));
+
+    if (invertA) 
+        aExpr = "!(" + aExpr + ")";
+    if (invertB) 
+        bExpr = "!(" + bExpr + ")";
+
+    std::string expr = fmt::format("{} {} {}", aExpr, op, bExpr);
+
+    if (invertResult)
+        expr = "!(" + expr + ")";
+
+    ctx.println("\t{}.{} = {};",
+        ctx.cr(crField_D), crBitName(crBit_D), expr);
+}
+
 //=============================================================================
 // Memory Operation Helpers
 //=============================================================================
