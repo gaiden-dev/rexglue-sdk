@@ -362,13 +362,19 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (valid_flags) {
         valid_flags[i] |= valid_bits;
       }
-      uint64_t old_gpu_written = system_page_flags_valid_and_gpu_written_[i];
-      uint64_t new_gpu_written =
-          written_by_gpu ? (old_gpu_written | valid_bits) : (old_gpu_written & ~valid_bits);
-      if (new_gpu_written != old_gpu_written) {
-        system_page_flags_valid_and_gpu_written_[i] = new_gpu_written;
+      uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+      valid_flags[i] |= valid_bits;
+      if (written_by_gpu) {
+        system_page_flags_valid_and_gpu_written_[i] |= valid_bits;
+        // Mark as dirty to trigger copy in
+        // SetSystemPageBlocksValidWithGpuDataWritten.
         gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
-        dirty_blocks_.fetch_or(uint32_t(1) << (i >> 6), std::memory_order_relaxed);
+        // Mark the specific 64-entry block as dirty for partial copying.
+        // Each bit in dirty_blocks_ represents 64 entries (i >> 6).
+        uint32_t dirty_block_bit = 1u << (i >> 6);
+        dirty_blocks_.fetch_or(dirty_block_bit, std::memory_order_relaxed);
+      } else {
+        system_page_flags_valid_and_gpu_written_[i] &= ~valid_bits;
       }
     }
   }
