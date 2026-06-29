@@ -97,7 +97,18 @@ void Sleep(std::chrono::microseconds duration) {
   if (duration.count() < 100) {
     MaybeYield();
   } else {
-    ::Sleep(static_cast<DWORD>(duration.count() / 1000));
+    uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+    static uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+    static uint64_t threshold_ticks = double(guest_tick_frequency) / 1000 * 2;
+    uint64_t target_time = current_time + double(guest_tick_frequency) / 1000000 * duration.count();
+    while (current_time < target_time - threshold_ticks) {
+      ::Sleep(1);
+      current_time = chrono::Clock::QueryGuestTickCount();
+    }
+    while (current_time < target_time) {
+      _mm_pause();
+      current_time = chrono::Clock::QueryGuestTickCount();
+    }
   }
 }
 

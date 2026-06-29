@@ -35,6 +35,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#include <fstream>
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
@@ -798,8 +800,19 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   if (reader->read_count() < count * sizeof(uint32_t)) {
+    static bool firstTime = true;
+    if (firstTime) {
+      firstTime = false;
+      auto exe_dir = rex::filesystem::GetExecutableFolder();
+      std::ofstream stream(exe_dir / "RingBufferDump.bin", std::ios::binary);
+      if (stream) {
+        stream.write((char*)reader->buffer(), reader->capacity());
+      }
+    }
     REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
                  reader->read_count(), count * sizeof(uint32_t));
+    REXGPU_ERROR("(read offset {:08X}, write offset {:08X}", reader->read_offset(),
+                 reader->write_offset());
     return false;
   }
 
@@ -1176,7 +1189,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          //rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          rex::thread::MaybeYield();
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

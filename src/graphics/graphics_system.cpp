@@ -166,11 +166,21 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
+          //while (current_time - last_frame_time >= interval_ticks) {
+          //  MarkVblank();
+          //  last_frame_time += interval_ticks;
+          //}
+          //rex::thread::Sleep(std::chrono::milliseconds(1));
+          uint64_t time_delta = current_time - last_frame_time;
+          if (time_delta >= interval_ticks) {
+            if (time_delta > interval_ticks * 2) {
+              last_frame_time = current_time;
+            } else {
+              last_frame_time += interval_ticks;
+            }
             MarkVblank();
-            last_frame_time += interval_ticks;
+            rex::thread::Sleep(std::chrono::microseconds(1000000 * interval_ticks / guest_tick_frequency));
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
         }
         return 0;
       }));
