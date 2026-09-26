@@ -158,3 +158,7 @@ if(REXGLUE_USE_D3D12)
         dxguid
     )
 endif()
+
+if(UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    target_compile_options(rexgpu-xenos PRIVATE -mssse3)
+endif()

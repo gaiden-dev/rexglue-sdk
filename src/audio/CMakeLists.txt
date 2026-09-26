@@ -39,3 +39,7 @@ target_link_libraries(rexaudio
     PUBLIC rexcore SDL3::SDL3
     PRIVATE libavcodec libavutil
 )
+
+if(UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    target_compile_options(rexaudio PRIVATE -mssse3)
+endif()

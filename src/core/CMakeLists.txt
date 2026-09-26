@@ -135,3 +135,7 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
 endif()
+
+if(UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
+    target_compile_options(rexcore PRIVATE -mssse3)
+endif()
