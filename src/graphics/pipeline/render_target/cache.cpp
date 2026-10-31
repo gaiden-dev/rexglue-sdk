@@ -1393,13 +1393,15 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
           "Created a {}x{} {}xMSAA {} render target with guest format {} at "
           "EDRAM base {}",
           width, height, uint32_t(1) << uint32_t(key.msaa_samples),
-          key.is_depth ? "depth" : "color", uint32_t(key.resource_format), uint32_t(key.base_tiles));
+          key.is_depth ? "depth" : "color", uint32_t(key.resource_format),
+          uint32_t(key.base_tiles));
     } else {
       REXGPU_ERROR(
           "Failed to create a {}x{} {}xMSAA {} render target with guest format "
           "{} at EDRAM base {}",
           width, height, uint32_t(1) << uint32_t(key.msaa_samples),
-          key.is_depth ? "depth" : "color", uint32_t(key.resource_format), uint32_t(key.base_tiles));
+          key.is_depth ? "depth" : "color", uint32_t(key.resource_format),
+          uint32_t(key.base_tiles));
     }
     // Insert even if failed to create, not to try to create again.
     render_targets_.emplace(key, render_target);

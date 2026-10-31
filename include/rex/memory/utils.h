@@ -354,9 +354,8 @@ class FixedVMemVector {
 
  public:
   FixedVMemVector()
-      : data_(reinterpret_cast<uint8_t*>(memory::AllocFixed(nullptr, sz,
-                                                            memory::AllocationType::kReserveCommit,
-                                                            memory::PageAccess::kReadWrite))),
+      : data_(reinterpret_cast<uint8_t*>(memory::AllocFixed(
+            nullptr, sz, memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite))),
         nbytes_(0) {}
   ~FixedVMemVector() {
     if (data_) {

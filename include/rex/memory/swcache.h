@@ -31,13 +31,25 @@
 namespace rex::swcache {
 
 #if REX_COMPILER_CLANG == 1 || REX_COMPILER_GNUC == 1
-REX_FORCEINLINE static void PrefetchW(const void* addr) { __builtin_prefetch(addr, 1, 0); }
-REX_FORCEINLINE static void PrefetchNTA(const void* addr) { __builtin_prefetch(addr, 0, 0); }
-REX_FORCEINLINE static void PrefetchL3(const void* addr) { __builtin_prefetch(addr, 0, 1); }
-REX_FORCEINLINE static void PrefetchL2(const void* addr) { __builtin_prefetch(addr, 0, 2); }
-REX_FORCEINLINE static void PrefetchL1(const void* addr) { __builtin_prefetch(addr, 0, 3); }
+REX_FORCEINLINE static void PrefetchW(const void* addr) {
+  __builtin_prefetch(addr, 1, 0);
+}
+REX_FORCEINLINE static void PrefetchNTA(const void* addr) {
+  __builtin_prefetch(addr, 0, 0);
+}
+REX_FORCEINLINE static void PrefetchL3(const void* addr) {
+  __builtin_prefetch(addr, 0, 1);
+}
+REX_FORCEINLINE static void PrefetchL2(const void* addr) {
+  __builtin_prefetch(addr, 0, 2);
+}
+REX_FORCEINLINE static void PrefetchL1(const void* addr) {
+  __builtin_prefetch(addr, 0, 3);
+}
 #elif REX_ARCH_AMD64 == 1 && REX_COMPILER_MSVC == 1
-REX_FORCEINLINE static void PrefetchW(const void* addr) { _m_prefetchw(addr); }
+REX_FORCEINLINE static void PrefetchW(const void* addr) {
+  _m_prefetchw(addr);
+}
 REX_FORCEINLINE static void PrefetchNTA(const void* addr) {
   _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_NTA);
 }
@@ -129,9 +141,15 @@ REX_FORCEINLINE static void WriteLine(CacheLine* REX_RESTRICT destination,
   _mm256_storeu_ps(&destination->floats[8], high);
 }
 
-REX_FORCEINLINE static void WriteFence() { _mm_sfence(); }
-REX_FORCEINLINE static void ReadFence() { _mm_lfence(); }
-REX_FORCEINLINE static void ReadWriteFence() { _mm_mfence(); }
+REX_FORCEINLINE static void WriteFence() {
+  _mm_sfence();
+}
+REX_FORCEINLINE static void ReadFence() {
+  _mm_lfence();
+}
+REX_FORCEINLINE static void ReadWriteFence() {
+  _mm_mfence();
+}
 #else
 union alignas(REX_HOST_CACHE_LINE_SIZE) CacheLine {
   uint8_t bvals[REX_HOST_CACHE_LINE_SIZE];

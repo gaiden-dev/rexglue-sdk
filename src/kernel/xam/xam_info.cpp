@@ -304,8 +304,8 @@ u32 XamAlloc_entry(u32 flags, u32 size, mapped_u32 out_ptr) {
   if (flags != 0) {
     static std::atomic<uint32_t> s_flagLogs{0};
     if (s_flagLogs.fetch_add(1, std::memory_order_relaxed) < 4)
-      REXKRNL_INFO("XamAlloc(flags={:08X}, size={}) - nonzero flags accepted",
-                   (uint32_t)flags, (uint32_t)size);
+      REXKRNL_INFO("XamAlloc(flags={:08X}, size={}) - nonzero flags accepted", (uint32_t)flags,
+                   (uint32_t)size);
   }
 
   // Allocate from the heap. Not sure why XAM does this specially, perhaps

@@ -143,9 +143,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
 
   // Frame limiter thread.
   frame_limiter_worker_running_ = true;
-  frame_limiter_worker_thread_ = system::object_ref<system::XHostThread>(new system::XHostThread(
-      kernel_state_, 128 * 1024, 0,
-      [this]() {
+  frame_limiter_worker_thread_ = system::object_ref<system::XHostThread>(
+      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         uint64_t normalized_framerate_limit = std::max<uint64_t>(0, REXCVAR_GET(framerate_limit));
 
         // If VSYNC is enabled, but frames are not limited,
@@ -299,8 +298,8 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
       return 0x08100748;
     case 0x0F01:  // RB_BC_CONTROL
       return 0x0000200E;
-    case 0x1951:  // interrupt status
-      return 1;   // vblank
+    case 0x1951:    // interrupt status
+      return 1;     // vblank
     case 0x1961: {  // AVIVO_D1MODE_VIEWPORT_SIZE
       // ReXGlue: screen res from the guest video mode (VdQueryVideoMode).
       // maximum [width(0x0FFF), height(0x0FFF)]

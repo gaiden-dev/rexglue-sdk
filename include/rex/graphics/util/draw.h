@@ -554,9 +554,9 @@ union ResolveCopyDestCoordinateInfo {
   struct {
     // 0...16384/32.
     uint32_t pitch_aligned_div_32 : xenos::kTexture2DCubeMaxWidthHeightLog2 + 2 -
-        xenos::kTextureTileWidthHeightLog2;
+                                    xenos::kTextureTileWidthHeightLog2;
     uint32_t height_aligned_div_32 : xenos::kTexture2DCubeMaxWidthHeightLog2 + 2 -
-        xenos::kTextureTileWidthHeightLog2;
+                                     xenos::kTextureTileWidthHeightLog2;
 
     // Up to the maximum period of the texture tiled address function (128x128
     // for 2D 1bpb).

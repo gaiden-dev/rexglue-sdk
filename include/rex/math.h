@@ -352,9 +352,15 @@ REX_FORCEINLINE static uint32_t ArchFloatMaskSignbit(ArchFloatMask x) {
 }
 constexpr ArchFloatMask floatmask_zero{.0f};
 #else
-static float ArchMin(float x, float y) { return std::min<float>(x, y); }
-static float ArchMax(float x, float y) { return std::max<float>(x, y); }
-static float ArchReciprocal(float den) { return 1.0f / den; }
+static float ArchMin(float x, float y) {
+  return std::min<float>(x, y);
+}
+static float ArchMax(float x, float y) {
+  return std::max<float>(x, y);
+}
+static float ArchReciprocal(float den) {
+  return 1.0f / den;
+}
 using ArchFloatMask = unsigned;
 REX_FORCEINLINE static ArchFloatMask ArchCmpneqFloatMask(float x, float y) {
   return static_cast<unsigned>(-static_cast<signed>(x != y));
@@ -369,7 +375,9 @@ REX_FORCEINLINE static ArchFloatMask ArchANDFloatMask(ArchFloatMask x, ArchFloat
   return x & y;
 }
 constexpr ArchFloatMask floatmask_zero = 0;
-REX_FORCEINLINE static uint32_t ArchFloatMaskSignbit(ArchFloatMask x) { return x >> 31; }
+REX_FORCEINLINE static uint32_t ArchFloatMaskSignbit(ArchFloatMask x) {
+  return x >> 31;
+}
 #endif
 REX_FORCEINLINE static float RefineReciprocal(float initial, float den) {
   float t0 = initial * den;

@@ -1585,15 +1585,13 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
     builder.addMemberName(type_struct_in_gl_per_vertex, member_in_gl_per_vertex_clip_distance,
                           "gl_ClipDistance");
     builder.addMemberDecoration(type_struct_in_gl_per_vertex, member_in_gl_per_vertex_clip_distance,
-                                spv::DecorationBuiltIn,
-                                static_cast<int>(spv::BuiltInClipDistance));
+                                spv::DecorationBuiltIn, static_cast<int>(spv::BuiltInClipDistance));
   }
   if (cull_distance_count) {
     builder.addMemberName(type_struct_in_gl_per_vertex, member_in_gl_per_vertex_cull_distance,
                           "gl_CullDistance");
     builder.addMemberDecoration(type_struct_in_gl_per_vertex, member_in_gl_per_vertex_cull_distance,
-                                spv::DecorationBuiltIn,
-                                static_cast<int>(spv::BuiltInCullDistance));
+                                spv::DecorationBuiltIn, static_cast<int>(spv::BuiltInCullDistance));
   }
   builder.addDecoration(type_struct_in_gl_per_vertex, spv::DecorationBlock);
   spv::Id type_array_in_gl_per_vertex =
