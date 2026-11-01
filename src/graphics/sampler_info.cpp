@@ -10,7 +10,6 @@
  */
 
 #include <cstring>
-#include <memory>
 
 #include <rex/graphics/sampler_info.h>
 #include <rex/hash.h>

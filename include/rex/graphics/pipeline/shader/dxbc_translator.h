@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -8,8 +9,6 @@
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
-
-#pragma once
 
 #include <cstddef>
 #include <cstring>
@@ -111,7 +110,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    static constexpr uint32_t kVersion = 0x20260819;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -137,6 +136,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // however, always using SV_Depth rather than SV_DepthLessEqual because
       // rounding up results in a bigger value. Same viewport usage rules apply.
       kFloat24Rounding,
+      // Host RT shader polygon offset for suspected coplanar redraws with tiny
+      // biases. Writes the biased depth from the pixel shader and zeroes fixed
+      // function depth bias to avoid host slope/quantization quirks. This path
+      // is controlled by depth_bias_shader_offset.
+      kPolygonOffset,
+      kFloat24TruncatingPolygonOffset,
+      kFloat24RoundingPolygonOffset,
     };
 
     uint64_t value;
@@ -153,8 +159,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t output_point_size : 1;
       // Dynamically indexable register count from SQ_PROGRAM_CNTL.
       uint32_t dynamic_addressable_register_count : 8;
-      // PA_CL_CLIP_CNTL::ps_ucp_mode for point primitives.
-      uint32_t point_ps_ucp_mode : 2;
+      uint32_t : 2;
       // uint32_t 1.
       // Pipeline stage and input configuration.
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
@@ -175,7 +180,18 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
-      DepthStencilMode depth_stencil_mode : 2;
+      DepthStencilMode depth_stencil_mode : 3;
+      // For host render targets with MIN/MAX blend op - the source blend factor
+      // to pre-multiply the shader output by (since D3D12 MIN/MAX ignores blend
+      // factors, but Xbox 360 applies them). kOne means no pre-multiply.
+      // Only RT0 is supported for now.
+      xenos::BlendFactor rt0_blend_rgb_factor_for_premult : 5;
+      xenos::BlendFactor rt0_blend_a_factor_for_premult : 5;
+      // PsParamGen and the memexport dedup must act like there's no resolution
+      // scaling. Doesn't affect fetch offsets, those follow texture scale, not
+      // from the draw. This is only set when the draw is native because of a
+      // set scale threshold (RTV only).
+      uint32_t resolution_scale_native : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -305,7 +321,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // components of each of the 32 used texture fetch constants.
     uint32_t texture_swizzled_signs[8];
 
-    // Whether each texture in fetch constants is resolution-scaled.
+    // Whether each texture in fetch constants contains resolution-scaled data.
     uint32_t textures_resolution_scaled;
     // Log2 of X and Y sample size. Used for alpha to mask, and for MSAA with
     // ROV, this is used for EDRAM address calculation.
@@ -318,7 +334,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
     uint32_t alpha_to_mask;
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
-    uint32_t padding_edram_depth_base_dwords_scaled;
+    // UINT32_MAX when this draw is outside an active ZPD segment. The shader
+    // helper should treat that as a skip sentinel.
+    uint32_t zpd_rov_counter_index;
 
     float color_exp_bias[4];
 
@@ -388,6 +406,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1
+    // bit 4 = signed
+    // bit 5 = unsigned-biased
+    // bit 24 = normalized
+    // Zero means no scale.
+    uint32_t texture_integer_scale_bits[32];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -420,6 +447,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kAlphaToMask,
       kEdram32bppTilePitchDwordsScaled,
       kEdramDepthBaseDwordsScaled,
+      kZpdRovCounterIndex,
 
       kColorExpBias,
 
@@ -439,6 +467,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kTextureIntegerScaleBits,
 
       kCount,
     };
@@ -502,6 +532,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   enum class UAVRegister {
     kSharedMemory,
     kEdram,
+    kZpdRovCounter,
   };
 
   uint64_t GetDefaultVertexShaderModification(
@@ -547,7 +578,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
                                     uint32_t f32_temp_component, uint32_t temp_temp,
                                     uint32_t temp_temp_component, bool round_to_nearest_even,
                                     bool remap_from_0_to_0_5);
-  // Converts the 20e4 number in bits [f24_shift, f24_shift + 10) to a 32-bit
+  // Converts the 20e4 number in bits [f24_shift, f24_shift + 24) to a 32-bit
   // float. Two temporaries must be different, but one can be the same as the
   // source. The destination may be anything writable. If remap_to_0_to_0_5 is
   // true, 0...1 in float24 will be remaped to 0...0.5 in float32.
@@ -691,6 +722,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // With ROV, need to store it to write later.
       return true;
     }
+    if (DSV_IsApplyingPolygonOffset()) {
+      // Shader polygon offset for needs raster depth derivatives, so we have to
+      // stash the system-temp depth/stencil before guest control flow starts
+      // branching or killing fragments.
+      return true;
+    }
     return false;
   }
   // Whether the current non-ROV pixel shader should convert the depth to 20e4.
@@ -701,7 +738,21 @@ class DxbcShaderTranslator : public ShaderTranslator {
     Modification::DepthStencilMode depth_stencil_mode =
         GetDxbcShaderModification().pixel.depth_stencil_mode;
     return depth_stencil_mode == Modification::DepthStencilMode::kFloat24Truncating ||
-           depth_stencil_mode == Modification::DepthStencilMode::kFloat24Rounding;
+           depth_stencil_mode == Modification::DepthStencilMode::kFloat24TruncatingPolygonOffset ||
+           depth_stencil_mode == Modification::DepthStencilMode::kFloat24Rounding ||
+           depth_stencil_mode == Modification::DepthStencilMode::kFloat24RoundingPolygonOffset;
+  }
+  // Whether the current non-ROV pixel shader applies polygon offset via shader
+  // depth output instead of fixed function bias.
+  bool DSV_IsApplyingPolygonOffset() const {
+    if (edram_rov_used_) {
+      return false;
+    }
+    Modification::DepthStencilMode depth_stencil_mode =
+        GetDxbcShaderModification().pixel.depth_stencil_mode;
+    return depth_stencil_mode == Modification::DepthStencilMode::kPolygonOffset ||
+           depth_stencil_mode == Modification::DepthStencilMode::kFloat24TruncatingPolygonOffset ||
+           depth_stencil_mode == Modification::DepthStencilMode::kFloat24RoundingPolygonOffset;
   }
   // Whether it's possible and worth skipping running the translated shader for
   // 2x2 quads.
@@ -726,6 +777,20 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // unchanged or known that it's safe not to await kills/alphatest/AtoC),
   // returns from the shader.
   void ROV_DepthStencilTest();
+  // Adds the surviving coverage MSAA counts from ROV params into the counter
+  // slot selected by the ZPD ROV counter index, after the final PS
+  // depth/stencil decision. ZPD segments and borrowed VIZ surveys both route
+  // through that index.
+  void ROV_AddPassedMSAASamplesToCounter();
+  // Converts the float32 components of the register to extended-range float16
+  // in their low 16 bits. Exponent 31 holds finite values up to 131008 of
+  // either sign on the Xbox 360 instead of Inf or NaN, and NaN maps to 0.
+  // Pushes and pops its own temporary registers.
+  void Float32ToF16ExtendedRange(uint32_t reg, uint32_t components);
+  // Converts extended-range float16 in the low 16 bits of the components of
+  // the register, with zeros above, back to float32. Pushes and pops its own
+  // temporary registers.
+  void Float16ExtendedRangeTo32(uint32_t reg, uint32_t components);
   // Unpacks a 32bpp or a 64bpp color in packed_temp.packed_temp_components to
   // color_temp, using 2 temporary VGPRs.
   void ROV_UnpackColor(uint32_t rt_index, uint32_t packed_temp, uint32_t packed_temp_components,
@@ -880,6 +945,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
   void ProcessVectorAluOperation(const ParsedAluInstruction& instr,
                                  uint8_t memexport_eM_potentially_written_before,
                                  uint32_t& result_swizzle, bool& predicate_written);
+  // Reduces finite host approximations to a chosen mantissa width.
+  // We still don't know the exact precision or rounding.
+  void ReduceFloatPrecision(const dxbc::Dest& dest, const dxbc::Src& value, uint32_t mantissa_bits);
   void ProcessScalarAluOperation(const ParsedAluInstruction& instr,
                                  uint8_t memexport_eM_potentially_written_before,
                                  bool& predicate_written);
@@ -926,7 +994,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
   bool edram_rov_used_;
 
   // Whether with RTV-based output-merger, k_8_8_8_8_GAMMA render targets are
-  // stored as 8-bit with shader-side gamma conversion.
+  // represented as host 8-bit unsigned normalized, and require conversion in
+  // translated shaders.
   bool gamma_render_target_as_unorm8_;
 
   // Whether 2x MSAA is emulated using real 2x MSAA rather than two samples of
@@ -936,6 +1005,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Guest pixel host width / height.
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+
+  // Scale of the draw being translated. All position-dependent paths use
+  // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
+  uint32_t GetCurrentDrawResolutionScaleX() const {
+    return is_pixel_shader() && GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_x_;
+  }
+  uint32_t GetCurrentDrawResolutionScaleY() const {
+    return is_pixel_shader() && GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_y_;
+  }
 
   // Is currently writing the empty depth-only pixel shader, for
   // CompleteTranslation.
@@ -1152,6 +1234,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t uav_count_;
   uint32_t uav_index_shared_memory_;
   uint32_t uav_index_edram_;
+  uint32_t uav_index_zpd_rov_counter_;
 
   std::vector<SamplerBinding> sampler_bindings_;
 };

@@ -10,13 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <cstdint>
-#include <mutex>
-#include <utility>
-#include <vector>
-
 #include <rex/memory.h>
-#include <rex/thread/mutex.h>
 
 namespace rex::graphics {
 
@@ -31,11 +25,19 @@ class SharedMemory {
   virtual ~SharedMemory();
   // Call in the implementation-specific ClearCache.
   virtual void ClearCache();
-  void SetSystemPageBlocksValidWithGpuDataWritten();
+  virtual void SetSystemPageBlocksValidWithGpuDataWritten();
+  // ReXGlue: marks every page as not valid on the host (GraphicsSystem::InvalidateGpuMemory).
   void InvalidateAllPages();
 
-  typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
-                                      void* context, uint32_t address_first, uint32_t address_last,
+  // ReXGlue: guest physical address to host pointer for callers outside the
+  // SharedMemory hierarchy (texture replacement hashing and dumping).
+  template <typename T = const uint8_t*>
+  T TranslatePhysical(uint32_t guest_address) const {
+    return memory().TranslatePhysical<T>(guest_address);
+  }
+
+  typedef void (*GlobalWatchCallback)(const global_unique_lock_type& global_lock, void* context,
+                                      uint32_t address_first, uint32_t address_last,
                                       bool invalidated_by_gpu);
   typedef void* GlobalWatchHandle;
   // Registers a callback invoked when something is invalidated in the GPU
@@ -48,9 +50,8 @@ class SharedMemory {
   // The callback is called within the global critical region.
   GlobalWatchHandle RegisterGlobalWatch(GlobalWatchCallback callback, void* callback_context);
   void UnregisterGlobalWatch(GlobalWatchHandle handle);
-  typedef void (*WatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
-                                void* context, void* data, uint64_t argument,
-                                bool invalidated_by_gpu);
+  typedef void (*WatchCallback)(const global_unique_lock_type& global_lock, void* context,
+                                void* data, uint64_t argument, bool invalidated_by_gpu);
   typedef void* WatchHandle;
   // Registers a callback invoked when the specified memory range is invalidated
   // in the GPU memory copy by the CPU or (if triggered explicitly - such as by
@@ -76,8 +77,20 @@ class SharedMemory {
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
-  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  // Returns whether every page in the range is currently valid in the host GPU
+  // memory copy. Hold the global critical region if relying on this for state
+  // transitions such as watch installation.
+  bool IsRangeValid(uint32_t start, uint32_t length) const;
+
+  void TryFindUploadRange(const uint32_t& block_first, const uint32_t& block_last,
+                          const uint32_t& page_first, const uint32_t& page_last,
+                          uint32_t& range_start, unsigned int& current_upload_range,
+                          std::pair<uint32_t, uint32_t>* uploads);
+
+  void TryGetNextUploadRange(uint32_t& range_start, uint64_t& block_valid, const uint32_t& i,
+                             unsigned int& current_upload_range,
+                             std::pair<uint32_t, uint32_t>* uploads);
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -98,7 +111,7 @@ class SharedMemory {
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
-  void InitializeCommon();
+  bool InitializeCommon();
   void InitializeSparseHostGpuMemory(uint32_t granularity_log2);
   // Call last in implementation-specific shutdown, also callable from the
   // destructor.
@@ -137,8 +150,22 @@ class SharedMemory {
   // MakeRangeValid has page granularity). upload_page_ranges are sorted in
   // ascending address order, so front and back can be used to determine the
   // overall bounds of pages to be uploaded.
-  virtual bool UploadRanges(
-      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+  virtual bool UploadRanges(const std::pair<uint32_t, uint32_t>* upload_page_ranges,
+                            uint32_t num_upload_ranges) = 0;
+
+  const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
+    return trace_download_ranges_;
+  }
+  uint32_t trace_download_page_count() const { return trace_download_page_count_; }
+  // Fills trace_download_ranges() and trace_download_page_count() with
+  // GPU-written ranges that need to be downloaded, and also invalidates
+  // non-GPU-written ranges so only the needed data - not the all the collected
+  // data - will be written in the trace. trace_download_page_count() will be 0
+  // if nothing to download.
+  void PrepareForTraceDownload();
+  // Release memory used for trace download ranges, to be called after
+  // downloading or in cases when download is dropped.
+  void ReleaseTraceDownloadRanges();
 
  private:
   memory::Memory& memory_;
@@ -156,26 +183,37 @@ class SharedMemory {
 
   void* memory_invalidation_callback_handle_ = nullptr;
   void* memory_data_provider_handle_ = nullptr;
+  static constexpr unsigned int MAX_UPLOAD_RANGES = 65536;
 
   // Ranges that need to be uploaded, generated by GetRangesToUpload (a
   // persistently allocated vector).
-  std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+  // std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+  FixedVMemVector<MAX_UPLOAD_RANGES * sizeof(std::pair<uint32_t, uint32_t>)> upload_ranges_;
 
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing
   // watches.
-  rex::thread::global_critical_region global_critical_region_;
+  static constexpr rex::global_critical_region global_critical_region_{};
 
   // ***************************************************************************
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
 
-  // Pages whose contents in the buffer are in sync with guest memory.
-  std::vector<uint64_t> system_page_flags_valid_;
-  // Subset of valid pages containing data written by the GPU.
-  std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
-  uint32_t num_system_page_flags_ = 0;
+  struct SystemPageFlagsBlock {
+    // Whether each page is up to date in the GPU buffer.
+    uint64_t valid;
+    // Subset of valid pages - whether each page in the GPU buffer contains data
+    // that was written on the GPU, thus should not be invalidated spuriously.
+    uint64_t valid_and_gpu_written;
+  };
 
+  // chrispy: todo, systempageflagsblock should be 3 different arrays
+  //  Flags for each 64 system pages, interleaved as blocks, so bit scan can be
+  //  used to quickly extract ranges.
+  // std::vector<SystemPageFlagsBlock> system_page_flags_;
+
+  uint64_t *system_page_flags_valid_ = nullptr, *system_page_flags_valid_and_gpu_written_ = nullptr;
+  unsigned num_system_page_flags_ = 0;
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
 
@@ -230,6 +268,11 @@ class SharedMemory {
   uint32_t watch_node_current_pool_allocated_ = 0;
   WatchRange* watch_range_first_free_ = nullptr;
   WatchNode* watch_node_first_free_ = nullptr;
+
+  // GPU-written memory downloading for traces. <Start address, length>.
+  std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
+  uint32_t trace_download_page_count_ = 0;
+
   // Triggers the watches (global and per-range), removing triggered range
   // watches.
   void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);

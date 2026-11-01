@@ -9,12 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <memory>
-#include <utility>
-#include <vector>
-
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
+#include <rex/graphics/pipeline/shader/spirv_compatibility.h>
 
 namespace rex::graphics {
 
@@ -92,8 +89,18 @@ spv::Id SpirvBuilder::createTriBuiltinCall(spv::Id result_type, spv::Id builtins
   return result;
 }
 
-SpirvBuilder::IfBuilder::IfBuilder(spv::Id condition, unsigned int control, SpirvBuilder& builder,
-                                   unsigned int thenWeight, unsigned int elseWeight)
+spv::Id SpirvBuilder::smearFloatConstant(float value, spv::Id value_type) {
+  spv::Id scalar = makeFloatConstant(value);
+  if (!isVectorType(value_type)) {
+    return scalar;
+  }
+  std::vector<spv::Id> components(size_t(getNumTypeComponents(value_type)), scalar);
+  return makeCompositeConstant(value_type, components);
+}
+
+SpirvBuilder::IfBuilder::IfBuilder(spv::Id condition, spv::SelectionControlMask control,
+                                   SpirvBuilder& builder, unsigned int thenWeight,
+                                   unsigned int elseWeight)
     : builder(builder),
       condition(condition),
       control(control),
@@ -124,8 +131,7 @@ void SpirvBuilder::IfBuilder::makeBeginElse(bool branchToMerge) {
   assert_true(currentBranch == Branch::kThen);
 #endif
 
-  // A block may have only one terminator, and glslang's createBranch appends
-  // unconditionally - check here, like SwitchBuilder::endSegment does.
+  // ReXGlue: the vendored glslang's createBranch would add a second terminator.
   if (branchToMerge && !builder.getBuildPoint()->isTerminated()) {
     // Close out the "then" by having it jump to the mergeBlock.
     thenPhiParent = builder.getBuildPoint()->getId();
@@ -149,7 +155,7 @@ void SpirvBuilder::IfBuilder::makeEndIf(bool branchToMerge) {
   assert_true(currentBranch == Branch::kThen || currentBranch == Branch::kElse);
 #endif
 
-  // Don't add a second terminator, as in makeBeginElse.
+  // ReXGlue: as in makeBeginElse.
   if (branchToMerge && !builder.getBuildPoint()->isTerminated()) {
     // Jump to the merge block.
     (elseBlock ? elsePhiParent : thenPhiParent) = builder.getBuildPoint()->getId();
@@ -191,7 +197,8 @@ spv::Id SpirvBuilder::IfBuilder::createMergePhi(spv::Id then_variable,
                               getThenPhiParent(), else_variable, getElsePhiParent());
 }
 
-SpirvBuilder::SwitchBuilder::SwitchBuilder(spv::Id selector, unsigned int selection_control,
+SpirvBuilder::SwitchBuilder::SwitchBuilder(spv::Id selector,
+                                           spv::SelectionControlMask selection_control,
                                            SpirvBuilder& builder)
     : builder_(builder),
       selector_(selector),

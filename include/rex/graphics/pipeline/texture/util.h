@@ -12,18 +12,24 @@
 
 #include <algorithm>
 
+#include <rex/graphics/pipeline/texture/address.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/xenos.h>
 #include <rex/math.h>
 
-namespace rex::graphics::texture_util {
+namespace rex::graphics {
+namespace texture_util {
 
 // This namespace replaces texture_extent and most of texture_info for
 // simplicity.
 
+// TODO(Triang3l): Move most of the addressing calculations to
+// `texture_address.h` and clean them up based on the actual internals of the
+// tiling.
+
 // Extracts the size from the fetch constant, and also cleans up addresses and
-// mip range based on real presence of the base level and mips. Returns 6 faces
-// for cube textures.
+// mip range based on the base and mip addresses and guest mip levels. Returns 6
+// faces for cube textures.
 void GetSubresourcesFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
                                       uint32_t* width_minus_1_out, uint32_t* height_minus_1_out,
                                       uint32_t* depth_or_array_size_minus_1_out,
@@ -281,30 +287,34 @@ void GetTextureTotalSize(xenos::DataDimension dimension, uint32_t base_pitch_tex
 int32_t GetTiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytes_per_block_log2);
 int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, uint32_t height,
                          uint32_t bytes_per_block_log2);
+
 // Because (0, 0, 0) within each 32x32x4-block tile is stored in memory first,
 // and the tiled address grows monotonically with Z/4, then Y/32, then X/32
 // blocks.
-inline uint32_t GetTiledAddressLowerBound2D(uint32_t left, uint32_t top, uint32_t pitch,
+inline uint32_t GetTiledAddressLowerBound2D(uint32_t left, uint32_t top, uint32_t pitch_aligned,
                                             uint32_t bytes_per_block_log2) {
-  return uint32_t(GetTiledOffset2D(int32_t(left & ~(xenos::kTextureTileWidthHeight - 1)),
-                                   int32_t(top & ~(xenos::kTextureTileWidthHeight - 1)), pitch,
-                                   bytes_per_block_log2));
+  return uint32_t(texture_address::Tiled2D(int32_t(left & ~(xenos::kTextureTileWidthHeight - 1)),
+                                           int32_t(top & ~(xenos::kTextureTileWidthHeight - 1)),
+                                           pitch_aligned, bytes_per_block_log2));
 }
-inline uint32_t GetTiledAddressLowerBound3D(uint32_t left, uint32_t top, uint32_t front,
-                                            uint32_t pitch, uint32_t height,
+inline uint64_t GetTiledAddressLowerBound3D(uint32_t left, uint32_t top, uint32_t front,
+                                            uint32_t pitch_aligned, uint32_t height_aligned,
                                             uint32_t bytes_per_block_log2) {
-  return uint32_t(GetTiledOffset3D(int32_t(left & ~(xenos::kTextureTileWidthHeight - 1)),
-                                   int32_t(top & ~(xenos::kTextureTileWidthHeight - 1)),
-                                   int32_t(front & ~(xenos::kTextureTileDepth)), pitch, height,
-                                   bytes_per_block_log2));
+  return uint64_t(texture_address::Tiled3D(int32_t(left & ~(xenos::kTextureTileWidthHeight - 1)),
+                                           int32_t(top & ~(xenos::kTextureTileWidthHeight - 1)),
+                                           int32_t(front & ~(xenos::kTextureTileDepth)),
+                                           pitch_aligned, height_aligned, bytes_per_block_log2));
 }
 // Supporting the right > pitch and bottom > height (in tiles) cases also, for
 // estimation how far addresses can actually go even potentially beyond the
 // subresource stride.
-uint32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t pitch,
+REX_NOINLINE
+REX_NOALIAS
+uint32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t pitch_aligned,
                                      uint32_t bytes_per_block_log2);
-uint32_t GetTiledAddressUpperBound3D(uint32_t right, uint32_t bottom, uint32_t back, uint32_t pitch,
-                                     uint32_t height, uint32_t bytes_per_block_log2);
+uint64_t GetTiledAddressUpperBound3D(uint32_t right, uint32_t bottom, uint32_t back,
+                                     uint32_t pitch_aligned, uint32_t height_aligned,
+                                     uint32_t bytes_per_block_log2);
 
 // Returns four packed TextureSign values swizzled according to the swizzle in
 // the fetch constant, so the shader can apply TextureSigns after reading a
@@ -329,4 +339,5 @@ void GetClampModesForDimension(const xenos::xe_gpu_texture_fetch_t& fetch,
                                xenos::ClampMode& clamp_x_out, xenos::ClampMode& clamp_y_out,
                                xenos::ClampMode& clamp_z_out);
 
-}  // namespace rex::graphics::texture_util
+}  // namespace texture_util
+}  // namespace rex::graphics

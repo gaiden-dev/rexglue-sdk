@@ -66,7 +66,8 @@ class global_critical_region {
   }
 
   // Acquires a lock on the global critical section.
-  inline std::unique_lock<std::recursive_mutex> Acquire() {
+  // Static so it can also be called on a constexpr instance or by type name.
+  static std::unique_lock<std::recursive_mutex> Acquire() {
     return std::unique_lock<std::recursive_mutex>(mutex());
   }
 
@@ -83,3 +84,9 @@ class global_critical_region {
 };
 
 }  // namespace rex::thread
+
+namespace rex {
+// Unqualified spellings used by code ported from xenia-canary.
+using thread::global_critical_region;
+using global_unique_lock_type = std::unique_lock<std::recursive_mutex>;
+}  // namespace rex

@@ -10,7 +10,6 @@
  */
 
 #include <cstring>
-#include <utility>
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/shader.h>

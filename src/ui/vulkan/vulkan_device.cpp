@@ -204,6 +204,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
+  bool ext_1_2_EXT_host_query_reset = false;
   bool ext_1_1_KHR_maintenance1 = false;
   bool ext_1_2_KHR_shader_float_controls = false;
   bool ext_EXT_fragment_shader_interlock = false;
@@ -224,6 +225,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_sampler_ycbcr_conversion, 1, 1)
       // #198. Also must be enabled for VK_KHR_spirv_1_4.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float_controls, 1, 2)
+      XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(EXT_host_query_reset, 1, 2)
+      // #82. GPU predication for VIZ_QUERY conditional rendering.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_conditional_rendering)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #55.
@@ -305,6 +309,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
+  VulkanFeatures<VkPhysicalDeviceHostQueryResetFeatures,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES>
+      features_EXT_host_query_reset;
   VulkanFeatures<VkPhysicalDeviceVulkan13Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>
       features_1_3;
@@ -330,6 +337,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceCustomBorderColorFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT>
       features_EXT_custom_border_color;
+  VulkanFeatures<VkPhysicalDeviceConditionalRenderingFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT>
+      features_EXT_conditional_rendering;
   VkPhysicalDeviceCustomBorderColorPropertiesEXT properties_EXT_custom_border_color = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
@@ -339,6 +349,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
       features_1_2.Link(supported_features_2, device_create_info);
+    } else if (ext_1_2_EXT_host_query_reset) {
+      features_EXT_host_query_reset.Link(supported_features_2, device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
       features_1_3.Link(supported_features_2, device_create_info);
@@ -372,6 +384,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       features_EXT_custom_border_color.Link(supported_features_2, device_create_info);
       properties_EXT_custom_border_color.pNext = properties_2.pNext;
       properties_2.pNext = &properties_EXT_custom_border_color;
+    }
+    if (device->extensions_.ext_EXT_conditional_rendering) {
+      features_EXT_conditional_rendering.Link(supported_features_2, device_create_info);
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
@@ -650,12 +665,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+      XE_UI_VULKAN_FEATURE_2(features_1_2, hostQueryReset);
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
     }
+    if (ext_1_2_EXT_host_query_reset && with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_EXT_host_query_reset, hostQueryReset);
+    }
   }
+  device->extensions_.ext_1_2_EXT_host_query_reset = ext_1_2_EXT_host_query_reset;
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
     if (with_gpu_emulation) {
@@ -685,6 +705,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, separateStencilMaskRef)
       XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset,
                              shaderSampleRateInterpolationFunctions)
+      XE_UI_VULKAN_FEATURE_2(features_KHR_portability_subset, triangleFans)
     }
   } else {
     // Not a portability subset device.
@@ -694,6 +715,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE_IMPLIED(pointPolygons)
     XE_UI_VULKAN_FEATURE_IMPLIED(separateStencilMaskRef)
     XE_UI_VULKAN_FEATURE_IMPLIED(shaderSampleRateInterpolationFunctions)
+    XE_UI_VULKAN_FEATURE_IMPLIED(triangleFans)
   }
 
   if (ext_1_2_KHR_shader_float_controls) {
@@ -728,6 +750,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_EXT_robustness2) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
+    }
+  }
+
+  if (device->extensions_.ext_EXT_conditional_rendering) {
+    if (with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_EXT_conditional_rendering, conditionalRendering)
     }
   }
 
@@ -772,6 +800,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include <rex/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc>
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
   }
+  if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+#include <rex/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc>
+  }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
@@ -791,6 +822,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #include <rex/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc>
     }
   }
+  if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+    if (device->extensions_.ext_1_2_EXT_host_query_reset) {
+#include <rex/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc>
+    }
+  }
   if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 3, 0)) {
     if (device->extensions_.ext_1_3_KHR_dynamic_rendering) {
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
@@ -801,6 +837,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+  }
+  if (device->extensions_.ext_EXT_conditional_rendering) {
+#include <rex/ui/vulkan/functions/device_ext_conditional_rendering.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

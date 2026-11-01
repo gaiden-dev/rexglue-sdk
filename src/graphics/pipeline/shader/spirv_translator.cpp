@@ -9,22 +9,25 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
 
 #include <SPIRV/GLSL.std.450.h>
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/shader/spirv_compatibility.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_BOOL(spirv_disable_rounding_mode_rte, false, "GPU",
+                    "Disable RoundingModeRTE capability in SPIR-V shaders. Enable this to "
+                    "allow shader debugging in RenderDoc, which doesn't support this "
+                    "capability.");
 
 namespace rex::graphics {
 
@@ -41,8 +44,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
-      demote_to_helper_invocation(all),
-      sample_rate_shading(all) {}
+      demote_to_helper_invocation(all) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -58,8 +60,7 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
-      demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
-      sample_rate_shading(vulkan_device->properties().sampleRateShading) {
+      demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -97,7 +98,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
   Shader shader(xenos::ShaderType::kPixel, 0, nullptr, 0);
   string::StringBuffer instruction_disassembly_buffer;
   shader.AnalyzeUcode(instruction_disassembly_buffer);
-  Modification modification(GetDefaultPixelShaderModification(0));
+  Modification modification(0);
   modification.pixel.depth_stencil_mode = depth_stencil_mode;
   Shader::Translation& translation = *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);
@@ -112,31 +113,30 @@ void SpirvShaderTranslator::Reset() {
 
   uniform_float_constants_ = spv::NoResult;
 
+  // Vertex shader inputs.
   input_vertex_index_ = spv::NoResult;
-  input_primitive_id_ = spv::NoResult;
+  // Tessellation evaluation shader inputs.
+  input_control_point_index_ = spv::NoResult;
   input_tess_coord_ = spv::NoResult;
-  input_patch_control_point_indices_ = spv::NoResult;
+  // Pixel shader inputs.
   input_point_coordinates_ = spv::NoResult;
   input_fragment_coordinates_ = spv::NoResult;
   input_front_facing_ = spv::NoResult;
-  input_sample_id_ = spv::NoResult;
   input_sample_mask_ = spv::NoResult;
-  std::fill(input_output_interpolators_.begin(), input_output_interpolators_.end(), spv::NoResult);
+  std::ranges::fill(input_output_interpolators_, spv::NoResult);
   output_point_coordinates_ = spv::NoResult;
   output_point_size_ = spv::NoResult;
-  output_per_vertex_member_count_ = 0;
-  output_per_vertex_member_clip_distance_ = UINT32_MAX;
-  output_per_vertex_member_cull_distance_ = UINT32_MAX;
-  type_output_per_vertex_ = spv::NoResult;
-  output_per_vertex_ = spv::NoResult;
-  output_fragment_depth_ = spv::NoResult;
-  output_fragment_sample_mask_ = spv::NoResult;
 
   sampler_bindings_.clear();
   texture_bindings_.clear();
 
   main_interface_.clear();
   var_main_registers_ = spv::NoResult;
+  var_main_rectangle_guest_vertex_index_ = spv::NoResult;
+  var_main_rectangle_per_vertex_ = spv::NoResult;
+  var_main_rectangle_clip_distances_.fill(spv::NoResult);
+  var_main_rectangle_cull_distances_.fill(spv::NoResult);
+  var_main_rectangle_interpolators_.fill(spv::NoResult);
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
        ++memexport_eM_index) {
@@ -144,22 +144,18 @@ void SpirvShaderTranslator::Reset() {
   }
   var_main_memexport_data_written_ = spv::NoResult;
   main_memexport_allowed_ = spv::NoResult;
-  var_main_rectangle_guest_vertex_index_ = spv::NoResult;
-  var_main_rectangle_per_vertex_ = spv::NoResult;
-  std::fill(var_main_rectangle_clip_distances_.begin(), var_main_rectangle_clip_distances_.end(),
-            spv::NoResult);
-  std::fill(var_main_rectangle_cull_distances_.begin(), var_main_rectangle_cull_distances_.end(),
-            spv::NoResult);
-  std::fill(var_main_rectangle_interpolators_.begin(), var_main_rectangle_interpolators_.end(),
-            spv::NoResult);
   var_main_point_size_edge_flag_kill_vertex_ = spv::NoResult;
   var_main_kill_pixel_ = spv::NoResult;
-  var_main_fragment_depth_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  std::ranges::fill(output_fragment_data_, spv::NoResult);
+  output_or_var_fragment_depth_ = spv::NoResult;
+  output_fragment_depth_ = spv::NoResult;
+  main_fbo_depth_unbiased_ = spv::NoResult;
+  main_fbo_depth_derivatives_.fill(spv::NoResult);
 
+  main_loop_exit_ = nullptr;
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
-  main_loop_exit_ = nullptr;
 
   cf_exec_conditional_merge_ = nullptr;
   cf_instruction_predicate_merge_ = nullptr;
@@ -248,28 +244,24 @@ void SpirvShaderTranslator::StartTranslation() {
   spv::Id type_float4_array_4 =
       builder_->makeArrayType(type_float4_, builder_->makeUintConstant(4), sizeof(float) * 4);
   builder_->addDecoration(type_float4_array_4, spv::DecorationArrayStride, sizeof(float) * 4);
-  spv::Id type_float4_array_6 =
-      builder_->makeArrayType(type_float4_, builder_->makeUintConstant(6), sizeof(float) * 4);
-  builder_->addDecoration(type_float4_array_6, spv::DecorationArrayStride, sizeof(float) * 4);
   spv::Id type_uint4_array_2 =
       builder_->makeArrayType(type_uint4_, builder_->makeUintConstant(2), sizeof(uint32_t) * 4);
   builder_->addDecoration(type_uint4_array_2, spv::DecorationArrayStride, sizeof(uint32_t) * 4);
   spv::Id type_uint4_array_4 =
       builder_->makeArrayType(type_uint4_, builder_->makeUintConstant(4), sizeof(uint32_t) * 4);
   builder_->addDecoration(type_uint4_array_4, spv::DecorationArrayStride, sizeof(uint32_t) * 4);
+  spv::Id type_uint4_array_8 =
+      builder_->makeArrayType(type_uint4_, builder_->makeUintConstant(8), sizeof(uint32_t) * 4);
+  builder_->addDecoration(type_uint4_array_8, spv::DecorationArrayStride, sizeof(uint32_t) * 4);
+  spv::Id type_float4_array_6 =
+      builder_->makeArrayType(type_float4_, builder_->makeUintConstant(6), sizeof(float) * 4);
+  builder_->addDecoration(type_float4_array_6, spv::DecorationArrayStride, sizeof(float) * 4);
   const SystemConstant system_constants[] = {
       {"flags", offsetof(SystemConstants, flags), type_uint_},
       {"vertex_index_load_address", offsetof(SystemConstants, vertex_index_load_address),
        type_uint_},
       {"vertex_index_endian", offsetof(SystemConstants, vertex_index_endian), type_uint_},
-      {"line_loop_closing_index", offsetof(SystemConstants, line_loop_closing_index), type_uint_},
       {"vertex_base_index", offsetof(SystemConstants, vertex_base_index), type_int_},
-      {"vertex_index_reset", offsetof(SystemConstants, vertex_index_reset), type_uint_},
-      {"compute_memexport_vertex_count", offsetof(SystemConstants, compute_memexport_vertex_count),
-       type_uint_},
-      {"user_clip_planes", offsetof(SystemConstants, user_clip_planes), type_float4_array_6},
-      {"vertex_index_min", offsetof(SystemConstants, vertex_index_min), type_uint_},
-      {"vertex_index_max", offsetof(SystemConstants, vertex_index_max), type_uint_},
       {"ndc_scale", offsetof(SystemConstants, ndc_scale), type_float3_},
       {"point_vertex_diameter_min", offsetof(SystemConstants, point_vertex_diameter_min),
        type_float_},
@@ -279,17 +271,17 @@ void SpirvShaderTranslator::StartTranslation() {
       {"point_constant_diameter", offsetof(SystemConstants, point_constant_diameter), type_float2_},
       {"point_screen_diameter_to_ndc_radius",
        offsetof(SystemConstants, point_screen_diameter_to_ndc_radius), type_float2_},
-      {"textures_resolution_scaled", offsetof(SystemConstants, textures_resolution_scaled),
-       type_uint_},
       {"texture_swizzled_signs", offsetof(SystemConstants, texture_swizzled_signs),
        type_uint4_array_2},
       {"texture_swizzles", offsetof(SystemConstants, texture_swizzles), type_uint4_array_4},
+      {"textures_resolved", offsetof(SystemConstants, textures_resolved), type_uint_},
       {"alpha_test_reference", offsetof(SystemConstants, alpha_test_reference), type_float_},
-      {"alpha_to_mask", offsetof(SystemConstants, alpha_to_mask), type_uint_},
       {"edram_32bpp_tile_pitch_dwords_scaled",
        offsetof(SystemConstants, edram_32bpp_tile_pitch_dwords_scaled), type_uint_},
       {"edram_depth_base_dwords_scaled", offsetof(SystemConstants, edram_depth_base_dwords_scaled),
        type_uint_},
+      {"alpha_to_mask", offsetof(SystemConstants, alpha_to_mask), type_uint_},
+      {"zpd_fsi_counter_index", offsetof(SystemConstants, zpd_fsi_counter_index), type_uint_},
       {"color_exp_bias", offsetof(SystemConstants, color_exp_bias), type_float4_},
       {"edram_poly_offset_front_scale", offsetof(SystemConstants, edram_poly_offset_front_scale),
        type_float_},
@@ -309,6 +301,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"texture_integer_scale_bits", offsetof(SystemConstants, texture_integer_scale_bits),
+       type_uint4_array_8},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -499,6 +493,9 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_vfetch_address_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                  "xe_var_vfetch_address", const_int_0_);
+    var_main_vfetch_bound_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
+                                 "xe_var_vfetch_bound", const_int_0_);
     var_main_tfetch_lod_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                  "xe_var_tfetch_lod", const_float_0_);
@@ -510,19 +507,18 @@ void SpirvShaderTranslator::StartTranslation() {
                                  "xe_var_tfetch_gradients_v", const_float3_0_);
     if (register_count()) {
       spv::Id type_register_array =
-          builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
+          builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 0);
       var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                                      type_register_array, "xe_var_registers");
     }
+    // ReXGlue: rectangle-list vertex loop - outputs of each guest vertex of the rectangle.
     if (IsSpirvRectangleListVertexLoopEnabled()) {
       Modification shader_modification = GetSpirvShaderModification();
       var_main_rectangle_guest_vertex_index_ =
           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
                                    "xe_var_rectangle_guest_vertex_index", const_uint_0_);
-      // Keep the interpolated gl_PerVertex members in plain function-local
-      // arrays - the block type's BuiltIn and ArrayStride decorations are only
-      // valid in Input and Output storage. Desktop drivers accept it anyway,
-      // MoltenVK's SPIRV-Cross does not.
+      // Plain arrays, not the gl_PerVertex block type (SPIRV-Cross rejects it in
+      // Function storage).
       spv::Id type_rectangle_per_vertex_array =
           builder_->makeArrayType(type_float4_, builder_->makeUintConstant(3), 0);
       var_main_rectangle_per_vertex_ =
@@ -595,10 +591,9 @@ void SpirvShaderTranslator::StartTranslation() {
   //  before all blocks they dominate."
   main_loop_continue_ = new spv::Block(builder_->getUniqueId(), *function_main_);
   main_loop_merge_ = new spv::Block(builder_->getUniqueId(), *function_main_);
+  // ReXGlue: rectangle-list vertex loop - exits converge in the body, before the next guest vertex.
   main_loop_exit_ = main_loop_merge_;
   if (IsSpirvRectangleListVertexLoopEnabled()) {
-    // Need a block in the loop body to converge exits and to decide whether to
-    // continue with the next guest rectangle vertex.
     main_loop_exit_ = new spv::Block(builder_->getUniqueId(), *function_main_);
   }
   builder_->createBranch(main_loop_header_);
@@ -676,6 +671,13 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       builder_->createBranch(main_loop_merge_);
     }
 
+    // ReXGlue: rectangle-list vertex loop - next guest vertex or exit (adds a pc phi operand).
+    if (rectangle_vertex_loop) {
+      function_main_->addBlock(main_loop_merge_);
+      builder_->setBuildPoint(main_loop_merge_);
+      CompleteRectangleListVertexLoopIteration();
+    }
+
     // Main loop continuation - choose the program counter based on the path
     // taken (-1 if not from a jump as a safe fallback, which would result in
     // not hitting any switch case and reaching the final break in the body).
@@ -701,448 +703,23 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     builder_->createBranch(main_loop_header_);
 
     // Add the main loop merge block and go back to the function.
-    function_main_->addBlock(main_loop_merge_);
-    builder_->setBuildPoint(main_loop_merge_);
     if (rectangle_vertex_loop) {
-      // For rectangle-list fallback without geometry shaders, run the guest
-      // vertex shader 3 times (for all source vertices), then choose or
-      // synthesize the output for the current host strip vertex.
-      Modification shader_modification = GetSpirvShaderModification();
-      uint32_t clip_distance_count = shader_modification.GetVertexClipDistanceCount();
-      uint32_t cull_distance_count = shader_modification.GetVertexCullDistanceCount();
-
-      CompleteVertexOrTessEvalShaderInMain();
-
-      spv::Id rectangle_guest_vertex_index =
-          builder_->createLoad(var_main_rectangle_guest_vertex_index_, spv::NoPrecision);
-      spv::Id rectangle_guest_vertex_index_int =
-          builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_guest_vertex_index);
-
-      // Store current iteration outputs, member by member.
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
-      spv::Id rectangle_vertex_position = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_),
-          spv::NoPrecision);
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
-      builder_->createStore(
-          rectangle_vertex_position,
-          builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
-                                      id_vector_temp_));
-      auto store_rectangle_distance_members =
-          [this, rectangle_guest_vertex_index_int](
-              uint32_t member_index, uint32_t component_count,
-              const std::array<spv::Id, kMaxRectanglePerVertexDistances>& variables) {
-            for (uint32_t i = 0; i < component_count; ++i) {
-              id_vector_temp_.clear();
-              id_vector_temp_.push_back(builder_->makeIntConstant(int(member_index)));
-              id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-              spv::Id value = builder_->createLoad(
-                  builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
-                                              id_vector_temp_),
-                  spv::NoPrecision);
-              id_vector_temp_.clear();
-              id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
-              builder_->createStore(
-                  value, builder_->createAccessChain(spv::StorageClassFunction, variables[i],
-                                                     id_vector_temp_));
-            }
-          };
-      if (clip_distance_count && output_per_vertex_member_clip_distance_ != UINT32_MAX) {
-        store_rectangle_distance_members(output_per_vertex_member_clip_distance_,
-                                         clip_distance_count, var_main_rectangle_clip_distances_);
-      }
-      if (cull_distance_count && output_per_vertex_member_cull_distance_ != UINT32_MAX) {
-        store_rectangle_distance_members(output_per_vertex_member_cull_distance_,
-                                         cull_distance_count, var_main_rectangle_cull_distances_);
-      }
-      uint32_t interpolators_remaining = GetModificationInterpolatorMask();
-      uint32_t interpolator_index;
-      while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
-        interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
-        builder_->createStore(
-            builder_->createLoad(input_output_interpolators_[interpolator_index], spv::NoPrecision),
-            builder_->createAccessChain(spv::StorageClassFunction,
-                                        var_main_rectangle_interpolators_[interpolator_index],
-                                        id_vector_temp_));
-      }
-
-      spv::Id rectangle_guest_vertex_is_last = builder_->createBinOp(
-          spv::OpIEqual, type_bool_, rectangle_guest_vertex_index, builder_->makeUintConstant(2));
-      SpirvBuilder::IfBuilder if_not_last_guest_vertex(
-          builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, rectangle_guest_vertex_is_last),
-          spv::SelectionControlDontFlattenMask, *builder_);
-      {
-        spv::Id rectangle_guest_vertex_index_next = builder_->createBinOp(
-            spv::OpIAdd, type_uint_, rectangle_guest_vertex_index, builder_->makeUintConstant(1));
-        builder_->createStore(rectangle_guest_vertex_index_next,
-                              var_main_rectangle_guest_vertex_index_);
-
-        // Reinitialize per-vertex execution state before running the translated
-        // guest shader for the next rectangle vertex.
-        builder_->createStore(builder_->makeBoolConstant(false), var_main_predicate_);
-        builder_->createStore(const_uint4_0_, var_main_loop_count_);
-        builder_->createStore(const_int_0_, var_main_address_register_);
-        builder_->createStore(const_int4_0_, var_main_loop_address_);
-        builder_->createStore(const_float_0_, var_main_previous_scalar_);
-        builder_->createStore(const_int_0_, var_main_vfetch_address_);
-        builder_->createStore(const_float_0_, var_main_tfetch_lod_);
-        builder_->createStore(const_float3_0_, var_main_tfetch_gradients_h_);
-        builder_->createStore(const_float3_0_, var_main_tfetch_gradients_v_);
-        for (uint32_t i = 0; i < register_count(); ++i) {
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-          builder_->createStore(const_float4_0_,
-                                builder_->createAccessChain(spv::StorageClassFunction,
-                                                            var_main_registers_, id_vector_temp_));
-        }
-        uint32_t iteration_interpolators_remaining = GetModificationInterpolatorMask();
-        while (rex::bit_scan_forward(iteration_interpolators_remaining, &interpolator_index)) {
-          iteration_interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
-          builder_->createStore(const_float4_0_, input_output_interpolators_[interpolator_index]);
-        }
-        if (var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult) {
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeFloatConstant(-1.0f));
-          id_vector_temp_.push_back(const_float_0_);
-          id_vector_temp_.push_back(const_float_0_);
-          builder_->createStore(builder_->makeCompositeConstant(type_float3_, id_vector_temp_),
-                                var_main_point_size_edge_flag_kill_vertex_);
-        }
-        if (IsMemoryExportUsed()) {
-          // Flush and reinitialize memexport state for the next guest rectangle
-          // vertex iteration in this host invocation.
-          ExportToMemory(current_shader().memexport_eM_potentially_written_before_end());
-          builder_->createStore(const_float4_0_, var_main_memexport_address_);
-          uint8_t memexport_eM_remaining = current_shader().memexport_eM_written();
-          uint32_t memexport_eM_index;
-          while (rex::bit_scan_forward(memexport_eM_remaining, &memexport_eM_index)) {
-            memexport_eM_remaining &= ~(uint8_t(1) << memexport_eM_index);
-            builder_->createStore(const_float4_0_, var_main_memexport_data_[memexport_eM_index]);
-          }
-          builder_->createStore(const_uint_0_, var_main_memexport_data_written_);
-        }
-
-        // Load the next guest vertex index into r0.x.
-        if (register_count()) {
-          spv::Id rectangle_two_triangle_strip_vertex_index =
-              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
-                                      builder_->createLoad(input_vertex_index_, spv::NoPrecision));
-          spv::Id rectangle_primitive_index = builder_->createBinOp(
-              spv::OpShiftRightLogical, type_uint_, rectangle_two_triangle_strip_vertex_index,
-              builder_->makeUintConstant(2));
-          spv::Id rectangle_vertex_index = builder_->createBinOp(
-              spv::OpIAdd, type_uint_,
-              builder_->createBinOp(spv::OpIMul, type_uint_, rectangle_primitive_index,
-                                    builder_->makeUintConstant(3)),
-              rectangle_guest_vertex_index_next);
-          spv::Id rectangle_load_vertex_index = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_,
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                    builder_->makeUintConstant(static_cast<unsigned int>(
-                                        kSysFlag_ComputeOrPrimitiveVertexIndexLoad))),
-              const_uint_0_);
-          SpirvBuilder::IfBuilder rectangle_load_vertex_index_if(
-              rectangle_load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
-          spv::Id rectangle_loaded_vertex_index;
-          {
-            spv::Id rectangle_vertex_index_is_32bit = builder_->createBinOp(
-                spv::OpINotEqual, type_bool_,
-                builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                      builder_->makeUintConstant(static_cast<unsigned int>(
-                                          kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit))),
-                const_uint_0_);
-            id_vector_temp_.clear();
-            id_vector_temp_.push_back(
-                builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
-            spv::Id rectangle_vertex_index_address = builder_->createBinOp(
-                spv::OpIAdd, type_uint_,
-                builder_->createLoad(
-                    builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                                id_vector_temp_),
-                    spv::NoPrecision),
-                builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, rectangle_vertex_index,
-                                      builder_->createTriOp(spv::OpSelect, type_uint_,
-                                                            rectangle_vertex_index_is_32bit,
-                                                            builder_->makeUintConstant(2),
-                                                            builder_->makeUintConstant(1))));
-            rectangle_loaded_vertex_index = LoadUint32FromSharedMemory(
-                builder_->createUnaryOp(spv::OpBitcast, type_int_,
-                                        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                                                              rectangle_vertex_index_address,
-                                                              builder_->makeUintConstant(2))));
-            rectangle_loaded_vertex_index = builder_->createTriOp(
-                spv::OpSelect, type_uint_, rectangle_vertex_index_is_32bit,
-                rectangle_loaded_vertex_index,
-                builder_->createTriOp(
-                    spv::OpBitFieldUExtract, type_uint_, rectangle_loaded_vertex_index,
-                    builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_,
-                                          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                                rectangle_vertex_index_address,
-                                                                builder_->makeUintConstant(2)),
-                                          builder_->makeUintConstant(3)),
-                    builder_->makeUintConstant(16)));
-            id_vector_temp_.clear();
-            id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
-            rectangle_loaded_vertex_index = EndianSwap32Uint(
-                rectangle_loaded_vertex_index,
-                builder_->createLoad(
-                    builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                                id_vector_temp_),
-                    spv::NoPrecision));
-          }
-          rectangle_load_vertex_index_if.makeEndIf();
-          rectangle_vertex_index = rectangle_load_vertex_index_if.createMergePhi(
-              rectangle_loaded_vertex_index, rectangle_vertex_index);
-
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexBaseIndex));
-          spv::Id rectangle_vertex_base_index = builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                          id_vector_temp_),
-              spv::NoPrecision);
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexMin));
-          spv::Id rectangle_vertex_index_min = builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                          id_vector_temp_),
-              spv::NoPrecision);
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexMax));
-          spv::Id rectangle_vertex_index_max = builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                          id_vector_temp_),
-              spv::NoPrecision);
-          rectangle_vertex_index = builder_->createBinOp(
-              spv::OpIAdd, type_uint_, rectangle_vertex_index,
-              builder_->createUnaryOp(spv::OpBitcast, type_uint_, rectangle_vertex_base_index));
-          rectangle_vertex_index =
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, rectangle_vertex_index,
-                                    builder_->makeUintConstant(xenos::kVertexIndexMask));
-          rectangle_vertex_index = builder_->createTriBuiltinCall(
-              type_uint_, ext_inst_glsl_std_450_, GLSLstd450UClamp, rectangle_vertex_index,
-              rectangle_vertex_index_min, rectangle_vertex_index_max);
-          spv::Id rectangle_vertex_index_float =
-              builder_->createUnaryOp(spv::OpConvertUToF, type_float_, rectangle_vertex_index);
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(const_int_0_);
-          id_vector_temp_.push_back(const_int_0_);
-          builder_->createStore(rectangle_vertex_index_float,
-                                builder_->createAccessChain(spv::StorageClassFunction,
-                                                            var_main_registers_, id_vector_temp_));
-        }
-
-        if (has_main_switch) {
-          main_switch_next_pc_phi_operands_.push_back(const_int_0_);
-          main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
-        }
-        builder_->createBranch(main_loop_continue_);
-      }
-      // The branch to the loop continuation already terminated the "then" side.
-      if_not_last_guest_vertex.makeBeginElse(false);
-      {
-        spv::Id rectangle_host_vertex_in_primitive = builder_->createBinOp(
-            spv::OpBitwiseAnd, type_uint_,
-            builder_->createUnaryOp(spv::OpBitcast, type_uint_,
-                                    builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
-            builder_->makeUintConstant(3));
-        spv::Id rectangle_host_vertex_is_synthetic =
-            builder_->createBinOp(spv::OpIEqual, type_bool_, rectangle_host_vertex_in_primitive,
-                                  builder_->makeUintConstant(3));
-        spv::Id rectangle_host_vertex_is_0 = builder_->createBinOp(
-            spv::OpIEqual, type_bool_, rectangle_host_vertex_in_primitive, const_uint_0_);
-        spv::Id rectangle_host_vertex_is_1 =
-            builder_->createBinOp(spv::OpIEqual, type_bool_, rectangle_host_vertex_in_primitive,
-                                  builder_->makeUintConstant(1));
-
-        auto load_rectangle_position_xy = [this](spv::Id vertex_index, uint32_t component) {
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(vertex_index);
-          id_vector_temp_.push_back(builder_->makeIntConstant(int(component)));
-          return builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
-                                          id_vector_temp_),
-              spv::NoPrecision);
-        };
-
-        spv::Id const_int_0 = builder_->makeIntConstant(0);
-        spv::Id const_int_1 = builder_->makeIntConstant(1);
-        spv::Id const_int_2 = builder_->makeIntConstant(2);
-        spv::Id const_int_3 = builder_->makeIntConstant(3);
-
-        spv::Id edge_lengths[3];
-        for (uint32_t i = 0; i < 3; ++i) {
-          spv::Id edge_0 = builder_->makeIntConstant(int((1 + i) % 3));
-          spv::Id edge_1 = builder_->makeIntConstant(int((2 + i) % 3));
-          spv::Id edge_x =
-              builder_->createBinOp(spv::OpFSub, type_float_, load_rectangle_position_xy(edge_1, 0),
-                                    load_rectangle_position_xy(edge_0, 0));
-          spv::Id edge_y =
-              builder_->createBinOp(spv::OpFSub, type_float_, load_rectangle_position_xy(edge_1, 1),
-                                    load_rectangle_position_xy(edge_0, 1));
-          edge_lengths[i] = builder_->createBinOp(
-              spv::OpFAdd, type_float_,
-              builder_->createBinOp(spv::OpFMul, type_float_, edge_x, edge_x),
-              builder_->createBinOp(spv::OpFMul, type_float_, edge_y, edge_y));
-        }
-
-        spv::Id rectangle_vertex_indices[3];
-        rectangle_vertex_indices[0] = builder_->createTriOp(
-            spv::OpSelect, type_int_,
-            builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
-                                  builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_,
-                                                        edge_lengths[0], edge_lengths[1]),
-                                  builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_,
-                                                        edge_lengths[0], edge_lengths[2])),
-            const_int_0,
-            builder_->createTriOp(spv::OpSelect, type_int_,
-                                  builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_,
-                                                        edge_lengths[1], edge_lengths[2]),
-                                  const_int_1, const_int_2));
-        for (uint32_t i = 1; i < 3; ++i) {
-          spv::Id vertex_index_without_wrapping =
-              builder_->createBinOp(spv::OpIAdd, type_int_, rectangle_vertex_indices[0],
-                                    builder_->makeIntConstant(int(i)));
-          rectangle_vertex_indices[i] = builder_->createTriOp(
-              spv::OpSelect, type_int_,
-              builder_->createBinOp(spv::OpSLessThan, type_bool_, vertex_index_without_wrapping,
-                                    const_int_3),
-              vertex_index_without_wrapping,
-              builder_->createBinOp(spv::OpISub, type_int_, vertex_index_without_wrapping,
-                                    const_int_3));
-        }
-
-        auto select_rectangle_vertex_component =
-            [this, rectangle_host_vertex_is_0, rectangle_host_vertex_is_1](
-                spv::Id value_0, spv::Id value_1, spv::Id value_2, spv::Id type) {
-              return builder_->createTriOp(
-                  spv::OpSelect, type, rectangle_host_vertex_is_0, value_0,
-                  builder_->createTriOp(spv::OpSelect, type, rectangle_host_vertex_is_1, value_1,
-                                        value_2));
-            };
-
-        interpolators_remaining = GetModificationInterpolatorMask();
-        while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
-          interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(rectangle_vertex_indices[0]);
-          spv::Id interpolator_0 = builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassFunction,
-                                          var_main_rectangle_interpolators_[interpolator_index],
-                                          id_vector_temp_),
-              spv::NoPrecision);
-          id_vector_temp_[0] = rectangle_vertex_indices[1];
-          spv::Id interpolator_1 = builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassFunction,
-                                          var_main_rectangle_interpolators_[interpolator_index],
-                                          id_vector_temp_),
-              spv::NoPrecision);
-          id_vector_temp_[0] = rectangle_vertex_indices[2];
-          spv::Id interpolator_2 = builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassFunction,
-                                          var_main_rectangle_interpolators_[interpolator_index],
-                                          id_vector_temp_),
-              spv::NoPrecision);
-          spv::Id interpolator_original = select_rectangle_vertex_component(
-              interpolator_0, interpolator_1, interpolator_2, type_float4_);
-          spv::Id interpolator_synthetic = builder_->createNoContractionBinOp(
-              spv::OpFAdd, type_float4_,
-              builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, interpolator_1,
-                                                 interpolator_0),
-              interpolator_2);
-          builder_->createStore(
-              builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
-                                    interpolator_synthetic, interpolator_original),
-              input_output_interpolators_[interpolator_index]);
-        }
-
-        auto load_rectangle_vertex_value = [this](spv::Id variable, spv::Id vertex_index) {
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(vertex_index);
-          return builder_->createLoad(
-              builder_->createAccessChain(spv::StorageClassFunction, variable, id_vector_temp_),
-              spv::NoPrecision);
-        };
-
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
-        spv::Id rectangle_position_ptr = builder_->createAccessChain(
-            spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
-        spv::Id position_0 = load_rectangle_vertex_value(var_main_rectangle_per_vertex_,
-                                                         rectangle_vertex_indices[0]);
-        spv::Id position_1 = load_rectangle_vertex_value(var_main_rectangle_per_vertex_,
-                                                         rectangle_vertex_indices[1]);
-        spv::Id position_2 = load_rectangle_vertex_value(var_main_rectangle_per_vertex_,
-                                                         rectangle_vertex_indices[2]);
-        spv::Id position_original =
-            select_rectangle_vertex_component(position_0, position_1, position_2, type_float4_);
-        spv::Id position_synthetic = builder_->createNoContractionBinOp(
-            spv::OpFAdd, type_float4_,
-            builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, position_1, position_0),
-            position_2);
-        builder_->createStore(
-            builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
-                                  position_synthetic, position_original),
-            rectangle_position_ptr);
-
-        auto write_rectangle_distance_member =
-            [this, &select_rectangle_vertex_component, rectangle_host_vertex_is_synthetic,
-             &load_rectangle_vertex_value, rectangle_vertex_indices](
-                uint32_t member_index, uint32_t component_count,
-                const std::array<spv::Id, kMaxRectanglePerVertexDistances>& variables) {
-              for (uint32_t i = 0; i < component_count; ++i) {
-                spv::Id value_0 =
-                    load_rectangle_vertex_value(variables[i], rectangle_vertex_indices[0]);
-                spv::Id value_1 =
-                    load_rectangle_vertex_value(variables[i], rectangle_vertex_indices[1]);
-                spv::Id value_2 =
-                    load_rectangle_vertex_value(variables[i], rectangle_vertex_indices[2]);
-                spv::Id value_original =
-                    select_rectangle_vertex_component(value_0, value_1, value_2, type_float_);
-                spv::Id value_synthetic = builder_->createNoContractionBinOp(
-                    spv::OpFAdd, type_float_,
-                    builder_->createNoContractionBinOp(spv::OpFSub, type_float_, value_1, value_0),
-                    value_2);
-                id_vector_temp_.clear();
-                id_vector_temp_.push_back(builder_->makeIntConstant(int(member_index)));
-                id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-                builder_->createStore(
-                    builder_->createTriOp(spv::OpSelect, type_float_,
-                                          rectangle_host_vertex_is_synthetic, value_synthetic,
-                                          value_original),
-                    builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
-                                                id_vector_temp_));
-              }
-            };
-
-        if (clip_distance_count && output_per_vertex_member_clip_distance_ != UINT32_MAX) {
-          write_rectangle_distance_member(output_per_vertex_member_clip_distance_,
-                                          clip_distance_count, var_main_rectangle_clip_distances_);
-        }
-        if (cull_distance_count && output_per_vertex_member_cull_distance_ != UINT32_MAX) {
-          write_rectangle_distance_member(output_per_vertex_member_cull_distance_,
-                                          cull_distance_count, var_main_rectangle_cull_distances_);
-        }
-      }
-      if_not_last_guest_vertex.makeEndIf();
-    }
-    if (main_loop_exit_ != main_loop_merge_) {
-      if (!builder_->getBuildPoint()->isTerminated()) {
-        builder_->createBranch(main_loop_exit_);
-      }
       function_main_->addBlock(main_loop_exit_);
       builder_->setBuildPoint(main_loop_exit_);
+    } else {
+      function_main_->addBlock(main_loop_merge_);
+      builder_->setBuildPoint(main_loop_merge_);
     }
   }
 
   // Write data for the last memexport.
   ExportToMemory(current_shader().memexport_eM_potentially_written_before_end());
 
-  if (is_vertex_shader() && !IsSpirvComputeShader() && !rectangle_vertex_loop) {
-    CompleteVertexOrTessEvalShaderInMain();
+  if (is_vertex_shader()) {
+    // ReXGlue: already done per guest vertex in the rectangle-list vertex loop.
+    if (!rectangle_vertex_loop) {
+      CompleteVertexOrTessEvalShaderInMain();
+    }
   } else if (is_pixel_shader()) {
     CompleteFragmentShaderInMain();
   }
@@ -1155,16 +732,22 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   if (is_pixel_shader()) {
     execution_model = spv::ExecutionModelFragment;
     builder_->addExecutionMode(function_main_, spv::ExecutionModeOriginUpperLeft);
-    if (output_fragment_depth_ != spv::NoResult) {
+    if (IsExecutionModeEarlyFragmentTests()) {
+      builder_->addExecutionMode(function_main_, spv::ExecutionModeEarlyFragmentTests);
+    }
+    // FSI handles depth manually.
+    if (!edram_fragment_shader_interlock_ &&
+        (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
+         DSV_IsApplyingPolygonOffset())) {
       builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthReplacing);
-      if (!current_shader().writes_depth() &&
+      // Truncating float24 conversion of the rasterizer's own depth rounds
+      // towards zero, so the output is always <= the original - announce that
+      // to keep coarse early-Z culling possible.
+      if (!current_shader().writes_depth() && !DSV_IsApplyingPolygonOffset() &&
           GetSpirvShaderModification().pixel.depth_stencil_mode ==
               Modification::DepthStencilMode::kFloat24Truncating) {
         builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthLess);
       }
-    }
-    if (IsExecutionModeEarlyFragmentTests()) {
-      builder_->addExecutionMode(function_main_, spv::ExecutionModeEarlyFragmentTests);
     }
     if (edram_fragment_shader_interlock_) {
       // Accessing per-sample values, so interlocking just when there's common
@@ -1179,21 +762,13 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     }
   } else {
     assert_true(is_vertex_shader());
-    bool is_compute_shader = IsSpirvComputeShader();
-    bool is_tess_eval_shader = IsSpirvTessEvalShader();
-    execution_model = is_compute_shader
-                          ? spv::ExecutionModelGLCompute
-                          : (is_tess_eval_shader ? spv::ExecutionModelTessellationEvaluation
-                                                 : spv::ExecutionModelVertex);
-    if (is_compute_shader) {
-      builder_->addExecutionMode(function_main_, spv::ExecutionModeLocalSize, 1, 1, 1);
-    } else if (is_tess_eval_shader) {
+    if (IsSpirvTessEvalShader()) {
+      execution_model = spv::ExecutionModelTessellationEvaluation;
+      // Set tessellation execution modes based on the domain shader type.
       Modification shader_modification = GetSpirvShaderModification();
-      switch (shader_modification.vertex.host_vertex_shader_type) {
-        case Shader::HostVertexShaderType::kLineDomainCPIndexed:
-        case Shader::HostVertexShaderType::kLineDomainPatchIndexed:
-          builder_->addExecutionMode(function_main_, spv::ExecutionModeIsolines);
-          break;
+      Shader::HostVertexShaderType host_type = shader_modification.vertex.host_vertex_shader_type;
+      // Tessellation domain (triangles vs quads).
+      switch (host_type) {
         case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
         case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
           builder_->addExecutionMode(function_main_, spv::ExecutionModeTriangles);
@@ -1202,15 +777,30 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
         case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
           builder_->addExecutionMode(function_main_, spv::ExecutionModeQuads);
           break;
+        case Shader::HostVertexShaderType::kLineDomainCPIndexed:
+        case Shader::HostVertexShaderType::kLineDomainPatchIndexed:
+          builder_->addExecutionMode(function_main_, spv::ExecutionModeIsolines);
+          break;
         default:
-          assert_unhandled_case(shader_modification.vertex.host_vertex_shader_type);
+          assert_unhandled_case(host_type);
           break;
       }
-      builder_->addExecutionMode(function_main_, (shader_modification.vertex.tessellation_mode ==
-                                                  uint32_t(xenos::TessellationMode::kDiscrete))
+      // Tessellation spacing. In SPIR-V the spacing is part of the domain
+      // shader rather than the hull shader. Match the Direct3D 12 hull shader
+      // partitioning. Integer (equal) for discrete, fractional even for
+      // continuous and adaptive.
+      builder_->addExecutionMode(function_main_, shader_modification.vertex.tessellation_mode ==
+                                                         xenos::TessellationMode::kDiscrete
                                                      ? spv::ExecutionModeSpacingEqual
                                                      : spv::ExecutionModeSpacingFractionalEven);
+      // Vertex ordering. Xenia does not flip the clip space Y on Vulkan
+      // (origin_bottom_left is false, so ndc_scale.y keeps the guest sign), so
+      // the tessellator must wind the same way as the Direct3D 12 hull shaders,
+      // which use triangle_cw. Counter-clockwise here inverts the facing and
+      // the guest backface culling removes the whole surface.
       builder_->addExecutionMode(function_main_, spv::ExecutionModeVertexOrderCw);
+    } else {
+      execution_model = spv::ExecutionModelVertex;
     }
   }
   if (features_.denorm_flush_to_zero_float32) {
@@ -1226,7 +816,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     builder_->addCapability(spv::CapabilitySignedZeroInfNanPreserve);
     builder_->addExecutionMode(function_main_, spv::ExecutionModeSignedZeroInfNanPreserve, 32);
   }
-  if (features_.rounding_mode_rte_float32) {
+  if (features_.rounding_mode_rte_float32 && !REXCVAR_GET(spirv_disable_rounding_mode_rte)) {
     builder_->addCapability(spv::CapabilityRoundingModeRTE);
     builder_->addExecutionMode(function_main_, spv::ExecutionModeRoundingModeRTE, 32);
   }
@@ -1636,37 +1226,46 @@ void SpirvShaderTranslator::EnsureBuildPointAvailable() {
 }
 
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
-  if (IsSpirvComputeShader()) {
-    // For memexport fallback execution, each invocation corresponds to one
-    // guest vertex processing index.
-    input_vertex_index_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
-                                                   type_uint3_, "gl_GlobalInvocationID");
-    builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn,
-                            spv::BuiltInGlobalInvocationId);
-    main_interface_.push_back(input_vertex_index_);
-    return;
-  }
-
   // Create the inputs.
   if (IsSpirvTessEvalShader()) {
-    input_primitive_id_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
-                                                   type_int_, "gl_PrimitiveID");
-    builder_->addDecoration(input_primitive_id_, spv::DecorationBuiltIn, spv::BuiltInPrimitiveId);
-    main_interface_.push_back(input_primitive_id_);
+    // Per-control-point index input from the hull shader, mirroring the control
+    // point input read by the Direct3D 12 domain shader. The hull shader has
+    // already applied the endian swap, the vertex index offset, the low 24-bit
+    // wrap and the min/max clamp, so this is the index the guest expects rather
+    // than the raw gl_PrimitiveID. The array size matches the hull shader's
+    // output control point count for the domain type.
+    uint32_t control_point_count = 1;
+    switch (GetSpirvShaderModification().vertex.host_vertex_shader_type) {
+      case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
+        control_point_count = 3;
+        break;
+      case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
+        control_point_count = 4;
+        break;
+      default:
+        // Patch-indexed (and line) domains output a single control point.
+        control_point_count = 1;
+        break;
+    }
+    input_control_point_index_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassInput,
+        builder_->makeArrayType(type_float_, builder_->makeUintConstant(control_point_count), 0),
+        "xe_in_control_point_index");
+    builder_->addDecoration(input_control_point_index_, spv::DecorationLocation, 0);
+    main_interface_.push_back(input_control_point_index_);
+
+    // Tessellation coordinates (barycentric coordinates for the tessellated
+    // vertex within the patch).
     input_tess_coord_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                  type_float3_, "gl_TessCoord");
-    builder_->addDecoration(input_tess_coord_, spv::DecorationBuiltIn, spv::BuiltInTessCoord);
+    builder_->addDecoration(input_tess_coord_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltInTessCoord));
     main_interface_.push_back(input_tess_coord_);
-    input_patch_control_point_indices_ =
-        builder_->createVariable(spv::NoPrecision, spv::StorageClassInput, type_float4_,
-                                 "xe_in_patch_control_point_indices");
-    builder_->addDecoration(input_patch_control_point_indices_, spv::DecorationLocation, 0);
-    builder_->addDecoration(input_patch_control_point_indices_, spv::DecorationPatch);
-    main_interface_.push_back(input_patch_control_point_indices_);
   } else {
     input_vertex_index_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                    type_int_, "gl_VertexIndex");
-    builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
+    builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltInVertexIndex));
     main_interface_.push_back(input_vertex_index_);
   }
 
@@ -1717,53 +1316,85 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
   }
 
   // Create the gl_PerVertex output for used system outputs.
-  uint32_t clip_distance_count = shader_modification.GetVertexClipDistanceCount();
-  uint32_t cull_distance_count = shader_modification.GetVertexCullDistanceCount();
   std::vector<spv::Id> struct_per_vertex_members;
-  struct_per_vertex_members.reserve(kOutputPerVertexMemberCountMax);
+  struct_per_vertex_members.reserve(kOutputPerVertexMemberCount);
   struct_per_vertex_members.push_back(type_float4_);
-  output_per_vertex_member_count_ = uint32_t(struct_per_vertex_members.size());
-  output_per_vertex_member_clip_distance_ = UINT32_MAX;
-  output_per_vertex_member_cull_distance_ = UINT32_MAX;
-  if (clip_distance_count) {
-    assert_true(features_.clip_distance);
-    builder_->addCapability(spv::CapabilityClipDistance);
-    spv::Id type_clip_distance =
-        builder_->makeArrayType(type_float_, builder_->makeUintConstant(clip_distance_count), 0);
-    builder_->addDecoration(type_clip_distance, spv::DecorationArrayStride, sizeof(float));
-    output_per_vertex_member_clip_distance_ = uint32_t(struct_per_vertex_members.size());
-    struct_per_vertex_members.push_back(type_clip_distance);
-    output_per_vertex_member_count_ = uint32_t(struct_per_vertex_members.size());
+
+  // Only allocate ClipDistance/CullDistance arrays when user clip planes are
+  // actually enabled (count > 0).
+  uint32_t user_clip_plane_count = shader_modification.vertex.user_clip_plane_count;
+  uint32_t clip_distance_count = 0;
+  uint32_t cull_distance_count = 0;
+  if (shader_modification.vertex.user_clip_plane_cull) {
+    cull_distance_count = user_clip_plane_count;
+  } else {
+    clip_distance_count = user_clip_plane_count;
   }
-  if (cull_distance_count) {
-    assert_true(features_.cull_distance);
-    builder_->addCapability(spv::CapabilityCullDistance);
-    spv::Id type_cull_distance =
-        builder_->makeArrayType(type_float_, builder_->makeUintConstant(cull_distance_count), 0);
-    builder_->addDecoration(type_cull_distance, spv::DecorationArrayStride, sizeof(float));
-    output_per_vertex_member_cull_distance_ = uint32_t(struct_per_vertex_members.size());
-    struct_per_vertex_members.push_back(type_cull_distance);
-    output_per_vertex_member_count_ = uint32_t(struct_per_vertex_members.size());
+  // Vertex kill with "and" operator writes a dedicated cull distance after
+  // the user clip plane cull distances.
+  if (shader_modification.vertex.vertex_kill_and) {
+    ++cull_distance_count;
   }
+  output_per_vertex_clip_distance_member_index_ = 0;
+  output_per_vertex_cull_distance_member_index_ = 0;
+  if (user_clip_plane_count > 0) {
+    // Create separate uniform buffer for clip planes.
+    spv::Id type_float4_array_6 =
+        builder_->makeArrayType(type_float4_, builder_->makeUintConstant(6), sizeof(float) * 4);
+    builder_->addDecoration(type_float4_array_6, spv::DecorationArrayStride, sizeof(float) * 4);
+    std::vector<spv::Id> clip_plane_struct_members;
+    clip_plane_struct_members.push_back(type_float4_array_6);
+    spv::Id type_clip_plane_constants =
+        builder_->makeStructType(clip_plane_struct_members, "XeClipPlaneConstants");
+    builder_->addMemberDecoration(type_clip_plane_constants, 0, spv::DecorationOffset, 0);
+    builder_->addDecoration(type_clip_plane_constants, spv::DecorationBlock);
+    uniform_clip_plane_constants_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform,
+                                 type_clip_plane_constants, "xe_uniform_clip_planes");
+    builder_->addDecoration(uniform_clip_plane_constants_, spv::DecorationDescriptorSet,
+                            int(kDescriptorSetConstants));
+    builder_->addDecoration(uniform_clip_plane_constants_, spv::DecorationBinding,
+                            int(kConstantBufferClipPlanes));
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(uniform_clip_plane_constants_);
+    }
+  }
+  if (clip_distance_count > 0) {
+    output_per_vertex_clip_distance_member_index_ =
+        static_cast<unsigned int>(struct_per_vertex_members.size());
+    struct_per_vertex_members.push_back(
+        builder_->makeArrayType(type_float_, builder_->makeUintConstant(clip_distance_count), 0));
+  }
+  if (cull_distance_count > 0) {
+    output_per_vertex_cull_distance_member_index_ =
+        static_cast<unsigned int>(struct_per_vertex_members.size());
+    struct_per_vertex_members.push_back(
+        builder_->makeArrayType(type_float_, builder_->makeUintConstant(cull_distance_count), 0));
+  }
+
   spv::Id type_struct_per_vertex =
       builder_->makeStructType(struct_per_vertex_members, "gl_PerVertex");
   builder_->addMemberName(type_struct_per_vertex, kOutputPerVertexMemberPosition, "gl_Position");
   builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
-                                spv::DecorationBuiltIn, spv::BuiltInPosition);
-  if (output_per_vertex_member_clip_distance_ != UINT32_MAX) {
-    builder_->addMemberName(type_struct_per_vertex, output_per_vertex_member_clip_distance_,
+                                spv::DecorationBuiltIn, static_cast<int>(spv::BuiltInPosition));
+
+  // Decorate clip/cull arrays only if allocated.
+  if (clip_distance_count > 0) {
+    builder_->addMemberName(type_struct_per_vertex, output_per_vertex_clip_distance_member_index_,
                             "gl_ClipDistance");
-    builder_->addMemberDecoration(type_struct_per_vertex, output_per_vertex_member_clip_distance_,
-                                  spv::DecorationBuiltIn, spv::BuiltInClipDistance);
+    builder_->addMemberDecoration(
+        type_struct_per_vertex, output_per_vertex_clip_distance_member_index_,
+        spv::DecorationBuiltIn, static_cast<int>(spv::BuiltInClipDistance));
   }
-  if (output_per_vertex_member_cull_distance_ != UINT32_MAX) {
-    builder_->addMemberName(type_struct_per_vertex, output_per_vertex_member_cull_distance_,
+  if (cull_distance_count > 0) {
+    builder_->addMemberName(type_struct_per_vertex, output_per_vertex_cull_distance_member_index_,
                             "gl_CullDistance");
-    builder_->addMemberDecoration(type_struct_per_vertex, output_per_vertex_member_cull_distance_,
-                                  spv::DecorationBuiltIn, spv::BuiltInCullDistance);
+    builder_->addMemberDecoration(
+        type_struct_per_vertex, output_per_vertex_cull_distance_member_index_,
+        spv::DecorationBuiltIn, static_cast<int>(spv::BuiltInCullDistance));
   }
+
   builder_->addDecoration(type_struct_per_vertex, spv::DecorationBlock);
-  type_output_per_vertex_ = type_struct_per_vertex;
   output_per_vertex_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
                                                 type_struct_per_vertex, "");
   builder_->addDecoration(output_per_vertex_, spv::DecorationInvariant);
@@ -1772,8 +1403,6 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
 
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
-  Shader::HostVertexShaderType host_vertex_shader_type =
-      shader_modification.vertex.host_vertex_shader_type;
 
   // The edge flag isn't used for any purpose by the translator.
   if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b101) {
@@ -1802,8 +1431,8 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
                                                      id_vector_temp_));
   }
 
-  if (!IsSpirvComputeShader()) {
-    // Zero the interpolators.
+  // Zero the interpolators.
+  {
     uint32_t interpolators_remaining = GetModificationInterpolatorMask();
     uint32_t interpolator_index;
     while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
@@ -1812,39 +1441,25 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
     }
   }
 
-  // For rectangle-list fallback without geometry shaders, additional guest
-  // vertex iterations are driven from CompleteTranslation via main_loop_merge_.
+  // ReXGlue: the rectangle-list vertex loop is driven by CompleteRectangleListVertexLoopIteration.
 
   // Check if memory export should be allowed for this host vertex of the guest
   // primitive to make sure export is done only once for each guest vertex.
   if (IsMemoryExportUsed()) {
     spv::Id memexport_allowed_for_host_vertex_of_guest_primitive = spv::NoResult;
-    if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
-        host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
-      spv::Id host_vertex_in_guest_primitive = builder_->createBinOp(
-          spv::OpBitwiseAnd, type_uint_,
-          builder_->createUnaryOp(spv::OpBitcast, type_uint_,
-                                  builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
-          builder_->makeUintConstant(3));
-      if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
-        // Only for one host vertex for the point.
-        memexport_allowed_for_host_vertex_of_guest_primitive = builder_->createBinOp(
-            spv::OpIEqual, type_bool_, host_vertex_in_guest_primitive, const_uint_0_);
-      } else {
-        if (IsSpirvRectangleListVertexLoopEnabled()) {
-          // In the rectangle guest-vertex loop mode, one host invocation
-          // processes all 3 guest vertices, so memexport must be done only from
-          // one host strip vertex.
-          memexport_allowed_for_host_vertex_of_guest_primitive = builder_->createBinOp(
-              spv::OpIEqual, type_bool_, host_vertex_in_guest_primitive, const_uint_0_);
-        } else {
-          // The synthetic fourth host vertex must not duplicate export for
-          // guest vertex 2 of the rectangle.
-          memexport_allowed_for_host_vertex_of_guest_primitive =
-              builder_->createBinOp(spv::OpINotEqual, type_bool_, host_vertex_in_guest_primitive,
-                                    builder_->makeUintConstant(3));
-        }
-      }
+    if (shader_modification.vertex.host_vertex_shader_type ==
+            Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+        shader_modification.vertex.host_vertex_shader_type ==
+            Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+      // Only for one host vertex for the point.
+      memexport_allowed_for_host_vertex_of_guest_primitive = builder_->createBinOp(
+          spv::OpIEqual, type_bool_,
+          builder_->createBinOp(
+              spv::OpBitwiseAnd, type_uint_,
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                      builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
+              builder_->makeUintConstant(3)),
+          const_uint_0_);
     }
 
     if (memexport_allowed_for_host_vertex_of_guest_primitive != spv::NoResult) {
@@ -1858,581 +1473,716 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
 
   // Load the vertex index or the tessellation parameters.
   if (register_count()) {
-    auto store_register_component = [this](uint32_t register_index, uint32_t component,
-                                           spv::Id value) {
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(int(register_index)));
-      id_vector_temp_.push_back(builder_->makeIntConstant(int(component)));
-      builder_->createStore(
-          value, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
-                                             id_vector_temp_));
-    };
     if (IsSpirvTessEvalShader()) {
-      auto load_tess_coord_component = [this](uint32_t component) {
-        return builder_->createCompositeExtract(
-            builder_->createLoad(input_tess_coord_, spv::NoPrecision), type_float_, component);
-      };
-      auto load_patch_control_point_index = [this](uint32_t component) {
-        return builder_->createCompositeExtract(
-            builder_->createLoad(input_patch_control_point_indices_, spv::NoPrecision), type_float_,
-            component);
-      };
-      switch (shader_modification.vertex.host_vertex_shader_type) {
+      // Tessellation evaluation shader (domain shader).
+      // Copy barycentric coordinates (gl_TessCoord) to r0 with appropriate
+      // swizzle based on the domain type.
+      Shader::HostVertexShaderType host_type = shader_modification.vertex.host_vertex_shader_type;
+
+      spv::Id tess_coord = builder_->createLoad(input_tess_coord_, spv::NoPrecision);
+
+      switch (host_type) {
         case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
-          // r0.xyz = domain location zyx, r1.xyz = control point indices.
-          store_register_component(0, 0, load_tess_coord_component(2));
-          store_register_component(0, 1, load_tess_coord_component(1));
-          store_register_component(0, 2, load_tess_coord_component(0));
-          if (register_count() >= 2) {
-            store_register_component(1, 0, load_patch_control_point_index(0));
-            store_register_component(1, 1, load_patch_control_point_index(1));
-            store_register_component(1, 2, load_patch_control_point_index(2));
+        case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed: {
+          // Triangle domain requires at least 2 registers (r0 for barycentric,
+          // r1 for control point indices or patch index).
+          assert_true(register_count() >= 2);
+          // Triangle domain: gl_TessCoord.xyz -> r0.zyx
+          // ZYX swizzle according to 415607E1 and 4D5307F2.
+          uint_vector_temp_.clear();
+          uint_vector_temp_.push_back(2);  // z -> r0.x
+          uint_vector_temp_.push_back(1);  // y -> r0.y
+          uint_vector_temp_.push_back(0);  // x -> r0.z
+          spv::Id tess_coord_zyx = builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_,
+                                                                 tess_coord, uint_vector_temp_);
+          // Store to r0.xyz
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id r0_ptr = builder_->createAccessChain(spv::StorageClassFunction,
+                                                       var_main_registers_, id_vector_temp_);
+          // Build float4 from swizzled xyz and w=1.0
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(
+              builder_->createCompositeExtract(tess_coord_zyx, type_float_, 0));
+          id_vector_temp_.push_back(
+              builder_->createCompositeExtract(tess_coord_zyx, type_float_, 1));
+          id_vector_temp_.push_back(
+              builder_->createCompositeExtract(tess_coord_zyx, type_float_, 2));
+          id_vector_temp_.push_back(const_float_1_);
+          builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+                                r0_ptr);
+          break;
+        }
+        case Shader::HostVertexShaderType::kQuadDomainCPIndexed: {
+          // Quad domain requires at least 2 registers (r0 for the domain
+          // location and the first control point index, r1 for the other
+          // three).
+          assert_true(register_count() >= 2);
+          // Quad domain CP-indexed, matching the Direct3D 12 domain shader:
+          // r0.xy = domain location, r0.z = control point index 0,
+          // r1.xyz = control point indices 1, 2, 3 (already endian swapped and
+          // converted to float by the host vertex and hull shaders).
+          spv::Id tess_coord_x = builder_->createCompositeExtract(tess_coord, type_float_, 0);
+          spv::Id tess_coord_y = builder_->createCompositeExtract(tess_coord, type_float_, 1);
+          // Load control point index 0.
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id control_point_index_0 = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput, input_control_point_index_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          // Store r0 = (domain.x, domain.y, control point index 0, 0).
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id r0_ptr = builder_->createAccessChain(spv::StorageClassFunction,
+                                                       var_main_registers_, id_vector_temp_);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(tess_coord_x);
+          id_vector_temp_.push_back(tess_coord_y);
+          id_vector_temp_.push_back(control_point_index_0);
+          id_vector_temp_.push_back(const_float_0_);
+          builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+                                r0_ptr);
+          // Store r1.xyz = control point indices 1, 2, 3.
+          for (uint32_t i = 1; i <= 3; ++i) {
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+            spv::Id control_point_index = builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassInput, input_control_point_index_,
+                                            id_vector_temp_),
+                spv::NoPrecision);
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(1));
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(i - 1)));
+            builder_->createStore(control_point_index, builder_->createAccessChain(
+                                                           spv::StorageClassFunction,
+                                                           var_main_registers_, id_vector_temp_));
           }
           break;
-        case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
-          // r0.xyz = domain location zyx, r1.x = patch index, r1.y = swizzle.
-          store_register_component(0, 0, load_tess_coord_component(2));
-          store_register_component(0, 1, load_tess_coord_component(1));
-          store_register_component(0, 2, load_tess_coord_component(0));
+        }
+        case Shader::HostVertexShaderType::kQuadDomainPatchIndexed: {
+          // Quad domain requires at least 2 registers (r0 for domain location
+          // and patch index, r1 for swizzle indicator).
+          assert_true(register_count() >= 2);
+          // Quad domain patch-indexed: gl_TessCoord.xy -> r0.yz,
+          // patch index -> r0.x, r0.w = 1
+          // XY swizzle according to the ground shader in 4D5307F2.
+          uint_vector_temp_.clear();
+          uint_vector_temp_.push_back(0);  // x -> r0.y
+          uint_vector_temp_.push_back(1);  // y -> r0.z
+          spv::Id tess_coord_xy = builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_,
+                                                                tess_coord, uint_vector_temp_);
+          // Read the patch index from control point 0 (already endian swapped,
+          // offset, wrapped and clamped by the host vertex and hull shaders),
+          // matching the Direct3D 12 domain shader, rather than using the raw
+          // gl_PrimitiveID.
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id patch_index_float = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput, input_control_point_index_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          // Store to r0: x = patch index, yz = tess coord, w = 1
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id r0_ptr = builder_->createAccessChain(spv::StorageClassFunction,
+                                                       var_main_registers_, id_vector_temp_);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(patch_index_float);
+          id_vector_temp_.push_back(
+              builder_->createCompositeExtract(tess_coord_xy, type_float_, 0));
+          id_vector_temp_.push_back(
+              builder_->createCompositeExtract(tess_coord_xy, type_float_, 1));
+          id_vector_temp_.push_back(const_float_1_);
+          builder_->createStore(builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+                                r0_ptr);
+          // Also set r1.x = 0.0f (swizzle indicator for identity swizzle).
           if (register_count() >= 2) {
-            store_register_component(1, 0, load_patch_control_point_index(0));
-            store_register_component(1, 1, const_float_0_);
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(1));
+            id_vector_temp_.push_back(const_int_0_);
+            builder_->createStore(
+                const_float_0_, builder_->createAccessChain(spv::StorageClassFunction,
+                                                            var_main_registers_, id_vector_temp_));
           }
           break;
-        case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
-          // r0.xy = domain location xy, r0.z/r1.xyz = control point indices.
-          store_register_component(0, 0, load_tess_coord_component(0));
-          store_register_component(0, 1, load_tess_coord_component(1));
-          store_register_component(0, 2, load_patch_control_point_index(0));
-          if (register_count() >= 2) {
-            store_register_component(1, 0, load_patch_control_point_index(1));
-            store_register_component(1, 1, load_patch_control_point_index(2));
-            store_register_component(1, 2, load_patch_control_point_index(3));
-          }
-          break;
-        case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
-          // r0.x = patch index, r0.yz = domain location xy, r1.x = swizzle.
-          store_register_component(0, 0, load_patch_control_point_index(0));
-          store_register_component(0, 1, load_tess_coord_component(0));
-          store_register_component(0, 2, load_tess_coord_component(1));
-          if (register_count() >= 2) {
-            store_register_component(1, 0, const_float_0_);
-          }
+        }
+        case Shader::HostVertexShaderType::kLineDomainCPIndexed:
+        case Shader::HostVertexShaderType::kLineDomainPatchIndexed:
+          // Line domain tessellation is not yet implemented.
+          REXGPU_ERROR(
+              "SPIRV: Line domain tessellation not implemented for host type "
+              "{}",
+              static_cast<uint32_t>(host_type));
+          assert_unhandled_case(host_type);
           break;
         default:
           break;
       }
-    }
-    if (IsSpirvVertexShader() || IsSpirvComputeShader()) {
-      spv::Id vertex_index;
-      spv::Id compute_vertex_processing_index = spv::NoResult;
-      spv::Id compute_load_vertex_index = spv::NoResult;
-      spv::Id compute_vertex_index_is_32bit = spv::NoResult;
-      if (IsSpirvComputeShader()) {
-        spv::Id global_invocation_id = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
-        spv::Id global_invocation_x =
-            builder_->createCompositeExtract(global_invocation_id, type_uint_, 0);
-        spv::Id global_invocation_y =
-            builder_->createCompositeExtract(global_invocation_id, type_uint_, 1);
-        spv::Id global_invocation_z =
-            builder_->createCompositeExtract(global_invocation_id, type_uint_, 2);
-        compute_vertex_processing_index = builder_->createBinOp(
-            spv::OpIAdd, type_uint_, global_invocation_x,
-            builder_->createBinOp(
-                spv::OpIAdd, type_uint_,
-                builder_->createBinOp(spv::OpIMul, type_uint_, global_invocation_y,
-                                      builder_->makeUintConstant(kMemExportComputeDispatchX)),
-                builder_->createBinOp(spv::OpIMul, type_uint_, global_invocation_z,
-                                      builder_->makeUintConstant(kMemExportComputeDispatchX *
-                                                                 kMemExportComputeDispatchY))));
 
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(
-            builder_->makeIntConstant(kSystemConstantComputeMemExportVertexCount));
-        spv::Id compute_memexport_vertex_count = builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                        id_vector_temp_),
-            spv::NoPrecision);
-        spv::Id compute_vertex_in_range =
-            builder_->createBinOp(spv::OpULessThan, type_bool_, compute_vertex_processing_index,
-                                  compute_memexport_vertex_count);
-        main_memexport_allowed_ =
-            main_memexport_allowed_ != spv::NoResult
-                ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_, main_memexport_allowed_,
-                                        compute_vertex_in_range)
-                : compute_vertex_in_range;
-        vertex_index = builder_->createTriOp(spv::OpSelect, type_uint_, compute_vertex_in_range,
-                                             compute_vertex_processing_index, const_uint_0_);
-        compute_vertex_processing_index = vertex_index;
-      } else {
-        vertex_index =
-            builder_->createUnaryOp(spv::OpBitcast, type_uint_,
-                                    builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+      // For triangle patch-indexed mode, store patch index to r1.x and
+      // swizzle indicator (0.0f) to r1.y.
+      if (register_count() >= 2) {
+        if (host_type == Shader::HostVertexShaderType::kTriangleDomainPatchIndexed) {
+          // Read the patch index from control point 0 (already endian swapped,
+          // offset, wrapped and clamped by the host vertex and hull shaders),
+          // matching the Direct3D 12 domain shader, rather than using the raw
+          // gl_PrimitiveID.
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          spv::Id patch_index_float = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput, input_control_point_index_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          // Store patch index to r1.x
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(1));
+          id_vector_temp_.push_back(const_int_0_);
+          builder_->createStore(patch_index_float,
+                                builder_->createAccessChain(spv::StorageClassFunction,
+                                                            var_main_registers_, id_vector_temp_));
+          // Store swizzle indicator (0.0f = identity) to r1.y
+          // According to D3D12 implementation and comments in
+          // adaptive_triangle.hs.glsl, r1.y == 0 means identity swizzle.
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(1));
+          id_vector_temp_.push_back(builder_->makeIntConstant(1));
+          builder_->createStore(const_float_0_,
+                                builder_->createAccessChain(spv::StorageClassFunction,
+                                                            var_main_registers_, id_vector_temp_));
+        } else if (host_type == Shader::HostVertexShaderType::kTriangleDomainCPIndexed) {
+          // Store the three control point indices (already endian swapped and
+          // converted to float by the host vertex and hull shaders) to r1.xyz,
+          // matching the Direct3D 12 domain shader.
+          for (uint32_t i = 0; i < 3; ++i) {
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+            spv::Id control_point_index = builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassInput, input_control_point_index_,
+                                            id_vector_temp_),
+                spv::NoPrecision);
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(1));
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+            builder_->createStore(control_point_index, builder_->createAccessChain(
+                                                           spv::StorageClassFunction,
+                                                           var_main_registers_, id_vector_temp_));
+          }
+        }
       }
-      if (IsSpirvVertexShader()) {
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantLineLoopClosingIndex));
-        spv::Id line_loop_closing_index = builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                        id_vector_temp_),
-            spv::NoPrecision);
-        vertex_index =
-            builder_->createTriOp(spv::OpSelect, type_uint_,
-                                  builder_->createBinOp(spv::OpINotEqual, type_bool_, vertex_index,
-                                                        line_loop_closing_index),
-                                  vertex_index, const_uint_0_);
-      }
-      if (IsSpirvVertexShader() &&
-          (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
-           host_vertex_shader_type ==
-               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip)) {
-        spv::Id const_uint_2 = builder_->makeUintConstant(2);
-        spv::Id two_triangle_strip_vertex_index = vertex_index;
+    } else if (IsSpirvVertexShader()) {
+      spv::Id vertex_index = builder_->createUnaryOp(
+          spv::OpBitcast, type_uint_, builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+      Shader::HostVertexShaderType host_vertex_shader_type =
+          shader_modification.vertex.host_vertex_shader_type;
+      if (host_vertex_shader_type == Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+          host_vertex_shader_type == Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+        // Load the point index, autogenerated or indirectly from the index
+        // buffer.
         // Extract the primitive index from the two-triangle strip vertex index.
-        vertex_index = builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                                             two_triangle_strip_vertex_index, const_uint_2);
+        spv::Id const_uint_2 = builder_->makeUintConstant(2);
+        vertex_index =
+            builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, vertex_index, const_uint_2);
+        // ReXGlue: 3 guest vertices per rectangle in the rectangle-list vertex loop.
         if (host_vertex_shader_type ==
             Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
-          spv::Id const_uint_3 = builder_->makeUintConstant(3);
-          spv::Id guest_vertex_in_guest_primitive;
-          if (IsSpirvRectangleListVertexLoopEnabled()) {
-            // In the rectangle VS fallback loop, process guest vertices 0, 1 and
-            // 2 in every host invocation.
-            guest_vertex_in_guest_primitive =
-                builder_->createLoad(var_main_rectangle_guest_vertex_index_, spv::NoPrecision);
-          } else {
-            // Rectangle lists consume 3 guest vertices per primitive. Clamp the
-            // synthetic fourth host vertex to guest vertex 2.
-            spv::Id host_vertex_in_guest_primitive = builder_->createBinOp(
-                spv::OpBitwiseAnd, type_uint_, two_triangle_strip_vertex_index, const_uint_3);
-            guest_vertex_in_guest_primitive = builder_->createTriOp(
-                spv::OpSelect, type_uint_,
-                builder_->createBinOp(spv::OpIEqual, type_bool_, host_vertex_in_guest_primitive,
-                                      const_uint_3),
-                const_uint_2, host_vertex_in_guest_primitive);
-          }
+          assert_true(IsSpirvRectangleListVertexLoopEnabled());
           vertex_index = builder_->createBinOp(
               spv::OpIAdd, type_uint_,
-              builder_->createBinOp(spv::OpIMul, type_uint_, vertex_index, const_uint_3),
-              guest_vertex_in_guest_primitive);
+              builder_->createBinOp(spv::OpIMul, type_uint_, vertex_index,
+                                    builder_->makeUintConstant(3)),
+              builder_->createLoad(var_main_rectangle_guest_vertex_index_, spv::NoPrecision));
         }
-        // Check if the index needs to be loaded from the index buffer.
-        spv::Id load_vertex_index = builder_->createBinOp(
-            spv::OpINotEqual, type_bool_,
-            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                  builder_->makeUintConstant(static_cast<unsigned int>(
-                                      kSysFlag_ComputeOrPrimitiveVertexIndexLoad))),
-            const_uint_0_);
-        SpirvBuilder::IfBuilder load_vertex_index_if(
-            load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
-        spv::Id loaded_vertex_index;
-        {
-          // Check if the index is 32-bit.
-          spv::Id vertex_index_is_32bit = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_,
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                    builder_->makeUintConstant(static_cast<unsigned int>(
-                                        kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit))),
-              const_uint_0_);
-          // Calculate the vertex index address in the shared memory.
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(
-              builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
-          spv::Id vertex_index_address = builder_->createBinOp(
-              spv::OpIAdd, type_uint_,
-              builder_->createLoad(
-                  builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                              id_vector_temp_),
-                  spv::NoPrecision),
-              builder_->createBinOp(
-                  spv::OpShiftLeftLogical, type_uint_, vertex_index,
-                  builder_->createTriOp(spv::OpSelect, type_uint_, vertex_index_is_32bit,
-                                        const_uint_2, builder_->makeUintConstant(1))));
-          // Load the 32 bits containing the whole vertex index or two 16-bit
-          // vertex indices.
-          // TODO(Triang3l): Bounds checking.
-          loaded_vertex_index = LoadUint32FromSharedMemory(
-              builder_->createUnaryOp(spv::OpBitcast, type_int_,
-                                      builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
-                                                            vertex_index_address, const_uint_2)));
-          // Extract the 16-bit index from the loaded 32 bits if needed.
-          loaded_vertex_index = builder_->createTriOp(
-              spv::OpSelect, type_uint_, vertex_index_is_32bit, loaded_vertex_index,
-              builder_->createTriOp(
-                  spv::OpBitFieldUExtract, type_uint_, loaded_vertex_index,
-                  builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_,
-                                        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                                              vertex_index_address, const_uint_2),
-                                        builder_->makeUintConstant(4 - 1)),
-                  builder_->makeUintConstant(16)));
-          // Endian-swap the loaded index.
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
-          loaded_vertex_index = EndianSwap32Uint(
-              loaded_vertex_index,
-              builder_->createLoad(
-                  builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                              id_vector_temp_),
-                  spv::NoPrecision));
-        }
-        load_vertex_index_if.makeEndIf();
-        // Select between the loaded index and the original index from Vulkan.
-        vertex_index = load_vertex_index_if.createMergePhi(loaded_vertex_index, vertex_index);
+        vertex_index = LoadPrimitiveVertexIndexIfNeeded(vertex_index);
       } else {
-        if (IsSpirvComputeShader()) {
-          // For memexport compute fallback, optionally load the original index
-          // from guest DMA (16-bit or 32-bit), unless emulating adaptive
-          // tessellation patch indexing (the patch index comes from invocation
-          // ID in that mode).
-          spv::Id patch_index_from_invocation = builder_->createBinOp(
+        // TODO(Triang3l): Close line loop primitive.
+        // Load the unswapped index as uint for swapping, or for indirect
+        // loading if needed.
+        if (!features_.full_draw_index_uint32) {
+          // Check if the full 32-bit index needs to be loaded indirectly.
+          spv::Id load_vertex_index = builder_->createBinOp(
               spv::OpINotEqual, type_bool_,
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                    builder_->makeUintConstant(static_cast<unsigned int>(
-                                        kSysFlag_ComputeMemExportPatchIndexFromInvocation))),
-              const_uint_0_);
-          compute_load_vertex_index = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_,
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                    builder_->makeUintConstant(static_cast<unsigned int>(
-                                        kSysFlag_ComputeOrPrimitiveVertexIndexLoad))),
-              const_uint_0_);
-          compute_load_vertex_index = builder_->createBinOp(
-              spv::OpLogicalAnd, type_bool_, compute_load_vertex_index,
-              builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, patch_index_from_invocation));
-          compute_vertex_index_is_32bit = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_,
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                    builder_->makeUintConstant(static_cast<unsigned int>(
-                                        kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit))),
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                  builder_->makeUintConstant(static_cast<unsigned int>(kSysFlag_VertexIndexLoad))),
               const_uint_0_);
           SpirvBuilder::IfBuilder load_vertex_index_if(
-              compute_load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
+              load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
           spv::Id loaded_vertex_index;
           {
+            // Load the 32-bit index.
+            // TODO(Triang3l): Bounds checking.
             id_vector_temp_.clear();
             id_vector_temp_.push_back(
                 builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
-            spv::Id vertex_index_address = builder_->createBinOp(
-                spv::OpIAdd, type_uint_,
-                builder_->createLoad(
-                    builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                                id_vector_temp_),
-                    spv::NoPrecision),
-                builder_->createBinOp(
-                    spv::OpShiftLeftLogical, type_uint_, vertex_index,
-                    builder_->createTriOp(spv::OpSelect, type_uint_, compute_vertex_index_is_32bit,
-                                          builder_->makeUintConstant(2),
-                                          builder_->makeUintConstant(1))));
             loaded_vertex_index = LoadUint32FromSharedMemory(builder_->createUnaryOp(
                 spv::OpBitcast, type_int_,
-                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, vertex_index_address,
-                                      builder_->makeUintConstant(2))));
-            loaded_vertex_index = builder_->createTriOp(
-                spv::OpSelect, type_uint_, compute_vertex_index_is_32bit, loaded_vertex_index,
-                builder_->createTriOp(
-                    spv::OpBitFieldUExtract, type_uint_, loaded_vertex_index,
+                builder_->createBinOp(
+                    spv::OpIAdd, type_uint_,
                     builder_->createBinOp(
-                        spv::OpShiftLeftLogical, type_uint_,
-                        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, vertex_index_address,
-                                              builder_->makeUintConstant(2)),
-                        builder_->makeUintConstant(3)),
-                    builder_->makeUintConstant(16)));
-            id_vector_temp_.clear();
-            id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
-            loaded_vertex_index = EndianSwap32Uint(
-                loaded_vertex_index,
-                builder_->createLoad(
-                    builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                                id_vector_temp_),
-                    spv::NoPrecision));
+                        spv::OpShiftRightLogical, type_uint_,
+                        builder_->createLoad(
+                            builder_->createAccessChain(spv::StorageClassUniform,
+                                                        uniform_system_constants_, id_vector_temp_),
+                            spv::NoPrecision),
+                        builder_->makeUintConstant(2)),
+                    vertex_index)));
           }
           load_vertex_index_if.makeEndIf();
+          // Select between the loaded index and the original index from Vulkan.
           vertex_index = load_vertex_index_if.createMergePhi(loaded_vertex_index, vertex_index);
-        } else {
-          // Load the unswapped index as uint for swapping, or for indirect
-          // loading if needed.
-          if (!features_.full_draw_index_uint32) {
-            // Check if the full 32-bit index needs to be loaded indirectly.
-            spv::Id load_vertex_index = builder_->createBinOp(
-                spv::OpINotEqual, type_bool_,
-                builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                      builder_->makeUintConstant(
-                                          static_cast<unsigned int>(kSysFlag_VertexIndexLoad))),
-                const_uint_0_);
-            SpirvBuilder::IfBuilder load_vertex_index_if(
-                load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
-            spv::Id loaded_vertex_index;
-            {
-              // Load the 32-bit index.
-              // TODO(Triang3l): Bounds checking.
-              id_vector_temp_.clear();
-              id_vector_temp_.push_back(
-                  builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
-              loaded_vertex_index = LoadUint32FromSharedMemory(builder_->createUnaryOp(
-                  spv::OpBitcast, type_int_,
-                  builder_->createBinOp(
-                      spv::OpIAdd, type_uint_,
-                      builder_->createBinOp(
-                          spv::OpShiftRightLogical, type_uint_,
-                          builder_->createLoad(builder_->createAccessChain(
+        }
+        // Endian-swap the index.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
+        vertex_index = EndianSwap32Uint(
+            vertex_index, builder_->createLoad(builder_->createAccessChain(
                                                    spv::StorageClassUniform,
                                                    uniform_system_constants_, id_vector_temp_),
-                                               spv::NoPrecision),
-                          builder_->makeUintConstant(2)),
-                      vertex_index)));
-            }
-            load_vertex_index_if.makeEndIf();
-            // Select between the loaded index and the original index from Vulkan.
-            vertex_index = load_vertex_index_if.createMergePhi(loaded_vertex_index, vertex_index);
-          }
-          // Endian-swap the index.
-          id_vector_temp_.clear();
-          id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
-          vertex_index = EndianSwap32Uint(
-              vertex_index, builder_->createLoad(builder_->createAccessChain(
-                                                     spv::StorageClassUniform,
-                                                     uniform_system_constants_, id_vector_temp_),
-                                                 spv::NoPrecision));
-        }
+                                               spv::NoPrecision));
       }
-      if (IsSpirvComputeShader() && IsMemoryExportUsed()) {
-        // Primitive reset must suppress memexport for reset-index invocations
-        // in the compute fallback path.
-        spv::Id primitive_reset_enabled = builder_->createBinOp(
-            spv::OpINotEqual, type_bool_,
-            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                  builder_->makeUintConstant(static_cast<unsigned int>(
-                                      kSysFlag_ComputeOrPrimitiveVertexIndexReset))),
-            const_uint_0_);
-        spv::Id vertex_index_is_32bit = builder_->createBinOp(
-            spv::OpINotEqual, type_bool_,
-            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                  builder_->makeUintConstant(static_cast<unsigned int>(
-                                      kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit))),
-            const_uint_0_);
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexReset));
-        spv::Id vertex_index_reset = builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                        id_vector_temp_),
-            spv::NoPrecision);
-        spv::Id vertex_index_not_reset_16 =
-            builder_->createBinOp(spv::OpINotEqual, type_bool_, vertex_index, vertex_index_reset);
-        spv::Id vertex_index_not_reset_32 = builder_->createBinOp(
-            spv::OpINotEqual, type_bool_,
-            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, vertex_index,
-                                  builder_->makeUintConstant(xenos::kVertexIndexMask)),
-            vertex_index_reset);
-        spv::Id vertex_index_not_reset =
-            builder_->createTriOp(spv::OpSelect, type_bool_, vertex_index_is_32bit,
-                                  vertex_index_not_reset_32, vertex_index_not_reset_16);
-        spv::Id memexport_allowed_for_non_reset_index = builder_->createBinOp(
-            spv::OpLogicalOr, type_bool_,
-            builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, primitive_reset_enabled),
-            vertex_index_not_reset);
-        main_memexport_allowed_ =
-            main_memexport_allowed_ != spv::NoResult
-                ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_, main_memexport_allowed_,
-                                        memexport_allowed_for_non_reset_index)
-                : memexport_allowed_for_non_reset_index;
-      }
-      // Add the base index, apply the 24-bit index mask and clamp to the
-      // draw's index range similarly to the Direct3D path.
+      // Convert the index to a signed integer.
+      vertex_index = builder_->createUnaryOp(spv::OpBitcast, type_int_, vertex_index);
+      // Add the base to the index.
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexBaseIndex));
-      spv::Id vertex_base_index = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
+      vertex_index = builder_->createBinOp(
+          spv::OpIAdd, type_int_, vertex_index,
+          builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision));
+      // Write the index to r0.x as float.
       id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexMin));
-      spv::Id vertex_index_min = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexMax));
-      spv::Id vertex_index_max = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
-      auto remap_vertex_index_to_float = [this, vertex_base_index, vertex_index_min,
-                                          vertex_index_max](spv::Id index) {
-        index = builder_->createBinOp(
-            spv::OpIAdd, type_uint_, index,
-            builder_->createUnaryOp(spv::OpBitcast, type_uint_, vertex_base_index));
-        index = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, index,
-                                      builder_->makeUintConstant(xenos::kVertexIndexMask));
-        index = builder_->createTriBuiltinCall(type_uint_, ext_inst_glsl_std_450_, GLSLstd450UClamp,
-                                               index, vertex_index_min, vertex_index_max);
-        return builder_->createUnaryOp(spv::OpConvertUToF, type_float_, index);
-      };
-      // Write the index to the register expected by the current host vertex
-      // shader mode.
-      spv::Id vertex_index_float = remap_vertex_index_to_float(vertex_index);
-      if (IsSpirvComputeShader()) {
-        auto load_compute_vertex_index_float = [this, compute_load_vertex_index,
-                                                compute_vertex_index_is_32bit,
-                                                &remap_vertex_index_to_float](
-                                                   spv::Id vertex_processing_index) {
-          spv::Id index = vertex_processing_index;
-          SpirvBuilder::IfBuilder load_vertex_index_if(
-              compute_load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
-          spv::Id loaded_vertex_index;
-          {
-            id_vector_temp_.clear();
-            id_vector_temp_.push_back(
-                builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
-            spv::Id vertex_index_address = builder_->createBinOp(
-                spv::OpIAdd, type_uint_,
-                builder_->createLoad(
-                    builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                                id_vector_temp_),
-                    spv::NoPrecision),
-                builder_->createBinOp(
-                    spv::OpShiftLeftLogical, type_uint_, vertex_processing_index,
-                    builder_->createTriOp(spv::OpSelect, type_uint_, compute_vertex_index_is_32bit,
-                                          builder_->makeUintConstant(2),
-                                          builder_->makeUintConstant(1))));
-            loaded_vertex_index = LoadUint32FromSharedMemory(builder_->createUnaryOp(
-                spv::OpBitcast, type_int_,
-                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, vertex_index_address,
-                                      builder_->makeUintConstant(2))));
-            loaded_vertex_index = builder_->createTriOp(
-                spv::OpSelect, type_uint_, compute_vertex_index_is_32bit, loaded_vertex_index,
-                builder_->createTriOp(
-                    spv::OpBitFieldUExtract, type_uint_, loaded_vertex_index,
-                    builder_->createBinOp(
-                        spv::OpShiftLeftLogical, type_uint_,
-                        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, vertex_index_address,
-                                              builder_->makeUintConstant(2)),
-                        builder_->makeUintConstant(3)),
-                    builder_->makeUintConstant(16)));
-            id_vector_temp_.clear();
-            id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
-            loaded_vertex_index = EndianSwap32Uint(
-                loaded_vertex_index,
-                builder_->createLoad(
-                    builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                                id_vector_temp_),
-                    spv::NoPrecision));
-          }
-          load_vertex_index_if.makeEndIf();
-          index = load_vertex_index_if.createMergePhi(loaded_vertex_index, index);
-          return remap_vertex_index_to_float(index);
-        };
-        spv::Id triangle_cp_indexed = builder_->createBinOp(
-            spv::OpINotEqual, type_bool_,
-            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                  builder_->makeUintConstant(static_cast<unsigned int>(
-                                      kSysFlag_ComputeMemExportTriangleCPIndexed))),
-            const_uint_0_);
-        spv::Id quad_cp_indexed = builder_->createBinOp(
-            spv::OpINotEqual, type_bool_,
-            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                  builder_->makeUintConstant(static_cast<unsigned int>(
-                                      kSysFlag_ComputeMemExportQuadCPIndexed))),
-            const_uint_0_);
-        spv::Id cp_indexed = builder_->createBinOp(spv::OpLogicalOr, type_bool_,
-                                                   triangle_cp_indexed, quad_cp_indexed);
-        SpirvBuilder::IfBuilder if_cp_indexed(cp_indexed, spv::SelectionControlDontFlattenMask,
-                                              *builder_);
-        {
-          spv::Id cp_count =
-              builder_->createTriOp(spv::OpSelect, type_uint_, triangle_cp_indexed,
-                                    builder_->makeUintConstant(3), builder_->makeUintConstant(4));
-          spv::Id cp_in_patch = builder_->createBinOp(spv::OpUMod, type_uint_,
-                                                      compute_vertex_processing_index, cp_count);
-          spv::Id patch_first_vertex_processing_index = builder_->createBinOp(
-              spv::OpISub, type_uint_, compute_vertex_processing_index, cp_in_patch);
-          spv::Id cp_index_0 = load_compute_vertex_index_float(patch_first_vertex_processing_index);
-          spv::Id cp_index_1 = load_compute_vertex_index_float(
-              builder_->createBinOp(spv::OpIAdd, type_uint_, patch_first_vertex_processing_index,
-                                    builder_->makeUintConstant(1)));
-          spv::Id cp_index_2 = load_compute_vertex_index_float(
-              builder_->createBinOp(spv::OpIAdd, type_uint_, patch_first_vertex_processing_index,
-                                    builder_->makeUintConstant(2)));
-
-          SpirvBuilder::IfBuilder if_triangle_cp(triangle_cp_indexed,
-                                                 spv::SelectionControlDontFlattenMask, *builder_);
-          {
-            // Emulate barycentric corner selection for the current control
-            // point in the patch: r0.xyz = domain location zyx.
-            spv::Id cp_is_0 =
-                builder_->createBinOp(spv::OpIEqual, type_bool_, cp_in_patch, const_uint_0_);
-            spv::Id cp_is_1 = builder_->createBinOp(spv::OpIEqual, type_bool_, cp_in_patch,
-                                                    builder_->makeUintConstant(1));
-            spv::Id cp_is_2 = builder_->createBinOp(spv::OpIEqual, type_bool_, cp_in_patch,
-                                                    builder_->makeUintConstant(2));
-            spv::Id domain_z = builder_->createTriOp(spv::OpSelect, type_float_, cp_is_2,
-                                                     const_float_1_, const_float_0_);
-            spv::Id domain_y = builder_->createTriOp(spv::OpSelect, type_float_, cp_is_1,
-                                                     const_float_1_, const_float_0_);
-            spv::Id domain_x = builder_->createTriOp(spv::OpSelect, type_float_, cp_is_0,
-                                                     const_float_1_, const_float_0_);
-            store_register_component(0, 0, domain_z);
-            store_register_component(0, 1, domain_y);
-            store_register_component(0, 2, domain_x);
-            if (register_count() >= 2) {
-              store_register_component(1, 0, cp_index_0);
-              store_register_component(1, 1, cp_index_1);
-              store_register_component(1, 2, cp_index_2);
-            }
-          }
-          if_triangle_cp.makeBeginElse();
-          {
-            // Emulate quad corner selection for the current control point:
-            // r0.xy = domain location xy.
-            spv::Id cp_is_1 = builder_->createBinOp(spv::OpIEqual, type_bool_, cp_in_patch,
-                                                    builder_->makeUintConstant(1));
-            spv::Id cp_is_2 = builder_->createBinOp(spv::OpIEqual, type_bool_, cp_in_patch,
-                                                    builder_->makeUintConstant(2));
-            spv::Id cp_is_3 = builder_->createBinOp(spv::OpIEqual, type_bool_, cp_in_patch,
-                                                    builder_->makeUintConstant(3));
-            spv::Id domain_x = builder_->createTriOp(
-                spv::OpSelect, type_float_,
-                builder_->createBinOp(spv::OpLogicalOr, type_bool_, cp_is_1, cp_is_2),
-                const_float_1_, const_float_0_);
-            spv::Id domain_y = builder_->createTriOp(
-                spv::OpSelect, type_float_,
-                builder_->createBinOp(spv::OpLogicalOr, type_bool_, cp_is_2, cp_is_3),
-                const_float_1_, const_float_0_);
-            store_register_component(0, 0, domain_x);
-            store_register_component(0, 1, domain_y);
-            store_register_component(0, 2, cp_index_0);
-            if (register_count() >= 2) {
-              spv::Id cp_index_3 = load_compute_vertex_index_float(builder_->createBinOp(
-                  spv::OpIAdd, type_uint_, patch_first_vertex_processing_index,
-                  builder_->makeUintConstant(3)));
-              store_register_component(1, 0, cp_index_1);
-              store_register_component(1, 1, cp_index_2);
-              store_register_component(1, 2, cp_index_3);
-            }
-          }
-          if_triangle_cp.makeEndIf();
-        }
-        if_cp_indexed.makeBeginElse();
-        if (register_count() >= 2) {
-          spv::Id patch_index_in_register_1 = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_,
-              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
-                                    builder_->makeUintConstant(static_cast<unsigned int>(
-                                        kSysFlag_ComputeMemExportPatchIndexInRegister1))),
-              const_uint_0_);
-          SpirvBuilder::IfBuilder if_patch_index_in_register_1(
-              patch_index_in_register_1, spv::SelectionControlDontFlattenMask, *builder_);
-          store_register_component(1, 0, vertex_index_float);
-          if_patch_index_in_register_1.makeBeginElse();
-          store_register_component(0, 0, vertex_index_float);
-          if_patch_index_in_register_1.makeEndIf();
-        } else {
-          store_register_component(0, 0, vertex_index_float);
-        }
-        if_cp_indexed.makeEndIf();
-      } else {
-        store_register_component(0, 0, vertex_index_float);
-      }
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(const_int_0_);
+      builder_->createStore(builder_->createUnaryOp(spv::OpConvertSToF, type_float_, vertex_index),
+                            builder_->createAccessChain(spv::StorageClassFunction,
+                                                        var_main_registers_, id_vector_temp_));
     }
+  }
+}
+
+// ReXGlue: split out of StartVertexOrTessEvalShaderInMain for the rectangle-list vertex loop.
+spv::Id SpirvShaderTranslator::LoadPrimitiveVertexIndexIfNeeded(spv::Id vertex_index) {
+  spv::Id const_uint_2 = builder_->makeUintConstant(2);
+  // Check if the index needs to be loaded from the index buffer.
+  spv::Id load_vertex_index = builder_->createBinOp(
+      spv::OpINotEqual, type_bool_,
+      builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                            builder_->makeUintConstant(static_cast<unsigned int>(
+                                kSysFlag_ComputeOrPrimitiveVertexIndexLoad))),
+      const_uint_0_);
+  SpirvBuilder::IfBuilder load_vertex_index_if(load_vertex_index,
+                                               spv::SelectionControlDontFlattenMask, *builder_);
+  spv::Id loaded_vertex_index;
+  {
+    // Check if the index is 32-bit.
+    spv::Id vertex_index_is_32bit = builder_->createBinOp(
+        spv::OpINotEqual, type_bool_,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                              builder_->makeUintConstant(static_cast<unsigned int>(
+                                  kSysFlag_ComputeOrPrimitiveVertexIndexLoad32Bit))),
+        const_uint_0_);
+    // Calculate the vertex index address in the shared memory.
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexLoadAddress));
+    spv::Id vertex_index_address = builder_->createBinOp(
+        spv::OpIAdd, type_uint_,
+        builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision),
+        builder_->createBinOp(
+            spv::OpShiftLeftLogical, type_uint_, vertex_index,
+            builder_->createTriOp(spv::OpSelect, type_uint_, vertex_index_is_32bit, const_uint_2,
+                                  builder_->makeUintConstant(1))));
+    // Load the 32 bits containing the whole vertex index or two 16-bit
+    // vertex indices.
+    // TODO(Triang3l): Bounds checking.
+    loaded_vertex_index = LoadUint32FromSharedMemory(
+        builder_->createUnaryOp(spv::OpBitcast, type_int_,
+                                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                                      vertex_index_address, const_uint_2)));
+    // Extract the 16-bit index from the loaded 32 bits if needed.
+    loaded_vertex_index = builder_->createTriOp(
+        spv::OpSelect, type_uint_, vertex_index_is_32bit, loaded_vertex_index,
+        builder_->createTriOp(
+            spv::OpBitFieldUExtract, type_uint_, loaded_vertex_index,
+            builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_,
+                                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                                        vertex_index_address, const_uint_2),
+                                  builder_->makeUintConstant(4 - 1)),
+            builder_->makeUintConstant(16)));
+    // Endian-swap the loaded index.
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
+    loaded_vertex_index = EndianSwap32Uint(
+        loaded_vertex_index, builder_->createLoad(builder_->createAccessChain(
+                                                      spv::StorageClassUniform,
+                                                      uniform_system_constants_, id_vector_temp_),
+                                                  spv::NoPrecision));
+  }
+  load_vertex_index_if.makeEndIf();
+  // Select between the loaded index and the original index from Vulkan.
+  return load_vertex_index_if.createMergePhi(loaded_vertex_index, vertex_index);
+}
+
+// ReXGlue: rectangle-list vertex loop.
+void SpirvShaderTranslator::CompleteRectangleListVertexLoopIteration() {
+  assert_true(IsSpirvRectangleListVertexLoopEnabled());
+  assert_true(builder_->getBuildPoint() == main_loop_merge_);
+  bool has_main_switch = !current_shader().label_addresses().empty();
+  // For rectangle-list fallback without geometry shaders, run the guest vertex
+  // shader 3 times (for all source vertices), then choose or synthesize the
+  // output for the current host strip vertex.
+  Modification shader_modification = GetSpirvShaderModification();
+  uint32_t clip_distance_count = shader_modification.GetVertexClipDistanceCount();
+  uint32_t cull_distance_count = shader_modification.GetVertexCullDistanceCount();
+
+  CompleteVertexOrTessEvalShaderInMain();
+
+  spv::Id rectangle_guest_vertex_index =
+      builder_->createLoad(var_main_rectangle_guest_vertex_index_, spv::NoPrecision);
+  spv::Id rectangle_guest_vertex_index_int =
+      builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_guest_vertex_index);
+
+  // Store current iteration outputs, member by member.
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
+  spv::Id rectangle_vertex_position = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_),
+      spv::NoPrecision);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
+  builder_->createStore(
+      rectangle_vertex_position,
+      builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
+                                  id_vector_temp_));
+  auto store_rectangle_distance_members =
+      [this, rectangle_guest_vertex_index_int](
+          uint32_t member_index, uint32_t component_count,
+          const std::array<spv::Id, kMaxRectanglePerVertexDistances>& variables) {
+        for (uint32_t i = 0; i < component_count; ++i) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(int(member_index)));
+          id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+          spv::Id value =
+              builder_->createLoad(builder_->createAccessChain(spv::StorageClassOutput,
+                                                               output_per_vertex_, id_vector_temp_),
+                                   spv::NoPrecision);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
+          builder_->createStore(value, builder_->createAccessChain(spv::StorageClassFunction,
+                                                                   variables[i], id_vector_temp_));
+        }
+      };
+  if (clip_distance_count && output_per_vertex_clip_distance_member_index_ != 0) {
+    store_rectangle_distance_members(output_per_vertex_clip_distance_member_index_,
+                                     clip_distance_count, var_main_rectangle_clip_distances_);
+  }
+  if (cull_distance_count && output_per_vertex_cull_distance_member_index_ != 0) {
+    store_rectangle_distance_members(output_per_vertex_cull_distance_member_index_,
+                                     cull_distance_count, var_main_rectangle_cull_distances_);
+  }
+  uint32_t interpolators_remaining = GetModificationInterpolatorMask();
+  uint32_t interpolator_index;
+  while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+    interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
+    builder_->createStore(
+        builder_->createLoad(input_output_interpolators_[interpolator_index], spv::NoPrecision),
+        builder_->createAccessChain(spv::StorageClassFunction,
+                                    var_main_rectangle_interpolators_[interpolator_index],
+                                    id_vector_temp_));
+  }
+
+  spv::Id rectangle_guest_vertex_is_last = builder_->createBinOp(
+      spv::OpIEqual, type_bool_, rectangle_guest_vertex_index, builder_->makeUintConstant(2));
+  SpirvBuilder::IfBuilder if_not_last_guest_vertex(
+      builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, rectangle_guest_vertex_is_last),
+      spv::SelectionControlDontFlattenMask, *builder_);
+  {
+    spv::Id rectangle_guest_vertex_index_next = builder_->createBinOp(
+        spv::OpIAdd, type_uint_, rectangle_guest_vertex_index, builder_->makeUintConstant(1));
+    builder_->createStore(rectangle_guest_vertex_index_next,
+                          var_main_rectangle_guest_vertex_index_);
+
+    // Reinitialize per-vertex execution state before running the translated
+    // guest shader for the next rectangle vertex.
+    builder_->createStore(builder_->makeBoolConstant(false), var_main_predicate_);
+    builder_->createStore(const_uint4_0_, var_main_loop_count_);
+    builder_->createStore(const_int_0_, var_main_address_register_);
+    builder_->createStore(const_int4_0_, var_main_loop_address_);
+    builder_->createStore(const_float_0_, var_main_previous_scalar_);
+    builder_->createStore(const_int_0_, var_main_vfetch_address_);
+    builder_->createStore(const_int_0_, var_main_vfetch_bound_);
+    builder_->createStore(const_float_0_, var_main_tfetch_lod_);
+    builder_->createStore(const_float3_0_, var_main_tfetch_gradients_h_);
+    builder_->createStore(const_float3_0_, var_main_tfetch_gradients_v_);
+    for (uint32_t i = 0; i < register_count(); ++i) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+      builder_->createStore(const_float4_0_,
+                            builder_->createAccessChain(spv::StorageClassFunction,
+                                                        var_main_registers_, id_vector_temp_));
+    }
+    uint32_t iteration_interpolators_remaining = GetModificationInterpolatorMask();
+    while (rex::bit_scan_forward(iteration_interpolators_remaining, &interpolator_index)) {
+      iteration_interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+      builder_->createStore(const_float4_0_, input_output_interpolators_[interpolator_index]);
+    }
+    if (var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeFloatConstant(-1.0f));
+      id_vector_temp_.push_back(const_float_0_);
+      id_vector_temp_.push_back(const_float_0_);
+      builder_->createStore(builder_->makeCompositeConstant(type_float3_, id_vector_temp_),
+                            var_main_point_size_edge_flag_kill_vertex_);
+    }
+    if (IsMemoryExportUsed()) {
+      // Flush and reinitialize memexport state for the next guest rectangle
+      // vertex iteration in this host invocation.
+      ExportToMemory(current_shader().memexport_eM_potentially_written_before_end());
+      builder_->createStore(const_float4_0_, var_main_memexport_address_);
+      uint8_t memexport_eM_remaining = current_shader().memexport_eM_written();
+      uint32_t memexport_eM_index;
+      while (rex::bit_scan_forward(memexport_eM_remaining, &memexport_eM_index)) {
+        memexport_eM_remaining &= ~(uint8_t(1) << memexport_eM_index);
+        builder_->createStore(const_float4_0_, var_main_memexport_data_[memexport_eM_index]);
+      }
+      builder_->createStore(const_uint_0_, var_main_memexport_data_written_);
+    }
+
+    // Load the next guest vertex index into r0.x.
+    if (register_count()) {
+      // Rectangle lists consume 3 guest vertices per primitive.
+      spv::Id rectangle_vertex_index = builder_->createBinOp(
+          spv::OpIAdd, type_uint_,
+          builder_->createBinOp(spv::OpIMul, type_uint_,
+                                builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
+                                                      builder_->createUnaryOp(
+                                                          spv::OpBitcast, type_uint_,
+                                                          builder_->createLoad(input_vertex_index_,
+                                                                               spv::NoPrecision)),
+                                                      builder_->makeUintConstant(2)),
+                                builder_->makeUintConstant(3)),
+          rectangle_guest_vertex_index_next);
+      rectangle_vertex_index = LoadPrimitiveVertexIndexIfNeeded(rectangle_vertex_index);
+      // Convert the index to a signed integer and add the base to it.
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantVertexBaseIndex));
+      spv::Id rectangle_vertex_index_int = builder_->createBinOp(
+          spv::OpIAdd, type_int_,
+          builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_vertex_index),
+          builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision));
+      // Write the index to r0.x as float.
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(const_int_0_);
+      builder_->createStore(
+          builder_->createUnaryOp(spv::OpConvertSToF, type_float_, rectangle_vertex_index_int),
+          builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
+                                      id_vector_temp_));
+    }
+
+    if (has_main_switch) {
+      main_switch_next_pc_phi_operands_.push_back(const_int_0_);
+      main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+    }
+    builder_->createBranch(main_loop_continue_);
+  }
+  // The branch to the loop continuation already terminated the "then" side.
+  if_not_last_guest_vertex.makeBeginElse(false);
+  {
+    spv::Id rectangle_host_vertex_in_primitive = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_uint_,
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
+        builder_->makeUintConstant(3));
+    spv::Id rectangle_host_vertex_is_synthetic =
+        builder_->createBinOp(spv::OpIEqual, type_bool_, rectangle_host_vertex_in_primitive,
+                              builder_->makeUintConstant(3));
+    spv::Id rectangle_host_vertex_is_0 = builder_->createBinOp(
+        spv::OpIEqual, type_bool_, rectangle_host_vertex_in_primitive, const_uint_0_);
+    spv::Id rectangle_host_vertex_is_1 =
+        builder_->createBinOp(spv::OpIEqual, type_bool_, rectangle_host_vertex_in_primitive,
+                              builder_->makeUintConstant(1));
+
+    auto load_rectangle_position_xy = [this](spv::Id vertex_index, uint32_t component) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(vertex_index);
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(component)));
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
+                                      id_vector_temp_),
+          spv::NoPrecision);
+    };
+
+    spv::Id const_int_0 = builder_->makeIntConstant(0);
+    spv::Id const_int_1 = builder_->makeIntConstant(1);
+    spv::Id const_int_2 = builder_->makeIntConstant(2);
+    spv::Id const_int_3 = builder_->makeIntConstant(3);
+
+    spv::Id edge_lengths[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+      spv::Id edge_0 = builder_->makeIntConstant(int((1 + i) % 3));
+      spv::Id edge_1 = builder_->makeIntConstant(int((2 + i) % 3));
+      spv::Id edge_x =
+          builder_->createBinOp(spv::OpFSub, type_float_, load_rectangle_position_xy(edge_1, 0),
+                                load_rectangle_position_xy(edge_0, 0));
+      spv::Id edge_y =
+          builder_->createBinOp(spv::OpFSub, type_float_, load_rectangle_position_xy(edge_1, 1),
+                                load_rectangle_position_xy(edge_0, 1));
+      edge_lengths[i] = builder_->createBinOp(
+          spv::OpFAdd, type_float_, builder_->createBinOp(spv::OpFMul, type_float_, edge_x, edge_x),
+          builder_->createBinOp(spv::OpFMul, type_float_, edge_y, edge_y));
+    }
+
+    spv::Id rectangle_vertex_indices[3];
+    rectangle_vertex_indices[0] = builder_->createTriOp(
+        spv::OpSelect, type_int_,
+        builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+                              builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_,
+                                                    edge_lengths[0], edge_lengths[1]),
+                              builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_,
+                                                    edge_lengths[0], edge_lengths[2])),
+        const_int_0,
+        builder_->createTriOp(spv::OpSelect, type_int_,
+                              builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_,
+                                                    edge_lengths[1], edge_lengths[2]),
+                              const_int_1, const_int_2));
+    for (uint32_t i = 1; i < 3; ++i) {
+      spv::Id vertex_index_without_wrapping = builder_->createBinOp(
+          spv::OpIAdd, type_int_, rectangle_vertex_indices[0], builder_->makeIntConstant(int(i)));
+      rectangle_vertex_indices[i] =
+          builder_->createTriOp(spv::OpSelect, type_int_,
+                                builder_->createBinOp(spv::OpSLessThan, type_bool_,
+                                                      vertex_index_without_wrapping, const_int_3),
+                                vertex_index_without_wrapping,
+                                builder_->createBinOp(spv::OpISub, type_int_,
+                                                      vertex_index_without_wrapping, const_int_3));
+    }
+
+    auto select_rectangle_vertex_component = [this, rectangle_host_vertex_is_0,
+                                              rectangle_host_vertex_is_1](
+                                                 spv::Id value_0, spv::Id value_1, spv::Id value_2,
+                                                 spv::Id type) {
+      return builder_->createTriOp(
+          spv::OpSelect, type, rectangle_host_vertex_is_0, value_0,
+          builder_->createTriOp(spv::OpSelect, type, rectangle_host_vertex_is_1, value_1, value_2));
+    };
+
+    interpolators_remaining = GetModificationInterpolatorMask();
+    while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+      interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(rectangle_vertex_indices[0]);
+      spv::Id interpolator_0 = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_rectangle_interpolators_[interpolator_index],
+                                      id_vector_temp_),
+          spv::NoPrecision);
+      id_vector_temp_[0] = rectangle_vertex_indices[1];
+      spv::Id interpolator_1 = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_rectangle_interpolators_[interpolator_index],
+                                      id_vector_temp_),
+          spv::NoPrecision);
+      id_vector_temp_[0] = rectangle_vertex_indices[2];
+      spv::Id interpolator_2 = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_rectangle_interpolators_[interpolator_index],
+                                      id_vector_temp_),
+          spv::NoPrecision);
+      spv::Id interpolator_original = select_rectangle_vertex_component(
+          interpolator_0, interpolator_1, interpolator_2, type_float4_);
+      spv::Id interpolator_synthetic = builder_->createNoContractionBinOp(
+          spv::OpFAdd, type_float4_,
+          builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, interpolator_1,
+                                             interpolator_0),
+          interpolator_2);
+      builder_->createStore(
+          builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
+                                interpolator_synthetic, interpolator_original),
+          input_output_interpolators_[interpolator_index]);
+    }
+
+    auto load_rectangle_vertex_value = [this](spv::Id variable, spv::Id vertex_index) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(vertex_index);
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction, variable, id_vector_temp_),
+          spv::NoPrecision);
+    };
+
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
+    spv::Id rectangle_position_ptr =
+        builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
+    spv::Id position_0 =
+        load_rectangle_vertex_value(var_main_rectangle_per_vertex_, rectangle_vertex_indices[0]);
+    spv::Id position_1 =
+        load_rectangle_vertex_value(var_main_rectangle_per_vertex_, rectangle_vertex_indices[1]);
+    spv::Id position_2 =
+        load_rectangle_vertex_value(var_main_rectangle_per_vertex_, rectangle_vertex_indices[2]);
+    spv::Id position_original =
+        select_rectangle_vertex_component(position_0, position_1, position_2, type_float4_);
+    spv::Id position_synthetic = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float4_,
+        builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, position_1, position_0),
+        position_2);
+    builder_->createStore(
+        builder_->createTriOp(spv::OpSelect, type_float4_, rectangle_host_vertex_is_synthetic,
+                              position_synthetic, position_original),
+        rectangle_position_ptr);
+
+    auto write_rectangle_distance_member =
+        [this, &select_rectangle_vertex_component, rectangle_host_vertex_is_synthetic,
+         &load_rectangle_vertex_value, rectangle_vertex_indices](
+            uint32_t member_index, uint32_t component_count,
+            const std::array<spv::Id, kMaxRectanglePerVertexDistances>& variables) {
+          for (uint32_t i = 0; i < component_count; ++i) {
+            spv::Id value_0 =
+                load_rectangle_vertex_value(variables[i], rectangle_vertex_indices[0]);
+            spv::Id value_1 =
+                load_rectangle_vertex_value(variables[i], rectangle_vertex_indices[1]);
+            spv::Id value_2 =
+                load_rectangle_vertex_value(variables[i], rectangle_vertex_indices[2]);
+            spv::Id value_original =
+                select_rectangle_vertex_component(value_0, value_1, value_2, type_float_);
+            spv::Id value_synthetic = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_,
+                builder_->createNoContractionBinOp(spv::OpFSub, type_float_, value_1, value_0),
+                value_2);
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(member_index)));
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+            builder_->createStore(builder_->createTriOp(spv::OpSelect, type_float_,
+                                                        rectangle_host_vertex_is_synthetic,
+                                                        value_synthetic, value_original),
+                                  builder_->createAccessChain(spv::StorageClassOutput,
+                                                              output_per_vertex_, id_vector_temp_));
+          }
+        };
+
+    if (clip_distance_count && output_per_vertex_clip_distance_member_index_ != 0) {
+      write_rectangle_distance_member(output_per_vertex_clip_distance_member_index_,
+                                      clip_distance_count, var_main_rectangle_clip_distances_);
+    }
+    if (cull_distance_count && output_per_vertex_cull_distance_member_index_ != 0) {
+      write_rectangle_distance_member(output_per_vertex_cull_distance_member_index_,
+                                      cull_distance_count, var_main_rectangle_cull_distances_);
+    }
+  }
+  if_not_last_guest_vertex.makeEndIf();
+  // The last guest vertex has been processed - leave the main loop.
+  if (!builder_->getBuildPoint()->isTerminated()) {
+    builder_->createBranch(main_loop_exit_);
   }
 }
 
@@ -2509,48 +2259,51 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
     }
   }
 
-  uint32_t clip_distance_next_component = 0;
-  uint32_t cull_distance_next_component = 0;
-  // Clip against user clip planes.
-  if (shader_modification.vertex.user_clip_plane_count) {
-    uint32_t output_per_vertex_member_clip_or_cull_distance =
-        shader_modification.vertex.user_clip_plane_cull ? output_per_vertex_member_cull_distance_
-                                                        : output_per_vertex_member_clip_distance_;
-    assert_true(output_per_vertex_member_clip_or_cull_distance != UINT32_MAX);
-    // Position with W format handled, but before guest-to-host NDC transform.
-    spv::Id guest_position_formatted;
+  // Compute user clip/cull distances BEFORE NDC transform.
+  // Clip planes must operate on the original clip-space position.
+  uint32_t user_clip_plane_count = shader_modification.vertex.user_clip_plane_count;
+  if (user_clip_plane_count > 0) {
+    // Reconstruct the original clip-space position (x, y, z, w) for dot
+    // product. Use the untransformed position_xyz and corrected position_w.
+    spv::Id clip_space_position;
     {
-      // Bypass the `getNumTypeConstituents(typeId) == (int)constituents.size()`
-      // assertion in createCompositeConstruct, OpCompositeConstruct can
-      // construct vectors not only from scalars, but also from other vectors.
       std::unique_ptr<spv::Instruction> composite_construct_op = std::make_unique<spv::Instruction>(
           builder_->getUniqueId(), type_float4_, spv::OpCompositeConstruct);
       composite_construct_op->addIdOperand(position_xyz);
       composite_construct_op->addIdOperand(position_w);
-      guest_position_formatted = composite_construct_op->getResultId();
+      clip_space_position = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
     }
-    uint32_t& user_clip_plane_next_component = shader_modification.vertex.user_clip_plane_cull
-                                                   ? cull_distance_next_component
-                                                   : clip_distance_next_component;
-    for (uint32_t i = 0; i < shader_modification.vertex.user_clip_plane_count; ++i) {
+
+    // Determine which member index to use based on whether we're using
+    // ClipDistance or CullDistance.
+    bool user_clip_plane_cull = shader_modification.vertex.user_clip_plane_cull;
+    unsigned int clip_cull_distance_member_index =
+        user_clip_plane_cull ? output_per_vertex_cull_distance_member_index_
+                             : output_per_vertex_clip_distance_member_index_;
+
+    // Compute distance to each enabled user clip plane via dot product.
+    for (uint32_t i = 0; i < user_clip_plane_count; ++i) {
+      // Load user clip plane from separate clip plane constants buffer.
       id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantUserClipPlanes));
-      id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-      spv::Id user_clip_plane = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+      id_vector_temp_.push_back(builder_->makeIntConstant(0));       // Struct member 0
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));  // Array index
+      spv::Id clip_plane = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassUniform, uniform_clip_plane_constants_,
                                       id_vector_temp_),
           spv::NoPrecision);
-      spv::Id user_clip_distance =
-          builder_->createBinOp(spv::OpDot, type_float_, guest_position_formatted, user_clip_plane);
+
+      // Compute dot product: distance = dot(clip_space_position, clip_plane).
+      spv::Id distance =
+          builder_->createBinOp(spv::OpDot, type_float_, clip_space_position, clip_plane);
+
+      // Store to gl_ClipDistance[i] or gl_CullDistance[i].
       id_vector_temp_.clear();
-      id_vector_temp_.push_back(
-          builder_->makeIntConstant(int(output_per_vertex_member_clip_or_cull_distance)));
-      id_vector_temp_.push_back(builder_->makeIntConstant(int(user_clip_plane_next_component)));
-      builder_->createStore(user_clip_distance,
-                            builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
-                                                        id_vector_temp_));
-      ++user_clip_plane_next_component;
+      id_vector_temp_.push_back(builder_->makeIntConstant(clip_cull_distance_member_index));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+      spv::Id distance_ptr =
+          builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
+      builder_->createStore(distance, distance_ptr);
     }
   }
 
@@ -2574,44 +2327,49 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   position_xyz =
       builder_->createNoContractionBinOp(spv::OpFAdd, type_float3_, position_xyz, ndc_offset_mul_w);
 
-  spv::Id kill_vertex = spv::NoResult;
+  // Apply vertex killing requested via the kill flag (oPts.z) - bits 0:30 of
+  // the value being non-zero kills. Done after the NDC transform since the kill
+  // cull distance is just a flag and the position is about to be written.
   if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b100) {
     assert_true(var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult);
     id_vector_temp_.clear();
-    // Z component.
+    // Z vector component.
     id_vector_temp_.push_back(builder_->makeIntConstant(2));
-    spv::Id kill_vertex_bits = builder_->createUnaryOp(
-        spv::OpBitcast, type_uint_,
-        builder_->createLoad(builder_->createAccessChain(spv::StorageClassFunction,
-                                                         var_main_point_size_edge_flag_kill_vertex_,
-                                                         id_vector_temp_),
-                             spv::NoPrecision));
-    kill_vertex = builder_->createBinOp(
+    spv::Id kill_value = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassFunction,
+                                    var_main_point_size_edge_flag_kill_vertex_, id_vector_temp_),
+        spv::NoPrecision);
+    // Test the integer bits 0:30 rather than comparing the float to avoid
+    // denormal flushing affecting the result (matching the Direct3D 12 path).
+    spv::Id vertex_killed = builder_->createBinOp(
         spv::OpINotEqual, type_bool_,
-        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, kill_vertex_bits,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                              builder_->createUnaryOp(spv::OpBitcast, type_uint_, kill_value),
                               builder_->makeUintConstant(UINT32_C(0x7FFFFFFF))),
         const_uint_0_);
-  }
-  if (kill_vertex != spv::NoResult && shader_modification.vertex.vertex_kill_and &&
-      output_per_vertex_member_cull_distance_ != UINT32_MAX) {
-    // In AND mode, kill via cull distance so the primitive is culled only if
-    // all vertices request kill.
-    id_vector_temp_.clear();
-    id_vector_temp_.push_back(
-        builder_->makeIntConstant(int(output_per_vertex_member_cull_distance_)));
-    id_vector_temp_.push_back(builder_->makeIntConstant(int(cull_distance_next_component)));
-    builder_->createStore(
-        builder_->createTriOp(spv::OpSelect, type_float_, kill_vertex,
-                              builder_->makeFloatConstant(-1.0f), const_float_0_),
-        builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_));
-    ++cull_distance_next_component;
-  } else if (kill_vertex != spv::NoResult) {
-    // OR mode - kill the primitive by setting W to NaN.
-    position_w = builder_->createTriOp(
-        spv::OpSelect, type_float_, kill_vertex,
-        builder_->createUnaryOp(spv::OpBitcast, type_float_,
-                                builder_->makeUintConstant(UINT32_C(0x7FC00000))),
-        position_w);
+    if (shader_modification.vertex.vertex_kill_and) {
+      // "and" operator - write -1 to the dedicated cull distance when killed
+      // (the primitive is culled only if it's negative for all the vertices).
+      uint32_t vertex_kill_cull_distance_index =
+          shader_modification.vertex.user_clip_plane_cull ? user_clip_plane_count : 0;
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(int(output_per_vertex_cull_distance_member_index_)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(vertex_kill_cull_distance_index)));
+      builder_->createStore(
+          builder_->createTriOp(spv::OpSelect, type_float_, vertex_killed,
+                                builder_->makeFloatConstant(-1.0f), const_float_0_),
+          builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
+                                      id_vector_temp_));
+    } else {
+      // "or" operator - setting the position W to NaN kills the whole primitive
+      // if any of its vertices requests the kill.
+      position_w = builder_->createTriOp(
+          spv::OpSelect, type_float_, vertex_killed,
+          builder_->createUnaryOp(spv::OpBitcast, type_float_,
+                                  builder_->makeUintConstant(UINT32_C(0x7FC00000))),
+          position_w);
+    }
   }
 
   // Write the point size.
@@ -2712,8 +2470,6 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
         builder_->createTriOp(
             spv::OpSelect, type_float2_, point_vertex_positive, point_radius,
             builder_->createNoContractionUnaryOp(spv::OpFNegate, type_float2_, point_radius)));
-    spv::Id point_position_z = builder_->createCompositeExtract(position_xyz, type_float_, 2);
-
     // Store the position.
     spv::Id position;
     {
@@ -2723,7 +2479,8 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
       std::unique_ptr<spv::Instruction> composite_construct_op = std::make_unique<spv::Instruction>(
           builder_->getUniqueId(), type_float4_, spv::OpCompositeConstruct);
       composite_construct_op->addIdOperand(point_position_xy);
-      composite_construct_op->addIdOperand(point_position_z);
+      composite_construct_op->addIdOperand(
+          builder_->createCompositeExtract(position_xyz, type_float_, 2));
       composite_construct_op->addIdOperand(position_w);
       position = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
@@ -2738,66 +2495,11 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
           output_point_coordinates_);
     }
 
-    bool point_recalculate_clip_distances = shader_modification.vertex.user_clip_plane_count &&
-                                            !shader_modification.vertex.user_clip_plane_cull &&
-                                            shader_modification.vertex.point_ps_ucp_mode >= 2;
-    bool point_recalculate_cull_distances = shader_modification.vertex.user_clip_plane_count &&
-                                            shader_modification.vertex.user_clip_plane_cull &&
-                                            shader_modification.vertex.point_ps_ucp_mode >= 3;
-    if (point_recalculate_clip_distances || point_recalculate_cull_distances) {
-      uint32_t output_per_vertex_member_user_clip_distance =
-          point_recalculate_cull_distances ? output_per_vertex_member_cull_distance_
-                                           : output_per_vertex_member_clip_distance_;
-      assert_true(output_per_vertex_member_user_clip_distance != UINT32_MAX);
-
-      // Convert host clip space back to guest clip space before applying user
-      // clip planes.
-      spv::Id point_position_xyz;
-      {
-        std::unique_ptr<spv::Instruction> composite_construct_op =
-            std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_float3_,
-                                               spv::OpCompositeConstruct);
-        composite_construct_op->addIdOperand(point_position_xy);
-        composite_construct_op->addIdOperand(point_position_z);
-        point_position_xyz = composite_construct_op->getResultId();
-        builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
-      }
-      spv::Id point_guest_position_xyz = builder_->createNoContractionBinOp(
-          spv::OpFSub, type_float3_, point_position_xyz,
-          builder_->createNoContractionBinOp(spv::OpVectorTimesScalar, type_float3_, ndc_offset,
-                                             position_w));
-      point_guest_position_xyz = builder_->createNoContractionBinOp(
-          spv::OpFDiv, type_float3_, point_guest_position_xyz, ndc_scale);
-      spv::Id point_guest_position;
-      {
-        std::unique_ptr<spv::Instruction> composite_construct_op =
-            std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_float4_,
-                                               spv::OpCompositeConstruct);
-        composite_construct_op->addIdOperand(point_guest_position_xyz);
-        composite_construct_op->addIdOperand(position_w);
-        point_guest_position = composite_construct_op->getResultId();
-        builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
-      }
-
-      for (uint32_t i = 0; i < shader_modification.vertex.user_clip_plane_count; ++i) {
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantUserClipPlanes));
-        id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-        spv::Id user_clip_plane = builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                        id_vector_temp_),
-            spv::NoPrecision);
-        spv::Id user_clip_distance =
-            builder_->createBinOp(spv::OpDot, type_float_, point_guest_position, user_clip_plane);
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(
-            builder_->makeIntConstant(int(output_per_vertex_member_user_clip_distance)));
-        id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-        builder_->createStore(user_clip_distance,
-                              builder_->createAccessChain(spv::StorageClassOutput,
-                                                          output_per_vertex_, id_vector_temp_));
-      }
-    }
+    // TODO(Triang3l): For points, handle ps_ucp_mode (take the guest clip space
+    // coordinates instead of the host ones, calculate the distances to the user
+    // clip planes, cull using the distance from the center for modes 0, 1 and
+    // 2, cull and clip per-vertex for modes 2 and 3) in clip and cull
+    // distances.
   } else {
     // Store the position converted to the host.
     spv::Id position;
@@ -2846,6 +2548,30 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffer_edram_);
     }
+
+    // ZPD FSI counter buffer uint[].
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
+    builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride, sizeof(uint32_t));
+    spv::Id type_zpd_fsi_counter = builder_->makeStructType(id_vector_temp_, "XeZPDFSICounter");
+    builder_->addMemberName(type_zpd_fsi_counter, 0, "counter");
+    builder_->addMemberDecoration(type_zpd_fsi_counter, 0, spv::DecorationCoherent);
+    builder_->addMemberDecoration(type_zpd_fsi_counter, 0, spv::DecorationRestrict);
+    builder_->addMemberDecoration(type_zpd_fsi_counter, 0, spv::DecorationOffset, 0);
+    builder_->addDecoration(type_zpd_fsi_counter, features_.spirv_version >= spv::Spv_1_3
+                                                      ? spv::DecorationBlock
+                                                      : spv::DecorationBufferBlock);
+    buffer_zpd_fsi_counter_ = builder_->createVariable(spv::NoPrecision,
+                                                       features_.spirv_version >= spv::Spv_1_3
+                                                           ? spv::StorageClassStorageBuffer
+                                                           : spv::StorageClassUniform,
+                                                       type_zpd_fsi_counter, "xe_zpd_fsi_counter");
+    builder_->addDecoration(buffer_zpd_fsi_counter_, spv::DecorationDescriptorSet,
+                            int(kDescriptorSetSharedMemoryAndEdram));
+    builder_->addDecoration(buffer_zpd_fsi_counter_, spv::DecorationBinding, 2);
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(buffer_zpd_fsi_counter_);
+    }
   }
 
   bool param_gen_needed =
@@ -2887,64 +2613,64 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     }
   }
 
-  bool float24_depth_conversion = IsWritingFloat24Depth();
-  bool float24_depth_from_fragment_coordinates =
-      float24_depth_conversion && !current_shader().writes_depth();
-  bool alpha_to_coverage_possible = !is_depth_only_fragment_shader_ &&
-                                    current_shader().writes_color_target(0) &&
-                                    !IsExecutionModeEarlyFragmentTests();
-
   // Fragment coordinates.
-  // TODO(Triang3l): More conditions - alpha to coverage (if RT 0 is written,
-  // and there's no early depth / stencil), depth writing in the fragment shader
-  // (per-sample if supported).
-  bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
-                                     (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
-  if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+  // FSI: Always needed for EDRAM offset calculation and depth derivatives.
+  // param_gen: Needed for PsParamGen calculation.
+  // FBO alpha-to-coverage: Needed for dithering pattern, but only when
+  // alpha-to-coverage can actually run (no early fragment tests).
+  // FBO float24 in-PS conversion of the rasterizer's depth: reads
+  // gl_FragCoord.z
+  // - and must do so per-sample for MSAA antialiasing of intersections.
+  bool need_frag_coord =
+      edram_fragment_shader_interlock_ || param_gen_needed || IsSampleRate() ||
+      DSV_IsApplyingPolygonOffset() ||
+      (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_ &&
+       current_shader().writes_color_target(0) && !IsExecutionModeEarlyFragmentTests());
+  if (need_frag_coord) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,
-                            spv::BuiltInFragCoord);
+                            static_cast<int>(spv::BuiltInFragCoord));
+    if (IsSampleRate()) {
+      // Per the Vulkan spec, a Sample-decorated fragment input forces
+      // per-sample shader invocation - no explicit sampleShadingEnable needed.
+      builder_->addCapability(spv::CapabilitySampleRateShading);
+      builder_->addDecoration(input_fragment_coordinates_, spv::DecorationSample);
+    }
     main_interface_.push_back(input_fragment_coordinates_);
   }
 
   // Is front facing.
-  if (edram_fragment_shader_interlock_ ||
+  if (edram_fragment_shader_interlock_ || DSV_IsApplyingPolygonOffset() ||
       (param_gen_needed && !GetSpirvShaderModification().pixel.param_gen_point)) {
     input_front_facing_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                    type_bool_, "gl_FrontFacing");
-    builder_->addDecoration(input_front_facing_, spv::DecorationBuiltIn, spv::BuiltInFrontFacing);
+    builder_->addDecoration(input_front_facing_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltInFrontFacing));
     main_interface_.push_back(input_front_facing_);
   }
 
   // Sample mask input.
-  if (edram_fragment_shader_interlock_ || IsSampleRate() ||
-      (alpha_to_coverage_possible && features_.sample_rate_shading)) {
+  if (edram_fragment_shader_interlock_) {
     // SampleMask depends on SampleRateShading in some SPIR-V revisions.
     builder_->addCapability(spv::CapabilitySampleRateShading);
-  }
-  if (IsSampleRate()) {
-    input_sample_id_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput, type_int_,
-                                                "gl_SampleID");
-    builder_->addDecoration(input_sample_id_, spv::DecorationFlat);
-    builder_->addDecoration(input_sample_id_, spv::DecorationBuiltIn, spv::BuiltInSampleId);
-    main_interface_.push_back(input_sample_id_);
-  }
-  if (edram_fragment_shader_interlock_) {
     input_sample_mask_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassInput,
         builder_->makeArrayType(type_int_, builder_->makeUintConstant(1), 0), "gl_SampleMaskIn");
     builder_->addDecoration(input_sample_mask_, spv::DecorationFlat);
-    builder_->addDecoration(input_sample_mask_, spv::DecorationBuiltIn, spv::BuiltInSampleMask);
+    builder_->addDecoration(input_sample_mask_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltInSampleMask));
     main_interface_.push_back(input_sample_mask_);
   }
 
-  if (!edram_fragment_shader_interlock_) {
-    // Framebuffer color attachment outputs.
-    std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
-              spv::NoResult);
-    if (!is_depth_only_fragment_shader_) {
+  if (!is_depth_only_fragment_shader_) {
+    // Framebuffer color attachment outputs (FBO path only).
+    // For FBO, we create Output variables here and Function-scoped variables
+    // in StartFragmentShaderInMain. The Function-scoped variables are used
+    // throughout the shader (so we can read them for alpha test), and copied
+    // to the Output variables at the end.
+    if (!edram_fragment_shader_interlock_) {
+      std::ranges::fill(output_fragment_data_, spv::NoResult);
       static const char* const kFragmentDataOutputNames[] = {
           "xe_out_fragment_data_0",
           "xe_out_fragment_data_1",
@@ -2958,7 +2684,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         spv::Id output_fragment_data_rt =
             builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput, type_float4_,
                                      kFragmentDataOutputNames[color_target_index]);
-        output_or_var_fragment_data_[color_target_index] = output_fragment_data_rt;
+        output_fragment_data_[color_target_index] = output_fragment_data_rt;
         builder_->addDecoration(output_fragment_data_rt, spv::DecorationLocation,
                                 int(color_target_index));
         // Make invariant as pixel shaders may be used for various precise
@@ -2967,27 +2693,43 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         main_interface_.push_back(output_fragment_data_rt);
       }
     }
-    output_fragment_depth_ = spv::NoResult;
-    output_fragment_sample_mask_ = spv::NoResult;
-    if (current_shader().writes_depth() || float24_depth_conversion) {
-      output_fragment_depth_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
-                                                        type_float_, "gl_FragDepth");
-      builder_->addDecoration(output_fragment_depth_, spv::DecorationBuiltIn,
-                              spv::BuiltInFragDepth);
-      main_interface_.push_back(output_fragment_depth_);
-    }
-    if (alpha_to_coverage_possible && features_.sample_rate_shading) {
-      output_fragment_sample_mask_ = builder_->createVariable(
-          spv::NoPrecision, spv::StorageClassOutput,
-          builder_->makeArrayType(type_int_, builder_->makeUintConstant(1), 0), "gl_SampleMask");
-      builder_->addDecoration(output_fragment_sample_mask_, spv::DecorationBuiltIn,
-                              spv::BuiltInSampleMask);
-      main_interface_.push_back(output_fragment_sample_mask_);
-    }
+  }
+
+  // FBO fragment depth output. Used for guest oDepth, float24 conversion, and
+  // the narrow host RT decal path. FSI manages depth in EDRAM instead.
+  if (!edram_fragment_shader_interlock_ &&
+      (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
+       DSV_IsApplyingPolygonOffset())) {
+    output_fragment_depth_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
+                                                      type_float_, "gl_FragDepth");
+    builder_->addDecoration(output_fragment_depth_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltInFragDepth));
+    builder_->addDecoration(output_fragment_depth_, spv::DecorationInvariant);
+    main_interface_.push_back(output_fragment_depth_);
+  }
+
+  // Sample mask output for alpha-to-coverage.
+  // Only needed for non-FSI mode. FSI uses main_fsi_sample_mask_ instead.
+  output_fragment_sample_mask_ = spv::NoResult;
+  if (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_) {
+    // gl_SampleMask is an array of int in SPIR-V.
+    spv::Id type_sample_mask_array =
+        builder_->makeArrayType(type_int_, builder_->makeUintConstant(1), 0);
+    output_fragment_sample_mask_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassOutput, type_sample_mask_array, "gl_SampleMask");
+    builder_->addDecoration(output_fragment_sample_mask_, spv::DecorationBuiltIn,
+                            static_cast<int>(spv::BuiltInSampleMask));
+    main_interface_.push_back(output_fragment_sample_mask_);
   }
 }
 
 void SpirvShaderTranslator::StartFragmentShaderInMain() {
+  // TODO(Triang3l): With sample shading (for depth format conversion) only
+  // for the bottom-right sample (unlike in Direct3D, the sample mask input
+  // doesn't include covered samples of the primitive that correspond to other
+  // invocations, so use the sample that's the most friendly to the half-pixel
+  // offset).
+
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
   // on the Xenos, and also keeping a single critical section exit and return
@@ -3008,37 +2750,61 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // to the execution mask GPUs naturally have.
   }
 
-  if (edram_fragment_shader_interlock_) {
-    // Initialize color output variables with fragment shader interlock.
-    std::fill(output_or_var_fragment_data_.begin(), output_or_var_fragment_data_.end(),
-              spv::NoResult);
-    var_main_fragment_depth_ = spv::NoResult;
-    var_main_fsi_color_written_ = spv::NoResult;
-    if (current_shader().writes_depth()) {
-      var_main_fragment_depth_ =
-          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
-                                   "xe_var_fragment_depth", const_float_0_);
+  // Initialize color output variables as Function-scoped for both FSI and FBO.
+  // For FBO, this allows reading the color values back (e.g., for alpha test),
+  // which isn't possible with Output storage class. The values are copied to
+  // the actual Output variables at the end of the shader for FBO.
+  std::ranges::fill(output_or_var_fragment_data_, spv::NoResult);
+  var_main_fsi_color_written_ = spv::NoResult;
+  uint32_t color_targets_written = current_shader().writes_color_targets();
+  if (color_targets_written && !is_depth_only_fragment_shader_) {
+    static const char* const kFragmentDataVariableNames[] = {
+        "xe_var_fragment_data_0",
+        "xe_var_fragment_data_1",
+        "xe_var_fragment_data_2",
+        "xe_var_fragment_data_3",
+    };
+    uint32_t color_targets_remaining = color_targets_written;
+    uint32_t color_target_index;
+    while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
+      color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
+      output_or_var_fragment_data_[color_target_index] =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                                   kFragmentDataVariableNames[color_target_index], const_float4_0_);
     }
-    uint32_t color_targets_written = current_shader().writes_color_targets();
-    if (color_targets_written) {
-      static const char* const kFragmentDataVariableNames[] = {
-          "xe_var_fragment_data_0",
-          "xe_var_fragment_data_1",
-          "xe_var_fragment_data_2",
-          "xe_var_fragment_data_3",
-      };
-      uint32_t color_targets_remaining = color_targets_written;
-      uint32_t color_target_index;
-      while (rex::bit_scan_forward(color_targets_remaining, &color_target_index)) {
-        color_targets_remaining &= ~(UINT32_C(1) << color_target_index);
-        output_or_var_fragment_data_[color_target_index] = builder_->createVariable(
-            spv::NoPrecision, spv::StorageClassFunction, type_float4_,
-            kFragmentDataVariableNames[color_target_index], const_float4_0_);
-      }
-      var_main_fsi_color_written_ =
-          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
-                                   "xe_var_fsi_color_written", const_uint_0_);
-    }
+    // Color write tracking for both FSI and FBO paths.
+    // This is used to conditionally skip alpha test / alpha-to-coverage if
+    // render target 0 wasn't written on the execution path.
+    var_main_fsi_color_written_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+                                 "xe_var_color_written", const_uint_0_);
+  }
+
+  // Staging variable for guest oDepth writes.
+  // Created whenever the shader uses oDepth:
+  //   * FSI reads it during its EDRAM depth write inside the interlock.
+  //   * FBO copies it to gl_FragDepth at the end of the shader.
+  if (current_shader().writes_depth()) {
+    output_or_var_fragment_depth_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
+                                 "xe_var_fragment_depth", const_float_0_);
+  }
+
+  if (DSV_IsApplyingPolygonOffset()) {
+    // The decal path needs the original triangle depth slope, not the slope of
+    // whichever lanes survive guest control flow or kill.
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(2));
+    main_fbo_depth_unbiased_ = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    builder_->addCapability(spv::CapabilityDerivativeControl);
+    main_fbo_depth_derivatives_[0] =
+        builder_->createUnaryOp(spv::OpDPdxCoarse, type_float_, main_fbo_depth_unbiased_);
+    main_fbo_depth_derivatives_[1] =
+        builder_->createUnaryOp(spv::OpDPdyCoarse, type_float_, main_fbo_depth_unbiased_);
   }
 
   if (edram_fragment_shader_interlock_ && FSI_IsDepthStencilEarly()) {
@@ -3095,72 +2861,6 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     return;
   }
 
-  if (current_shader().memexport_eM_written()) {
-    // Make sure memexport is done only once for a guest pixel.
-    uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
-    if (resolution_scaled_axes) {
-      assert_true(input_fragment_coordinates_ != spv::NoResult);
-      spv::Id memexport_allowed = spv::NoResult;
-      for (uint32_t i = 0; i < 2; ++i) {
-        if (!(resolution_scaled_axes & (UINT32_C(1) << i))) {
-          continue;
-        }
-        id_vector_temp_.clear();
-        id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
-        spv::Id position = builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
-                                        id_vector_temp_),
-            spv::NoPrecision);
-        spv::Id position_mod = builder_->createBinOp(
-            spv::OpUMod, type_uint_,
-            builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
-            builder_->makeUintConstant(i ? draw_resolution_scale_y_ : draw_resolution_scale_x_));
-        spv::Id position_is_center =
-            builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
-                                  builder_->makeUintConstant(i ? (draw_resolution_scale_y_ >> 1)
-                                                               : (draw_resolution_scale_x_ >> 1)));
-        memexport_allowed = memexport_allowed != spv::NoResult
-                                ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
-                                                        memexport_allowed, position_is_center)
-                                : position_is_center;
-      }
-      assert_true(memexport_allowed != spv::NoResult);
-      main_memexport_allowed_ =
-          main_memexport_allowed_ != spv::NoResult
-              ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_, main_memexport_allowed_,
-                                      memexport_allowed)
-              : memexport_allowed;
-    }
-    if (IsSampleRate()) {
-      assert_true(input_sample_id_ != spv::NoResult);
-      spv::Id sample_id = builder_->createUnaryOp(
-          spv::OpBitcast, type_uint_, builder_->createLoad(input_sample_id_, spv::NoPrecision));
-      spv::Id msaa_samples = LoadMsaaSamplesFromFlags();
-      spv::Id preferred_sample = builder_->createTriOp(
-          spv::OpSelect, type_uint_,
-          builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, msaa_samples,
-                                builder_->makeUintConstant(uint32_t(xenos::MsaaSamples::k4X))),
-          builder_->makeUintConstant(3),
-          builder_->createTriOp(
-              spv::OpSelect, type_uint_,
-              builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, msaa_samples,
-                                    builder_->makeUintConstant(uint32_t(xenos::MsaaSamples::k2X))),
-              builder_->makeUintConstant(native_2x_msaa_with_attachments_ ? 1u : 3u),
-              const_uint_0_));
-      // gl_SampleMaskIn on Vulkan may not include coverage bits for other
-      // sample invocations, unlike Direct3D SV_Coverage - use the sample
-      // that's the most friendly to the half-pixel offset.
-      spv::Id sample_preferred =
-          builder_->createBinOp(spv::OpIEqual, type_bool_, sample_id, preferred_sample);
-      main_memexport_allowed_ =
-          main_memexport_allowed_ != spv::NoResult
-              ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_, main_memexport_allowed_,
-                                      sample_preferred)
-              : sample_preferred;
-    }
-  }
-
   uint32_t param_gen_interpolator = GetPsParamGenInterpolator();
 
   // Zero general-purpose registers to prevent crashes when the game
@@ -3205,18 +2905,19 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     id_vector_temp_.clear();
     id_vector_temp_.push_back(const_int_0_);
     spv::Id param_gen_x = builder_->createUnaryBuiltinCall(
-        type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
-        builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
-                                        id_vector_temp_),
-            spv::NoPrecision));
-    if (draw_resolution_scale_x_ > 1) {
-      param_gen_x = builder_->createNoContractionBinOp(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs,
+        builder_->createUnaryBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+            builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                            id_vector_temp_),
+                spv::NoPrecision)));
+    // Apply resolution scale inversion after truncating.
+    if (GetCurrentDrawResolutionScaleX() > 1) {
+      param_gen_x = builder_->createBinOp(
           spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+          builder_->makeFloatConstant(1.0f / float(GetCurrentDrawResolutionScaleX())));
     }
-    param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
-                                                   GLSLstd450FAbs, param_gen_x);
     if (!modification.pixel.param_gen_point) {
       assert_true(input_front_facing_ != spv::NoResult);
       param_gen_x = builder_->createTriOp(
@@ -3241,18 +2942,19 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(1));
     spv::Id param_gen_y = builder_->createUnaryBuiltinCall(
-        type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
-        builder_->createLoad(
-            builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
-                                        id_vector_temp_),
-            spv::NoPrecision));
-    if (draw_resolution_scale_y_ > 1) {
-      param_gen_y = builder_->createNoContractionBinOp(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs,
+        builder_->createUnaryBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+            builder_->createLoad(
+                builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                            id_vector_temp_),
+                spv::NoPrecision)));
+    // Apply resolution scale inversion after truncating.
+    if (GetCurrentDrawResolutionScaleY() > 1) {
+      param_gen_y = builder_->createBinOp(
           spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+          builder_->makeFloatConstant(1.0f / float(GetCurrentDrawResolutionScaleY())));
     }
-    param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
-                                                   GLSLstd450FAbs, param_gen_y);
     if (modification.pixel.param_gen_point) {
       param_gen_y = builder_->createUnaryOp(
           spv::OpBitcast, type_float_,
@@ -3298,21 +3000,6 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     builder_->createStore(
         param_gen, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
                                                id_vector_temp_));
-  }
-
-  if (!edram_fragment_shader_interlock_) {
-    // Initialize the colors for safety.
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      spv::Id output_fragment_data_rt = output_or_var_fragment_data_[i];
-      if (output_fragment_data_rt != spv::NoResult) {
-        builder_->createStore(const_float4_0_, output_fragment_data_rt);
-      }
-    }
-    if (output_fragment_depth_ != spv::NoResult) {
-      // Keep output deterministic if oDepth is not written on a control flow
-      // path.
-      builder_->createStore(const_float_0_, output_fragment_depth_);
-    }
   }
 }
 
@@ -3604,13 +3291,11 @@ spv::Id SpirvShaderTranslator::GetAbsoluteOperand(spv::Id operand_storage,
                                           ext_inst_glsl_std_450_, GLSLstd450FAbs, operand_storage);
 }
 
-void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id value,
-                                        bool can_store_memexport_address) {
+void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id value) {
   uint32_t used_write_mask = result.GetUsedWriteMask();
   if (!used_write_mask) {
     return;
   }
-  bool is_clamped = result.is_clamped;
 
   EnsureBuildPointAvailable();
 
@@ -3652,8 +3337,7 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
       assert_not_zero(used_write_mask);
       assert_true(current_shader().writes_color_target(result.storage_index));
       target_pointer = output_or_var_fragment_data_[result.storage_index];
-      if (edram_fragment_shader_interlock_) {
-        assert_true(var_main_fsi_color_written_ != spv::NoResult);
+      if (var_main_fsi_color_written_ != spv::NoResult) {
         builder_->createStore(
             builder_->createBinOp(
                 spv::OpBitwiseOr, type_uint_,
@@ -3662,29 +3346,11 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
             var_main_fsi_color_written_);
       }
     } break;
-    case InstructionStorageTarget::kDepth: {
-      assert_true(is_pixel_shader());
-      // Writes X to scalar gl_FragDepth.
-      assert_true(used_write_mask == 0b0001);
-      assert_true(current_shader().writes_depth());
-      target_pointer =
-          edram_fragment_shader_interlock_ ? var_main_fragment_depth_ : output_fragment_depth_;
-      // Guest depth output is expected to be [0, 1].
-      is_clamped = true;
-    } break;
     case InstructionStorageTarget::kExportAddress: {
-      if (!can_store_memexport_address) {
-        return;
-      }
-      if (!current_shader().memexport_eM_written()) {
-        return;
-      }
       // spv::NoResult if memory export usage is unsupported or invalid.
       target_pointer = var_main_memexport_address_;
     } break;
     case InstructionStorageTarget::kExportData: {
-      assert_not_zero(current_shader().memexport_eM_written() &
-                      (uint8_t(1) << result.storage_index));
       // spv::NoResult if memory export usage is unsupported or invalid.
       target_pointer = var_main_memexport_data_[result.storage_index];
       if (target_pointer != spv::NoResult) {
@@ -3698,9 +3364,29 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
             var_main_memexport_data_written_);
       }
     } break;
+    case InstructionStorageTarget::kDepth: {
+      // oDepth is scalar. The FBO path copies it to gl_FragDepth (in
+      // CompleteFragmentShader_DSV_DepthTo24Bit), while FSI writes it to a
+      // depth variable consumed by FSI_DepthStencilTest.
+      assert_true(is_pixel_shader());
+      assert_true(used_write_mask == 0b0001);
+      assert_true(current_shader().writes_depth());
+      assert_true(output_or_var_fragment_depth_ != spv::NoResult);
+      target_pointer = output_or_var_fragment_depth_;
+      // Depth outside [0, 1] needs to be clamped for safety, similar to D3D12.
+      // Though 20e4 float depth can store values between 1 and 2, it's a very
+      // unusual case. In Vulkan, gl_FragDepth can accept any values when the
+      // depth buffer is floating-point, but we clamp for consistency.
+      // Clamp the depth value to [0, 1] if not already saturated.
+      if (value != spv::NoResult && !result.is_clamped) {
+        value =
+            builder_->createTriBuiltinCall(type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+                                           value, const_float_0_, const_float_1_);
+      }
+    } break;
     default:
-      assert_unhandled_case(result.storage_target);
-      return;
+      // TODO(Triang3l): All storage targets.
+      break;
   }
   if (target_pointer == spv::NoResult) {
     return;
@@ -3719,7 +3405,7 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result, spv::Id
   unsigned int value_num_components =
       value != spv::NoResult ? static_cast<unsigned int>(builder_->getNumComponents(value)) : 0;
 
-  if (is_clamped && non_constant_components) {
+  if (result.is_clamped && non_constant_components) {
     // Apply the saturation modifier to the result.
     value = builder_->createTriBuiltinCall(type_float_vectors_[value_num_components - 1],
                                            ext_inst_glsl_std_450_, GLSLstd450NClamp, value,
@@ -4026,7 +3712,7 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
   uint_vector_temp_.push_back(3);
   uint_vector_temp_.push_back(2);
   value = builder_->createTriOp(
-      spv::OpSelect, type_uint4_, is_8in64,
+      spv::OpSelect, type_uint4_, builder_->smearScalar(spv::NoPrecision, is_8in64, type_bool4_),
       builder_->createRvalueSwizzle(spv::NoPrecision, type_uint4_, value, uint_vector_temp_),
       value);
 
@@ -4039,7 +3725,7 @@ spv::Id SpirvShaderTranslator::EndianSwap128Uint4(spv::Id value, spv::Id endian)
   uint_vector_temp_.push_back(1);
   uint_vector_temp_.push_back(0);
   value = builder_->createTriOp(
-      spv::OpSelect, type_uint4_, is_8in128,
+      spv::OpSelect, type_uint4_, builder_->smearScalar(spv::NoPrecision, is_8in128, type_bool4_),
       builder_->createRvalueSwizzle(spv::NoPrecision, type_uint4_, value, uint_vector_temp_),
       value);
 
@@ -4188,52 +3874,52 @@ void SpirvShaderTranslator::StoreUint32ToSharedMemory(spv::Id value, spv::Id add
   binding_switch.makeEndSwitch();
 }
 
-spv::Id SpirvShaderTranslator::PWLGammaToLinear(spv::Id gamma, bool gamma_pre_saturated) {
+spv::Id SpirvShaderTranslator::PWLGammaToLinear(SpirvBuilder* builder_, spv::Id gamma,
+                                                bool pre_saturated,
+                                                spv::Id ext_inst_glsl_std_450_) {
   spv::Id value_type = builder_->getTypeId(gamma);
   assert_true(builder_->isFloatType(builder_->getScalarTypeId(value_type)));
   bool is_vector = builder_->isVectorType(value_type);
   assert_true(is_vector || builder_->isFloatType(value_type));
   int num_components = builder_->getNumTypeComponents(value_type);
   assert_true(num_components < 4);
-  spv::Id bool_type = type_bool_vectors_[num_components - 1];
+  spv::Id bool_type = is_vector ? builder_->makeVectorType(builder_->makeBoolType(), num_components)
+                                : builder_->makeBoolType();
 
-  spv::Id const_vector_0 = const_float_vectors_0_[num_components - 1];
-  spv::Id const_vector_1 =
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1.0f), value_type);
+  spv::Id const_vector_0 = builder_->smearFloatConstant(0.0f, value_type);
 
-  if (!gamma_pre_saturated) {
+  if (!pre_saturated) {
     // Saturate, flushing NaN to 0.
     gamma = builder_->createTriBuiltinCall(value_type, ext_inst_glsl_std_450_, GLSLstd450NClamp,
-                                           gamma, const_vector_0, const_vector_1);
+                                           gamma, const_vector_0,
+                                           builder_->smearFloatConstant(1.0f, value_type));
   }
 
-  spv::Id is_piece_at_least_3 = builder_->createBinOp(
-      spv::OpFOrdGreaterThanEqual, bool_type, gamma,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(192.0f / 255.0f), value_type));
-  spv::Id scale_3_or_2 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_3,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(8.0f / 1024.0f), value_type),
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(4.0f / 1024.0f), value_type));
-  spv::Id offset_3_or_2 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_3,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(-1024.0f), value_type),
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(-256.0f), value_type));
+  spv::Id is_piece_at_least_3 =
+      builder_->createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, gamma,
+                            builder_->smearFloatConstant(192.0f / 255.0f, value_type));
+  spv::Id scale_3_or_2 =
+      builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_3,
+                            builder_->smearFloatConstant(8.0f / 1024.0f, value_type),
+                            builder_->smearFloatConstant(4.0f / 1024.0f, value_type));
+  spv::Id offset_3_or_2 = builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_3,
+                                                builder_->smearFloatConstant(-1024.0f, value_type),
+                                                builder_->smearFloatConstant(-256.0f, value_type));
 
-  spv::Id is_piece_at_least_1 = builder_->createBinOp(
-      spv::OpFOrdGreaterThanEqual, bool_type, gamma,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(64.0f / 255.0f), value_type));
-  spv::Id scale_1_or_0 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_1,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(2.0f / 1024.0f), value_type),
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1.0f / 1024.0f), value_type));
-  spv::Id offset_1_or_0 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_1,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(-64.0f), value_type),
-      const_vector_0);
+  spv::Id is_piece_at_least_1 =
+      builder_->createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, gamma,
+                            builder_->smearFloatConstant(64.0f / 255.0f, value_type));
+  spv::Id scale_1_or_0 =
+      builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_1,
+                            builder_->smearFloatConstant(2.0f / 1024.0f, value_type),
+                            builder_->smearFloatConstant(1.0f / 1024.0f, value_type));
+  spv::Id offset_1_or_0 =
+      builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_1,
+                            builder_->smearFloatConstant(-64.0f, value_type), const_vector_0);
 
-  spv::Id is_piece_at_least_2 = builder_->createBinOp(
-      spv::OpFOrdGreaterThanEqual, bool_type, gamma,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(96.0f / 255.0f), value_type));
+  spv::Id is_piece_at_least_2 =
+      builder_->createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, gamma,
+                            builder_->smearFloatConstant(96.0f / 255.0f, value_type));
   spv::Id scale = builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_2,
                                         scale_3_or_2, scale_1_or_0);
   spv::Id offset = builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_2,
@@ -4261,52 +3947,53 @@ spv::Id SpirvShaderTranslator::PWLGammaToLinear(spv::Id gamma, bool gamma_pre_sa
   return linear;
 }
 
-spv::Id SpirvShaderTranslator::LinearToPWLGamma(spv::Id linear, bool linear_pre_saturated) {
+spv::Id SpirvShaderTranslator::LinearToPWLGamma(SpirvBuilder* builder_, spv::Id linear,
+                                                bool pre_saturated,
+                                                spv::Id ext_inst_glsl_std_450_) {
   spv::Id value_type = builder_->getTypeId(linear);
   assert_true(builder_->isFloatType(builder_->getScalarTypeId(value_type)));
   bool is_vector = builder_->isVectorType(value_type);
   assert_true(is_vector || builder_->isFloatType(value_type));
   int num_components = builder_->getNumTypeComponents(value_type);
   assert_true(num_components < 4);
-  spv::Id bool_type = type_bool_vectors_[num_components - 1];
+  spv::Id bool_type = is_vector ? builder_->makeVectorType(builder_->makeBoolType(), num_components)
+                                : builder_->makeBoolType();
 
-  spv::Id const_vector_0 = const_float_vectors_0_[num_components - 1];
-  spv::Id const_vector_1 =
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1.0f), value_type);
+  spv::Id const_vector_0 = builder_->smearFloatConstant(0.0f, value_type);
 
-  if (!linear_pre_saturated) {
+  if (!pre_saturated) {
     // Saturate, flushing NaN to 0.
     linear = builder_->createTriBuiltinCall(value_type, ext_inst_glsl_std_450_, GLSLstd450NClamp,
-                                            linear, const_vector_0, const_vector_1);
+                                            linear, const_vector_0,
+                                            builder_->smearFloatConstant(1.0f, value_type));
   }
 
-  spv::Id is_piece_at_least_3 = builder_->createBinOp(
-      spv::OpFOrdGreaterThanEqual, bool_type, linear,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(512.0f / 1023.0f), value_type));
-  spv::Id scale_3_or_2 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_3,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1023.0f / 8.0f), value_type),
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1023.0f / 4.0f), value_type));
-  spv::Id offset_3_or_2 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_3,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(128.0f / 255.0f), value_type),
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(64.0f / 255.0f), value_type));
+  spv::Id is_piece_at_least_3 =
+      builder_->createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, linear,
+                            builder_->smearFloatConstant(512.0f / 1023.0f, value_type));
+  spv::Id scale_3_or_2 =
+      builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_3,
+                            builder_->smearFloatConstant(1023.0f / 8.0f, value_type),
+                            builder_->smearFloatConstant(1023.0f / 4.0f, value_type));
+  spv::Id offset_3_or_2 =
+      builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_3,
+                            builder_->smearFloatConstant(128.0f / 255.0f, value_type),
+                            builder_->smearFloatConstant(64.0f / 255.0f, value_type));
 
-  spv::Id is_piece_at_least_1 = builder_->createBinOp(
-      spv::OpFOrdGreaterThanEqual, bool_type, linear,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(64.0f / 1023.0f), value_type));
-  spv::Id scale_1_or_0 = builder_->createTriOp(
-      spv::OpSelect, value_type, is_piece_at_least_1,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1023.0f / 2.0f), value_type),
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(1023.0f), value_type));
+  spv::Id is_piece_at_least_1 =
+      builder_->createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, linear,
+                            builder_->smearFloatConstant(64.0f / 1023.0f, value_type));
+  spv::Id scale_1_or_0 =
+      builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_1,
+                            builder_->smearFloatConstant(1023.0f / 2.0f, value_type),
+                            builder_->smearFloatConstant(1023.0f, value_type));
   spv::Id offset_1_or_0 = builder_->createTriOp(
       spv::OpSelect, value_type, is_piece_at_least_1,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(32.0f / 255.0f), value_type),
-      const_vector_0);
+      builder_->smearFloatConstant(32.0f / 255.0f, value_type), const_vector_0);
 
-  spv::Id is_piece_at_least_2 = builder_->createBinOp(
-      spv::OpFOrdGreaterThanEqual, bool_type, linear,
-      SpirvSmearScalarResultOrConstant(builder_->makeFloatConstant(128.0f / 1023.0f), value_type));
+  spv::Id is_piece_at_least_2 =
+      builder_->createBinOp(spv::OpFOrdGreaterThanEqual, bool_type, linear,
+                            builder_->smearFloatConstant(128.0f / 1023.0f, value_type));
   spv::Id scale = builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_2,
                                         scale_3_or_2, scale_1_or_0);
   spv::Id offset = builder_->createTriOp(spv::OpSelect, value_type, is_piece_at_least_2,

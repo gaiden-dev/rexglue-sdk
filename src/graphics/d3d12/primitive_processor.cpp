@@ -9,10 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
 #include <cstdint>
-#include <memory>
-#include <utility>
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/command_processor.h>
@@ -103,11 +100,11 @@ bool D3D12PrimitiveProcessor::InitializeBuiltinIndexBuffer(
         size_bytes);
     return false;
   }
+
   Microsoft::WRL::ComPtr<ID3D12Resource> upload_resource;
-  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
-                                             provider.GetHeapFlagCreateNotZeroed(), &resource_desc,
-                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                             IID_PPV_ARGS(&upload_resource)))) {
+  if (!provider.CreateUploadResource(provider.GetHeapFlagCreateNotZeroed(), &resource_desc,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ,
+                                     IID_PPV_ARGS(&upload_resource))) {
     REXGPU_ERROR(
         "D3D12 primitive processor: Failed to create the built-in index "
         "buffer upload resource with {} bytes",

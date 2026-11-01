@@ -9,17 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <iterator>
-#include <tuple>
+// ReXGlue: std::unordered_set is not pulled in transitively here.
 #include <unordered_set>
-#include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
-#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -28,18 +24,169 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
-REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
-                    "Clamp MRT EDRAM used range to minimum");
-
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, true, "GPU",
-                    "Execute unclipped draw VS on CPU for PSI render backend");
-
-REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
-                    "Use full range for SNORM16 render targets");
-
-REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
-                    "Resolve from host render targets directly to shared memory when possible")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(debug_msaa_2x_as_4x, false, "GPU.Debug",
+                    "Use 4x MSAA with 2 samples instead of native 2x MSAA when available. "
+                    "For scalability testing on host GPU APIs where 2x is not mandatory. MSAA "
+                    "will be of a similar or worse quality and use more memory.");
+REXCVAR_DEFINE_BOOL(depth_transfer_not_equal_test, true, "GPU.Debug",
+                    "When transferring data between depth render targets, use the \"not "
+                    "equal\" test to avoid writing rewriting depth via shader depth output if "
+                    "it's the same as the one currently in the depth buffer in case of round "
+                    "trips of the data.\n"
+                    "Settings this to true may make transfer round trips more friendly to "
+                    "depth compression depending on how the GPU implements it (as arbitrary "
+                    "depth output may result in it being disabled completely), which is "
+                    "beneficial to subsequent rendering, while setting this to false may "
+                    "reduce bandwidth usage during transfers as the previous depth won't need "
+                    "to be read.");
+// Lossless round trip: 545407F2.
+// Lossy round trip with the "greater or equal" test afterwards: 4D530919.
+// Lossy round trip with the "equal" test afterwards: 535107F5, 565507EF.
+REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU",
+                    "Whether to round to the nearest even, rather than truncating (rounding "
+                    "towards zero), the depth when converting it to 24-bit floating-point "
+                    "(20e4) from the host precision (32-bit floating point) when using a host "
+                    "depth buffer.\n"
+                    "false:\n"
+                    " Recommended.\n"
+                    " The conversion may move the depth values farther away from the camera.\n"
+                    " Without depth_float24_convert_in_pixel_shader:\n"
+                    "  The \"greater or equal\" depth test function continues to work fine if "
+                    "the full host precision depth data is lost, it's still possible to draw "
+                    "another pass of the same geometry with it.\n"
+                    "  (See the description of depth_float24_convert_in_pixel_shader for more "
+                    "information about full precision depth data loss.)\n"
+                    " With depth_float24_convert_in_pixel_shader:\n"
+                    "  Faster - the pixel shader for hidden surfaces may still be skipped "
+                    "(using conservative depth output).\n"
+                    "true:\n"
+                    " Only for special cases of issues caused by minor 32-bit floating-point "
+                    "rounding errors, for instance, when the game tries to draw something at "
+                    "the camera plane by setting Z of the vertex position to W.\n"
+                    " The conversion may move the depth values closer or farther.\n"
+                    " Using the same rounding mode as in the Direct3D 9 reference rasterizer.\n"
+                    " Without depth_float24_convert_in_pixel_shader:\n"
+                    "  Not possible to recover from a full host precision depth data loss - in "
+                    "subsequent passes of rendering the same geometry, half of the samples "
+                    "will be failing the depth test with the \"greater or equal\" depth test "
+                    "function.\n"
+                    " With depth_float24_convert_in_pixel_shader:\n"
+                    "  Slower - depth rejection before the pixel shader is not possible.\n"
+                    "When the depth buffer is emulated in software (via the fragment shader "
+                    "interlock / rasterizer-ordered view), this is ignored, and rounding to "
+                    "the nearest even is always done.");
+// With MSAA, when converting the depth in pixel shaders, they must run at
+// sample frequency - otherwise, if the depth is the same for the entire pixel,
+// intersections of polygons cannot be antialiased.
+//
+// Important usage note: When using this mode, bounds of the fixed-function
+// viewport must be converted to and back from float24 too (preferably using
+// rounding to the nearest even regardless of whether truncation was requested
+// for the values, to reduce the error already caused by truncation rather than
+// to amplify it). This ensures that clamping to the viewport bounds, which
+// happens after the pixel shader even if it overwrites the resulting depth, is
+// never done to a value not representable as float24 (for example, if the
+// minimum Z is a number too small to be represented as float24, but not zero,
+// it won't be possible to write what should become 0x000000 to the depth
+// buffer). Note that this may add some error to the depth values from the
+// rasterizer; however, modifying Z in the vertex shader to make interpolated
+// depth values would cause clipping to be done to different bounds, which may
+// be more undesirable, especially in cases when Z is explicitly set to a value
+// like 0 or W (in such cases, the adjusted polygon may go outside 0...W in clip
+// space and disappear).
+//
+// If false, doing the depth test at the host precision, converting to 20e4 to
+// support reinterpretation, but keeping track of both the last color (or
+// non-20e4 depth) value (let's call it stored_f24) and the last host depth
+// value (stored_host) for each EDRAM pixel, reloading the last host depth value
+// if stored_f24 == to_f24(stored_host) (otherwise it was overwritten by
+// something else, like clearing, or an actually used color buffer; this is
+// inexact though, and will incorrectly load pixels that were overwritten by
+// something else in the EDRAM, but turned out to have the same value on the
+// guest as before - an outdated host-precision value will be loaded in these
+// cases instead).
+REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
+                    "Whether to convert the depth values to 24-bit floating-point (20e4) from "
+                    "the host precision (32-bit floating point) directly in the pixel shaders "
+                    "of guest draws when using a host depth buffer.\n"
+                    "This prevents visual artifacts (interleaved stripes of parts of surfaces "
+                    "rendered and parts not rendered, having either the same width in case of "
+                    "the \"greater or equal\" depth test function, or the former being much "
+                    "thinner than the latter with the \"equal\" function) if the full host "
+                    "precision depth data is lost.\n"
+                    "This issue may happen if the game reloads the depth data previously "
+                    "evicted from the EDRAM to the RAM back to the EDRAM, but the EDRAM region "
+                    "that previously contained that depth buffer was overwritten by another "
+                    "depth buffer, or the game loads it to a different location in the EDRAM "
+                    "than it was previously placed at, thus Xenia is unable to restore the "
+                    "depth data with the original precision, and instead falls back to "
+                    "converting the lower-precision values, so in subsequent rendering passes "
+                    "for the same geometry, the actual depth values of the surfaces don't "
+                    "match those stored in the depth buffer anymore.\n"
+                    "This is a costly option because it makes the GPU unable to use depth "
+                    "buffer compression, and also with MSAA, forces the pixel shader to run "
+                    "for every subpixel sample rather than for the entire pixel, making pixel "
+                    "shading 2 or 4 times heavier depending on the MSAA sample count.\n"
+                    "The rounding direction is controlled by the depth_float24_round "
+                    "configuration variable.\n"
+                    "Note that with depth_float24_round = true, this becomes even more costly "
+                    "because pixel shaders must be executed regardless of whether the surface "
+                    "is behind the previously drawn surfaces. With depth_float24_round = "
+                    "false, conservative depth output is used, however, so depth rejection "
+                    "before the pixel shader may still work.\n"
+                    "If sample-rate shading is not supported by the host GPU, the conversion "
+                    "in the pixel shader is done only when MSAA is not used.\n"
+                    "When the depth buffer is emulated in software (via the fragment shader "
+                    "interlock / rasterizer-ordered view), this is ignored because 24-bit "
+                    "depth is always used directly.");
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU",
+                    "Apply offsets from texture fetch instructions taking resolution scale "
+                    "into account for render-to-texture, for more correct shadow filtering, "
+                    "bloom, etc., in some cases.");
+REXCVAR_DEFINE_UINT32(draw_resolution_scale_threshold, 0, "GPU",
+                      "Surface pitch in pixels at or below render targets skip being upscaled "
+                      "by draw_resolution_scale_x/y. 0 disables it.\n"
+                      "Small offscreen surfaces like bloom or depth of field buffers often "
+                      "break when upscaled and keeping them native avoids that. The pitch "
+                      "is compared after alignment to 80 pixel EDRAM tiles, so prefer "
+                      "conservative values, only as high as the broken effects need.\n"
+                      "Host render targets only.");
+REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU.Debug",
+                    "When the host can't write 8 bits per component pixels with piecewise "
+                    "linear gamma encoding directly with correct blending, use the 16-bit "
+                    "unsigned normalized format, if supported, for conceptually correct "
+                    "8_8_8_8_GAMMA render target format blending in linear color space. "
+                    "Greatly increases accuracy for this format, but may result in render "
+                    "target copying costs if the game switches between 8_8_8_8_GAMMA and "
+                    "8_8_8_8 views for the same EDRAM render target.");
+REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU.Debug",
+                    "With host render targets, if multiple render targets are bound, estimate "
+                    "the EDRAM range modified in any of them to be not bigger than the "
+                    "distance between any two render targets in the EDRAM, rather than "
+                    "allowing the last one claim the rest of the EDRAM.\n"
+                    "Has effect primarily on draws without viewport clipping.\n"
+                    "Setting this to false results in higher accuracy in rare cases, but may "
+                    "increase the amount of copying that needs to be done sometimes.");
+REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU",
+                    "Use pixel shader stencil reference output where available for purposes "
+                    "like copying between render targets. Can be disabled for scalability "
+                    "testing, in this case, much more expensive drawing of 8 quads will be "
+                    "done.");
+REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU.Debug",
+                    "When the host can only support 16_16 and 16_16_16_16 render targets as "
+                    "-1...1, remap -32...32 to -1...1 to use the full possible range of "
+                    "values, at the expense of multiplicative blending correctness.");
+// Enabled by default as the GPU is overall usually the bottleneck when the
+// pixel shader interlock render backend implementation is used, anything that
+// may improve GPU performance is favorable.
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, true, "GPU.Debug",
+                    "If execute_unclipped_draw_vs_on_cpu is enabled, execute the vertex shader "
+                    "for unclipped draws on the CPU even when using the pixel shader interlock "
+                    "(rasterizer-ordered view) implementation of the render backend on the "
+                    "host, for which no expensive copying between host render targets is "
+                    "needed when the ownership of a EDRAM range is changed.\n"
+                    "If this is enabled, excessive barriers may be eliminated when switching "
+                    "between different render targets in separate EDRAM locations.");
 
 namespace rex::graphics {
 
@@ -115,11 +262,11 @@ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat for
       break;
     case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
     case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-      // No NaNs on the Xbox 360 GPU, though can't use the extended range with
-      // Direct3D and Vulkan conversions.
-      // TODO(Triang3l): Use the extended-range encoding in all implementations.
-      clamp_rgb_low = clamp_alpha_low = -65504.0f;
-      clamp_rgb_high = clamp_alpha_high = 65504.0f;
+      // No NaNs on the Xbox 360 GPU. The interlock paths of both backends
+      // emulate the extended-range encoding in their pack and unpack, so the
+      // whole guest range survives the clamp.
+      clamp_rgb_low = clamp_alpha_low = -131008.0f;
+      clamp_rgb_high = clamp_alpha_high = 131008.0f;
       if (!(write_mask & 0b0001)) {
         keep_mask_low |= 0xFFFFu;
       }
@@ -338,6 +485,18 @@ void RenderTargetCache::InitializeCommon() {
   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
                             std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
                                                   RenderTargetKey(), RenderTargetKey()));
+
+  if (REXCVAR_GET(draw_resolution_scale_threshold)) {
+    if (GetPath() != Path::kHostRenderTargets) {
+      REXGPU_WARN(
+          "draw_resolution_scale_threshold is only supported by the host "
+          "render target path - ignoring");
+    } else if (!IsDrawResolutionScaled()) {
+      REXGPU_WARN(
+          "draw_resolution_scale_threshold has no effect without "
+          "draw_resolution_scale_x/y above 1 - ignoring");
+    }
+  }
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
@@ -397,6 +556,32 @@ void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }
 
+bool RenderTargetCache::IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
+                                              xenos::MsaaSamples msaa_samples) const {
+  uint32_t threshold = REXCVAR_GET(draw_resolution_scale_threshold);
+  if (!threshold || !IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  // Pitch is the only guest surface dimension that's reliably known since host
+  // render target heights are overestimated to cover all EDRAM, and draw height
+  // estimates would flip the same surface between classes and churn transfers.
+  // Pitch and MSAA are also shared by every surface of a draw so depth and
+  // color always land in the same class.
+  uint32_t pitch_pixels_tile_aligned =
+      RenderTargetKey::GetWidth(pitch_tiles_at_32bpp, msaa_samples);
+  return pitch_pixels_tile_aligned != 0 && pitch_pixels_tile_aligned <= threshold;
+}
+
+bool RenderTargetCache::IsDrawScaleNative() const {
+  auto rb_surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+  // Same pitch normalization as in Update.
+  uint32_t msaa_samples_x_log2 = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_tiles_at_32bpp = ((rb_surface_info.surface_pitch << msaa_samples_x_log2) +
+                                   (xenos::kEdramTileWidthSamples - 1)) /
+                                  xenos::kEdramTileWidthSamples;
+  return IsScaleNativeForPitch(pitch_tiles_at_32bpp, rb_surface_info.msaa_samples);
+}
+
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -430,10 +615,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   uint32_t pitch_tiles_at_32bpp =
       ((pitch_pixels << msaa_samples_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
       xenos::kEdramTileWidthSamples;
+  // Scale class of all the surfaces of this draw.
+  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
   if (!interlock_barrier_only) {
     uint32_t pitch_pixels_tile_aligned_scaled =
         pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2) *
-        draw_resolution_scale_x();
+        (scale_native ? 1 : draw_resolution_scale_x());
     uint32_t max_render_target_width = GetMaxRenderTargetWidth();
     if (pitch_pixels_tile_aligned_scaled > max_render_target_width) {
       // TODO(Triang3l): If really needed for some game on some device, clamp
@@ -639,6 +826,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
+    rt_key.scale_native = uint32_t(scale_native);
     if (!interlock_barrier_only) {
       RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
       if (!render_target) {
@@ -738,18 +926,21 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
     // Make sure the same render target isn't bound into two different slots
     // over time.
-    for (uint32_t i = 1;
-         are_accumulated_render_targets_valid_ && i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-      const RenderTarget* render_target = last_update_accumulated_render_targets_[i];
-      if (!render_target) {
-        continue;
-      }
-      for (uint32_t j = 0; j < i; ++j) {
-        if (last_update_accumulated_render_targets_[j] == render_target) {
-          are_accumulated_render_targets_valid_ = false;
-          break;
+    // chrispy: this needs optimization!
+    if (are_accumulated_render_targets_valid_) {
+      for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        const RenderTarget* render_target = last_update_accumulated_render_targets_[i];
+        if (!render_target) {
+          continue;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+          if (last_update_accumulated_render_targets_[j] == render_target) {
+            are_accumulated_render_targets_valid_ = false;
+            goto exit_slot_check_loop;
+          }
         }
       }
+    exit_slot_check_loop:;
     }
   }
   if (!are_accumulated_render_targets_valid_) {
@@ -916,22 +1107,23 @@ void RenderTargetCache::GetResolveCopyRectanglesToDump(
   }
 }
 
-void RenderTargetCache::GetResolveCopyDispatchesToDump(
-    uint32_t base, uint32_t row_length, uint32_t rows, uint32_t pitch,
-    std::vector<ResolveCopyDumpRectangle>& rectangles_out,
-    std::vector<ResolveCopyDispatch>& dispatches_out) const {
-  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, rectangles_out);
-  dispatches_out.clear();
-  for (uint32_t rectangle_index = 0; rectangle_index < uint32_t(rectangles_out.size());
-       ++rectangle_index) {
-    const ResolveCopyDumpRectangle& rectangle = rectangles_out[rectangle_index];
-    ResolveCopyDumpRectangle::Dispatch
-        rectangle_dispatches[ResolveCopyDumpRectangle::kMaxDispatches];
-    uint32_t dispatch_count = rectangle.GetDispatches(pitch, row_length, rectangle_dispatches);
-    for (uint32_t i = 0; i < dispatch_count; ++i) {
-      dispatches_out.emplace_back(rectangle_index, rectangle_dispatches[i]);
+bool RenderTargetCache::IsResolveSourceNativeOnly(uint32_t base, uint32_t row_length, uint32_t rows,
+                                                  uint32_t pitch) const {
+  if (!IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, rectangles);
+  if (rectangles.empty()) {
+    return false;
+  }
+  for (const ResolveCopyDumpRectangle& rectangle : rectangles) {
+    assert_not_null(rectangle.render_target);
+    if (!rectangle.render_target->key().scale_native) {
+      return false;
     }
   }
+  return true;
 }
 
 bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
@@ -980,7 +1172,8 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   }
   uint32_t pitch_pixels =
       pitch_tiles_at_32bpp * (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2);
-  uint32_t pitch_pixels_scaled = pitch_pixels * draw_resolution_scale_x();
+  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
+  uint32_t pitch_pixels_scaled = pitch_pixels * (scale_native ? 1 : draw_resolution_scale_x());
   uint32_t max_render_target_width = GetMaxRenderTargetWidth();
   if (pitch_pixels_scaled > max_render_target_width) {
     // TODO(Triang3l): If really needed for some game on some device, clamp the
@@ -1080,6 +1273,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     depth_render_target_key.msaa_samples = msaa_samples;
     depth_render_target_key.is_depth = 1;
     depth_render_target_key.resource_format = resolve_info.depth_edram_info.format;
+    depth_render_target_key.scale_native = uint32_t(scale_native);
     depth_render_target = GetOrCreateRenderTarget(depth_render_target_key);
     if (!depth_render_target) {
       // Failed to create the depth render target, don't clear it.
@@ -1096,6 +1290,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     color_render_target_key.is_depth = 0;
     color_render_target_key.resource_format = uint32_t(GetColorResourceFormat(
         xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format)));
+    color_render_target_key.scale_native = uint32_t(scale_native);
     color_render_target = GetOrCreateRenderTarget(color_render_target_key);
     if (!color_render_target) {
       // Failed to create the color render target, don't clear it.
@@ -1122,6 +1317,44 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
                     color_clear_length_tiles, &color_transfers_out, &clear_rectangle);
   }
   return true;
+}
+
+RenderTargetCache::RenderTarget*
+RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+    xenos::ColorRenderTargetFormat color_format) {
+  assert_true(GetPath() == Path::kHostRenderTargets);
+  constexpr uint32_t kPitchTilesAt32bpp = 16;
+  constexpr uint32_t kWidth = kPitchTilesAt32bpp * xenos::kEdramTileWidthSamples;
+  if (kWidth * draw_resolution_scale_x() > GetMaxRenderTargetWidth()) {
+    return nullptr;
+  }
+  // Same render target height is used for 32bpp and 64bpp to allow mixing them.
+  constexpr uint32_t kHeightTileRows = xenos::kEdramTileCount / kPitchTilesAt32bpp;
+  static_assert(kPitchTilesAt32bpp * kHeightTileRows == xenos::kEdramTileCount,
+                "Using width of the render target for EDRAM snapshot restoration that is "
+                "expected to result in the last row being fully utilized.");
+  constexpr uint32_t kHeight = kHeightTileRows * xenos::kEdramTileHeightSamples;
+  static_assert(kHeight <= xenos::kTexture2DCubeMaxWidthHeight,
+                "Using width of the render target for EDRAM snapshot restoration that is "
+                "expect to fully cover the EDRAM without exceeding the maximum guest "
+                "render target height.");
+  if (kHeight * draw_resolution_scale_y() > GetMaxRenderTargetHeight()) {
+    return nullptr;
+  }
+  RenderTargetKey render_target_key;
+  render_target_key.pitch_tiles_at_32bpp = kPitchTilesAt32bpp;
+  render_target_key.resource_format = uint32_t(GetColorResourceFormat(color_format));
+  RenderTarget* render_target = GetOrCreateRenderTarget(render_target_key);
+  if (!render_target) {
+    return nullptr;
+  }
+  // Change ownership, but don't transfer the contents - they will be replaced
+  // anyway.
+  ownership_ranges_.clear();
+  ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+                            std::forward_as_tuple(xenos::kEdramTileCount, render_target_key,
+                                                  RenderTargetKey(), RenderTargetKey()));
+  return render_target;
 }
 
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
@@ -1154,20 +1387,21 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
     render_target = CreateRenderTarget(key);
     uint32_t width = key.GetWidth();
     uint32_t height = GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
+    // ReXGlue: fmt cannot bind bit-fields.
     if (render_target) {
-      REXGPU_DEBUG(
+      REXGPU_INFO(
           "Created a {}x{} {}xMSAA {} render target with guest format {} at "
           "EDRAM base {}",
           width, height, uint32_t(1) << uint32_t(key.msaa_samples),
-          key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format),
-          static_cast<uint32_t>(key.base_tiles));
+          key.is_depth ? "depth" : "color", uint32_t(key.resource_format),
+          uint32_t(key.base_tiles));
     } else {
       REXGPU_ERROR(
           "Failed to create a {}x{} {}xMSAA {} render target with guest format "
           "{} at EDRAM base {}",
           width, height, uint32_t(1) << uint32_t(key.msaa_samples),
-          key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format),
-          static_cast<uint32_t>(key.base_tiles));
+          key.is_depth ? "depth" : "color", uint32_t(key.resource_format),
+          uint32_t(key.base_tiles));
     }
     // Insert even if failed to create, not to try to create again.
     render_targets_.emplace(key, render_target);
@@ -1250,7 +1484,14 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
   }
   uint32_t dest_pitch_tiles = dest.GetPitchTiles();
   bool dest_is_64bpp = dest.Is64bpp();
-  bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
+  // Native scale render targets are kept out of host depth tracking entirely
+  // so the host depth buffer region only ever holds data at the global scale
+  // and transfers never read host depth across scale classes. Ranges keep
+  // their old scaled host owners, which is fine. Host depth is only used where
+  // it still round trips to guest depth. Sub threshold depth just loses
+  // float32 precision on round trips anyways.
+  bool host_depth_encoding_different = dest.is_depth && !dest.scale_native &&
+                                       GetPath() == Path::kHostRenderTargets &&
                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
     // The map contains consecutive ranges, merged if the adjacent ones are the
@@ -1264,7 +1505,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       if (it_pre->second.end_tiles > extent_start &&
           !it_pre->second.IsOwnedBy(dest, host_depth_encoding_different)) {
         // Different render target overlapping the range - split the head.
-        ownership_ranges_.emplace(extent_start, it_pre->second);
+        ownership_ranges_.emplace_hint(it, extent_start, it_pre->second);
         it_pre->second.end_tiles = extent_start;
         // Let the next loop do the transfer and needed merging and splitting
         // starting from the added tail.
@@ -1286,7 +1527,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       // (split in this case) or within it.
       if (it->second.end_tiles > extent_end) {
         // Split the tail.
-        ownership_ranges_.emplace(extent_end, it->second);
+        ownership_ranges_.emplace_hint(std::next(it), extent_end, it->second);
         it->second.end_tiles = extent_end;
       }
       if (transfers_append_out) {

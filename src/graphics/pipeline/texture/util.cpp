@@ -13,10 +13,12 @@
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/texture/address.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/math.h>
 
-namespace rex::graphics::texture_util {
+namespace rex::graphics {
+namespace texture_util {
 
 void GetSubresourcesFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
                                       uint32_t* width_minus_1_out, uint32_t* height_minus_1_out,
@@ -83,11 +85,11 @@ void GetSubresourcesFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch
         std::max(std::min(uint32_t(fetch.mip_max_level), size_mip_max_level), mip_min_level);
   }
   if (mip_max_level != 0) {
+    if (mip_min_level != 0 && base_page == mip_page) {
+      base_page = 0;
+    }
     if (base_page == 0) {
       mip_min_level = std::max(mip_min_level, uint32_t(1));
-    }
-    if (mip_min_level != 0) {
-      base_page = 0;
     }
   } else {
     mip_page = 0;
@@ -193,9 +195,8 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
     }
   }
 
-  const FormatInfo* format_info = FormatInfo::Get(format);
-  x_blocks /= format_info->block_width;
-  y_blocks /= format_info->block_height;
+  x_blocks >>= FormatInfo::GetWidthShift(format);
+  y_blocks >>= FormatInfo::GetHeightShift(format);
   return true;
 }
 
@@ -212,7 +213,11 @@ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
     // GetPackedMipOffset may result in packing along Y for `width > height`
     // textures.
     assert_false(has_packed_levels);
-    height_texels = 1;
+    // For wide 1D textures mapped to 2D, height_texels is the number of rows.
+    // Only force height=1 for normal 1D textures.
+    if (height_texels <= 1) {
+      height_texels = 1;
+    }
   }
   uint32_t depth = dimension == xenos::DataDimension::k3D ? depth_or_array_size : 1;
   switch (dimension) {
@@ -392,9 +397,10 @@ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
     if (is_tiled) {
       uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
       if (dimension == xenos::DataDimension::k3D) {
-        level_layout.array_slice_data_extent_bytes = GetTiledAddressUpperBound3D(
+        level_layout.array_slice_data_extent_bytes = uint32_t(GetTiledAddressUpperBound3D(
             level_layout.x_extent_blocks, level_layout.y_extent_blocks, level_layout.z_extent,
-            row_pitch_blocks_tile_aligned, level_layout.y_extent_blocks, bytes_per_block_log2);
+            row_pitch_blocks_tile_aligned, level_layout.z_slice_stride_block_rows,
+            bytes_per_block_log2));
       } else {
         level_layout.array_slice_data_extent_bytes =
             GetTiledAddressUpperBound2D(level_layout.x_extent_blocks, level_layout.y_extent_blocks,
@@ -458,15 +464,16 @@ int32_t GetTiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, uint32
   return address;
 }
 
-uint32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t pitch,
+uint32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t pitch_aligned,
                                      uint32_t bytes_per_block_log2) {
   if (!right || !bottom) {
     return 0;
   }
   // Get the origin of the 32x32 tile containing the last texel.
-  uint32_t upper_bound = uint32_t(GetTiledOffset2D(
-      int32_t((right - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
-      int32_t((bottom - 1) & ~(xenos::kTextureTileWidthHeight - 1)), pitch, bytes_per_block_log2));
+  uint32_t upper_bound = uint32_t(
+      texture_address::Tiled2D(int32_t((right - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
+                               int32_t((bottom - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
+                               pitch_aligned, bytes_per_block_log2));
   switch (bytes_per_block_log2) {
     case 0:
       // Independent addressing within 128x128 portions, but the extent is 0xA00
@@ -485,17 +492,18 @@ uint32_t GetTiledAddressUpperBound2D(uint32_t right, uint32_t bottom, uint32_t p
   return upper_bound;
 }
 
-uint32_t GetTiledAddressUpperBound3D(uint32_t right, uint32_t bottom, uint32_t back, uint32_t pitch,
-                                     uint32_t height, uint32_t bytes_per_block_log2) {
+uint64_t GetTiledAddressUpperBound3D(uint32_t right, uint32_t bottom, uint32_t back,
+                                     uint32_t pitch_aligned, uint32_t height_aligned,
+                                     uint32_t bytes_per_block_log2) {
   if (!right || !bottom || !back) {
     return 0;
   }
   // Get the origin of the 32x32x4 tile containing the last texel.
-  uint32_t upper_bound = uint32_t(GetTiledOffset3D(
-      int32_t((right - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
-      int32_t((bottom - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
-      int32_t((back - 1) & ~(xenos::kTextureTileDepth - 1)), pitch, height, bytes_per_block_log2));
-  uint32_t pitch_aligned = rex::align(pitch, xenos::kTextureTileWidthHeight);
+  uint64_t upper_bound = uint64_t(
+      texture_address::Tiled3D(int32_t((right - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
+                               int32_t((bottom - 1) & ~(xenos::kTextureTileWidthHeight - 1)),
+                               int32_t((back - 1) & ~(xenos::kTextureTileDepth - 1)), pitch_aligned,
+                               height_aligned, bytes_per_block_log2));
   switch (bytes_per_block_log2) {
     case 0:
       // 64x32x8 portions have independent addressing.
@@ -578,4 +586,5 @@ void GetClampModesForDimension(const xenos::xe_gpu_texture_fetch_t& fetch,
   }
 }
 
-}  // namespace rex::graphics::texture_util
+}  // namespace texture_util
+}  // namespace rex::graphics

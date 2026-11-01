@@ -627,3 +627,12 @@ class Memory {
 };
 
 }  // namespace rex::memory
+
+// ReXGlue: canary spells these unqualified from xe::, keep that spelling in the GPU code.
+namespace rex {
+using memory::copy_and_swap_32_unaligned;
+using memory::HeapAllocationInfo;
+using memory::kMemoryAllocationCommit;
+using memory::kMemoryProtectWrite;
+using memory::VirtualHeap;
+}  // namespace rex

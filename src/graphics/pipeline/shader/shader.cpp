@@ -9,9 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <cinttypes>
 #include <cstring>
-#include <utility>
 
 #include <fmt/format.h>
 
@@ -32,7 +30,7 @@ Shader::Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
   // We keep ucode data in host native format so it's easier to work with.
   ucode_data_.resize(ucode_dword_count);
   if (std::endian::native != ucode_source_endian) {
-    memory::copy_and_swap(ucode_data_.data(), ucode_dwords, ucode_dword_count);
+    rex::copy_and_swap(ucode_data_.data(), ucode_dwords, ucode_dword_count);
   } else {
     std::memcpy(ucode_data_.data(), ucode_dwords, sizeof(uint32_t) * ucode_dword_count);
   }

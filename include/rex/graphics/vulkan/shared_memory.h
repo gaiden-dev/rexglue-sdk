@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/memory.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
@@ -26,11 +27,12 @@ class VulkanCommandProcessor;
 class VulkanSharedMemory : public SharedMemory {
  public:
   VulkanSharedMemory(VulkanCommandProcessor& command_processor, memory::Memory& memory,
-                     VkPipelineStageFlags guest_shader_pipeline_stages);
+                     TraceWriter& trace_writer, VkPipelineStageFlags guest_shader_pipeline_stages);
   ~VulkanSharedMemory() override;
 
   bool Initialize();
   void Shutdown(bool from_destructor = false);
+  void ClearCache() override;
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
@@ -49,17 +51,23 @@ class VulkanSharedMemory : public SharedMemory {
 
   VkBuffer buffer() const { return buffer_; }
 
+  // Returns true if any downloads were submitted to the command processor.
+  bool InitializeTraceSubmitDownloads();
+  void InitializeTraceCompleteDownloads();
+
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;
 
-  bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  bool UploadRanges(const std::pair<uint32_t, uint32_t>* upload_page_ranges,
+                    uint32_t num_ranges) override;
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
 
   VulkanCommandProcessor& command_processor_;
+  TraceWriter& trace_writer_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
 
   VkBuffer buffer_ = VK_NULL_HANDLE;
@@ -72,6 +80,11 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+
+  // Created temporarily, only for downloading.
+  VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory trace_download_buffer_memory_ = VK_NULL_HANDLE;
+  void ResetTraceDownload();
 };
 
 }  // namespace rex::graphics::vulkan

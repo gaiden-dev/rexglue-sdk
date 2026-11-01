@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -9,10 +10,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#pragma once
-
+#include <array>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -22,12 +23,12 @@
 #include <vector>
 
 #include <rex/graphics/register_file.h>
-#include <rex/graphics/registers.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
+#include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/system/xthread.h>
-#include <rex/thread.h>
 #include <rex/ui/presenter.h>
 
 namespace rex::stream {
@@ -36,15 +37,53 @@ class ByteStream;
 
 namespace rex::graphics {
 
-class GraphicsSystem;
-class Shader;
+enum class GPUSetting { ClearMemoryPageState, ReadbackMemexport };
 
 enum class ReadbackResolveMode {
-  kDisabled,
-  kFast,
-  kSome,
-  kFull,
+  kDisabled,  // No readback (none)
+  kFast,      // Delayed sync, 1 frame behind (fast)
+  kFull       // Immediate sync with GPU stall (full)
 };
+
+// Occlusion queries - ZPD report mode.
+enum class ZPDMode {
+  kFake,     // Fake sample counts, no real GPU queries (fake)
+  kFast,     // Real queries with speculative cached writes (fast)
+  kFastAlt,  // Fast queries, but preserves cached zeroes (fast-alt)
+  kStrict,   // Real queries, waits before writeback (strict)
+};
+
+void SaveGPUSetting(GPUSetting setting, uint64_t value);
+bool GetGPUSetting(GPUSetting setting);
+ReadbackResolveMode GetReadbackResolveMode();
+void SetReadbackResolveMode(const std::string& mode);
+ZPDMode GetZPDMode();
+void SetZPDMode(const std::string& mode);
+
+// Shared pool capacity for D3D12 and Vulkan.
+constexpr uint32_t kZPDQueryPoolCapacity = 8192;
+constexpr uint32_t kVIZQueryPoolCapacity = 256;
+
+// Contiguous range of query indices for batched resolve/copy operations.
+struct ResolveRange {
+  uint32_t start;
+  uint32_t count;
+};
+
+// Backstop for strict mode. Abandon any pending retires after this many polls
+// so EVENT_WRITE_ZPD doesn't keep spinning on an unresolved report.
+constexpr uint32_t kStrictZPDRetireMaxStalls = 16;
+// Clock backstop used for strict retire if guest polling is sparse.
+constexpr uint64_t kStrictZPDRetireDeadlineMs = 2;
+
+// Cap for the fast-mode cached delta map.  Games reuse a small set of report
+// addresses so this should never be hit, but prevents unbounded growth if a
+// title cycles through unique addresses.  Clearing the cache has no
+// correctness impact - it only removes speculative writeback hints.
+constexpr size_t kFastZPDCacheMaxEntries = 1024;
+
+class GraphicsSystem;
+class Shader;
 
 struct SwapState {
   // Lock must be held when changing data in this structure.
@@ -74,6 +113,10 @@ enum class GammaRampType {
 };
 
 class CommandProcessor {
+ protected:
+  RingBuffer reader_;  // chrispy: instead of having ringbuffer on stack, have it near
+                       // the start of the class so we can access it via rel8. This
+                       // also reduces the number of params we need to pass
  public:
   enum class SwapPostEffect {
     kNone,
@@ -83,7 +126,6 @@ class CommandProcessor {
 
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   virtual ~CommandProcessor();
-
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 
@@ -96,6 +138,7 @@ class CommandProcessor {
   void CallInThread(std::function<void()> fn);
 
   virtual void ClearCaches();
+  // ReXGlue: drops host-side caches of guest memory (see GraphicsSystem).
   virtual void InvalidateGpuMemory();
 
   // "Desired" is for the external thread managing the post-processing effect.
@@ -107,27 +150,42 @@ class CommandProcessor {
   // screen right in the beginning of 4D530AA4 is not a resolved render target,
   // for instance).
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
-                         uint32_t frontbuffer_height) = 0;
+                         uint32_t frontbuffer_height) {}
 
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
   // awaited.
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                                       bool blocking);
+                                       bool blocking,
+                                       std::function<void()> completion_callback = nullptr);
+
+  virtual void RequestFrameTrace(const std::filesystem::path& root_path);
+  virtual void BeginTracing(const std::filesystem::path& root_path);
+  virtual void EndTracing();
+
+  virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
+
+  void RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
+                        uint32_t register_count, bool execute_callbacks);
+  void RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
+                        const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
+                        uint32_t new_gamma_ramp_rw_component);
+  virtual void RestoreEdramSnapshot(const void* snapshot) = 0;
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 
   void UpdateWritePointer(uint32_t value);
 
-  void ExecutePacket(uint32_t ptr, uint32_t count);
+  void LogRegisterSet(uint32_t register_index, uint32_t value);
+  void LogRegisterSets(uint32_t base_register_index, const uint32_t* values, uint32_t n_values);
 
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
 
-  bool Save(::rex::stream::ByteStream* stream);
-  bool Restore(::rex::stream::ByteStream* stream);
+  bool Save(stream::ByteStream* stream);
+  bool Restore(stream::ByteStream* stream);
 
  protected:
   struct IndexBufferInfo {
@@ -138,24 +196,71 @@ class CommandProcessor {
     size_t length = 0;
   };
 
+  static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
+
+  // Eviction policy constants for readback buffer cache
+  static constexpr size_t kMaxReadbackBuffers = 64;
+  static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
+
+  // Progressive alignment for readback buffers to avoid wasting memory
+  static inline uint32_t AlignReadbackBufferSize(uint32_t size) {
+    if (size < 1 * 1024 * 1024) {
+      return rex::align(size, 256u * 1024u);  // 256KB for < 1MB
+    } else if (size < 4 * 1024 * 1024) {
+      return rex::align(size, 1u * 1024u * 1024u);  // 1MB for < 4MB
+    } else {
+      return rex::align(size, kReadbackBufferSizeIncrement);  // 16MB for >= 4MB
+    }
+  }
+
+  // Generate a cache key for a specific resolve operation
+  static inline uint64_t MakeReadbackResolveKey(uint32_t address, uint32_t length) {
+    return (uint64_t(address) << 32) | uint64_t(length);
+  }
+
   void WorkerThreadMain();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
+  // rarely needed, most register writes have no special logic here
+  REX_NOINLINE
+  void HandleSpecialRegisterWrite(uint32_t index, uint32_t value);
 
   virtual void WriteRegister(uint32_t index, uint32_t value);
+  // ReXGlue: register read that also covers extended_register_values_.
   uint32_t ReadRegisterValue(uint32_t index) const;
+
+  // mem has big-endian register values
+  REX_FORCEINLINE
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
-  virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
+
+  REX_FORCEINLINE
+  virtual void WriteRegisterRangeFromRing(rex::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
-  void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
-  void WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
-  void WriteBoolRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
-  void WriteLoopRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
-  void WriteREGISTERSRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
+
+  REX_NOINLINE
+  void WriteOneRegisterFromRing(
+      uint32_t base,
+      uint32_t num_times);  // repeatedly write a value to one register, presumably a
+                            // register with special handling for writes
+
+  void WriteALURangeFromRing(rex::RingBuffer* ring, uint32_t base, uint32_t num_times);
+
+  void WriteFetchRangeFromRing(rex::RingBuffer* ring, uint32_t base, uint32_t num_times);
+
+  void WriteBoolRangeFromRing(rex::RingBuffer* ring, uint32_t base, uint32_t num_times);
+
+  void WriteLoopRangeFromRing(rex::RingBuffer* ring, uint32_t base, uint32_t num_times);
+
+  void WriteREGISTERSRangeFromRing(rex::RingBuffer* ring, uint32_t base, uint32_t num_times);
+
   void WriteALURangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+
   void WriteFetchRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+
   void WriteBoolRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+
   void WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+
   void WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
 
   const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table() const {
@@ -169,71 +274,348 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
-  uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
-  virtual void OnPrimaryBufferEnd() {}
-  void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
-  bool ExecutePacket(memory::RingBuffer* reader);
-  bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
-  bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
-  bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
-  bool ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet);
-  bool ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count);
-  bool ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count);
-  bool ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count);
-  virtual bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                                  uint32_t count);
-  bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
-                              uint32_t viz_query_condition, uint32_t count_remaining);
-  bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* reader, uint32_t packet,
-                                        uint32_t count);
-  bool ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* reader, uint32_t packet,
-                                            uint32_t count);
-  bool ExecutePacketType3_SET_SHADER_CONSTANTS(memory::RingBuffer* reader, uint32_t packet,
-                                               uint32_t count);
-  bool ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* reader,
+  virtual void PollCompletedSubmission() {}
 
-                                            uint32_t packet, uint32_t count);
-  bool ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* reader, uint32_t packet,
-                                           uint32_t count);
-  bool ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+  // Used by strict ZPD to distinguish normal in flight latency from a
+  // genuinely stuck report.
+  virtual uint64_t GetCompletedSubmission() const { return 0; }
+
+  virtual void OnPrimaryBufferEnd() {}
+
+  // TODO(boma): Add tracking for EVENT_WRITE_EXT reports.
+  using ReportHandle = uint64_t;
+  static constexpr ReportHandle kInvalidReportHandle = 0;
+
+  enum class QueryOpenResult {
+    kOpened,
+    kDeferred,
+    kPoolExhausted,
+    kFailed,
+  };
+
+  // One active guest report slot. May span multiple host query segments split
+  // across submissions or render passes, final value is the normalized sum.
+  struct ZPDReport {
+    // Guest sample count. Each segment is normalized by its own scale area
+    // when it resolves.
+    uint64_t accumulated_samples = 0;
+    // Submission of the first closed segment.
+    uint64_t first_segment_end_submission = 0;
+    // Submission containing the most recently closed segment's resolve.
+    uint64_t last_segment_end_submission = 0;
+    uint64_t slot_sequence_id = 0;
+    uint32_t slot_base = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    // Snapshotted at BEGIN from zpd_slot_values_.
+    uint32_t begin_value = 0;
+    uint32_t pending_segments = 0;
+    // Last known delta. Carried forward on forced close so slot doesn't
+    // briefly look fully occluded. 0 is a valid delta for alternate fast path.
+    uint32_t cached_delta = 0;
+    bool has_cached_delta = false;
+    bool ended = false;
+  };
+
+  // Currently open guest lifetime. Retired reports are tracked separately
+  // by handle until their query segments resolve. This intentionally models
+  // only one logical report at a time. That's enough for conventional ZPD
+  // reports, but QueryBatch can have multiple slots in flight, so it doesn't
+  // fit this layout. Eventually this probably wants to become something more
+  // like a map of active reports keyed by slot and sequence instead.
+  struct ActiveZPDSegment {
+    ReportHandle report_handle = kInvalidReportHandle;
+    uint32_t slot_base = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    uint32_t scale_area = 0;
+    bool segment_active = false;
+    bool segment_pending_begin = false;
+    bool logical_active = false;
+  };
+
+  struct PendingZPDSlot {
+    ReportHandle report_handle = kInvalidReportHandle;
+    uint32_t cached_delta = 0;
+    bool has_cached_delta = false;
+  };
+
+  virtual void EnsureZPDQueryResources() {}
+  virtual void ShutdownZPDQueryResources() {}
+
+  virtual bool IsZPDQueryPoolReady() const { return false; }
+  virtual bool CanOpenZPDQuery() const { return true; }
+
+  // Backend acquires a pool slot, records BeginQuery, tracks it internally.
+  virtual QueryOpenResult OpenZPDQuery(ReportHandle report_handle, bool can_close_submission) {
+    return QueryOpenResult::kFailed;
+  }
+  // Backend records EndQuery, queues a resolve for the active slot.
+  virtual bool CloseZPDQuery(ReportHandle report_handle, uint64_t& out_submission) { return false; }
+  // Backend discards the active query without resolving.
+  virtual bool DiscardZPDQuery() { return false; }
+
+  // Backend drains completed resolves and calls OnZPDQueryResolved for each.
+  virtual void PumpQueryResolves() {}
+  // Backend waits for all pending segments of report_handle to resolve.
+  virtual bool AwaitQueryResolve(ReportHandle report_handle, uint64_t wait_for_submission) {
+    return false;
+  }
+
+  bool BeginZPDReport(uint32_t report_address);
+  bool EndZPDReport(uint32_t report_address, bool guest_forced_end);
+  // Opens a new host query segment when CanOpenZPDQuery is true.
+  void OpenQuerySegment(bool can_close_submission);
+  // Closes the current segment at a submission or render pass boundary.
+  // The logical report stays open and a new segment will open at the next
+  // opportunity.
+  void CloseQuerySegment();
+  // Splits the open segment when the draw scale changes so each segment
+  // normalizes with one scale.
+  void UpdateZPDScale(uint32_t scale_area);
+
+  // Called by backends when a host query resolve completes.  Accumulates
+  // the normalized sample count, and if all segments are done, commits the
+  // report to guest memory.
+  void OnZPDQueryResolved(ReportHandle report_handle, uint64_t raw_samples, uint32_t scale_area);
+
+  // Writes guest report with begin_value read from guest memory.
+  // Orphan END path only when no controller snapshot is available.
+  void WriteZPDReport(uint32_t begin_record, uint32_t end_record, uint32_t begin_value,
+                      uint32_t delta_value, bool write_begin_record);
+
+  // Called from PrepareForWait so strict mode can retire before guest loops
+  // again. Gives up after kStrictZPDRetireMaxStalls.
+  void PumpPendingRetire();
+
+  // Divides a segment's host count by the scale area it ran under.
+  static uint32_t NormalizeSampleCount(uint64_t samples, uint32_t scale_area);
+
+  // Writes the final report to guest memory and advances the slot running
+  // total.  Called when a report fully resolves or is abandoned.
+  void CommitZPDReport(ZPDReport& report, uint32_t delta_value);
+  // Checks that the report's slot sequence is still current (not reused).
+  bool IsZPDReportCurrent(const ZPDReport& report) const;
+  PendingZPDSlot GetPendingZPDSlot(uint32_t slot_base, uint32_t end_record) const;
+
+  void ResetZPDState() {
+    zpd_active_segment_ = {};
+    zpd_next_report_handle_ = 1;
+    zpd_slot_sequences_.clear();
+    zpd_slot_values_.clear();
+    logical_zpd_reports_.clear();
+    fast_zpd_report_cached_values_.clear();
+    fake_zpd_sample_count_ = 0;
+    querybatch_zpd_sample_count_ = UINT32_MAX;
+    zpd_pending_retire_handle_ = kInvalidReportHandle;
+    zpd_pending_retire_stalls_ = 0;
+    zpd_pending_retire_start_ms_ = 0;
+    zpd_force_fake_fallback_ = false;
+  }
+
+  // VIZ_QUERY is NOT a sample counter. The scan converter tracks 64 query IDs,
+  // and an ID is visible when its geometry is still potentially visible after
+  // hi-Z. Draws carrying a VIZ token then get culled at PM4 or predicated on
+  // the GPU. Anything unmeasured, for whatever reason, stays visible.
+  // Sequencing exists because titles reuse the 6 bit IDs while older host
+  // queries and predicates are still retiring.
+  struct VIZSlot {
+    uint64_t slot_sequence_id = 0;
+    uint32_t pending_segments = 0;
+    bool has_result = true;
+    bool visible = true;
+    bool active = false;
+    // Survey reached the backend during this sequence.
+    bool draw_seen = false;
+    // OR of resolved segment visibility for this sequence.
+    bool accumulated_visible = false;
+    bool has_segments = false;
+    // Not zero samples, just means something went wrong and it can't be
+    // reported not-visible.
+    bool has_fallback = false;
+    // Physical query slot a consumer draw may predicate on while the CPU
+    // result is still outstanding.
+    uint32_t predicate_query_index = UINT32_MAX;
+    bool predicate_uses_interlock_counter = false;
+    // Once the predicate stops covering the whole unresolved query, later
+    // segments can't make it exact again. kBlocked never goes back to kNone.
+    enum class PredicateState : uint8_t {
+      kNone,
+      kArmed,
+      kBlocked,
+    };
+    PredicateState predicate_state = PredicateState::kNone;
+  };
+
+  struct VIZBinding {
+    uint32_t slot_id = 0;
+    uint64_t slot_sequence_id = 0;
+    bool active = false;
+  };
+
+  struct PendingVIZResolve {
+    uint64_t end_submission = 0;
+    uint32_t slot_id = 0;
+    uint64_t slot_sequence_id = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool uses_interlock_counter = false;
+  };
+
+  // PM4 decision for a VIZ token.
+  // Run it, skip it, or run it under a backend predicate.
+  struct VIZDecision {
+    uint32_t slot_id = 0;
+    uint64_t slot_sequence_id = 0;
+    bool draw = true;
+    bool use_predicate = false;
+  };
+
+  // kFallback draws noted throughout backend bailout. PM4 only notes kDrawn.
+  enum class VIZQueryDrawResult {
+    kDrawn,
+    kFallback,
+    kEmpty,
+    kFailed,
+  };
+
+  struct VIZStats {
+    uint64_t queries_begun = 0;
+    uint64_t queries_ended = 0;
+    uint64_t resolved_visible = 0;
+    uint64_t resolved_hidden = 0;
+    // Backend results that arrived after their ID was already re-begun.
+    uint64_t stale_resolves = 0;
+    // Sequences that went conservative, not unmeasured draws.
+    uint64_t fallback_sequences = 0;
+    // Segments opened after a sequence's first, blocking the predicate.
+    uint64_t segment_splits = 0;
+    uint64_t token_draws = 0;
+    uint64_t draws_culled = 0;
+    uint64_t draws_predicated = 0;
+    // Tokened draws that bypassed VIZ.
+    uint64_t memexport_draws = 0;
+    uint64_t copy_passthroughs = 0;
+    // Token draws that actually blocked on a submitted resolve.
+    uint64_t waits = 0;
+    uint64_t last_log_frame = 0;
+
+    void Reset(uint64_t current_frame) {
+      *this = {};
+      last_log_frame = current_frame;
+    }
+  };
+
+  virtual void PumpVIZResolves() {}
+  virtual void AwaitSubmittedVIZResolve(uint64_t wait_for_submission) {}
+  void ArmVIZPredicate(uint32_t id, uint64_t generation, uint32_t query_index = UINT32_MAX,
+                       bool uses_interlock_counter = false);
+  // Whether ArmVIZPredicate would take a fresh predicate for this sequence,
+  // checked before recording staging that could never arm.
+  bool CanArmVIZPredicate(uint32_t id, uint64_t generation) const;
+  void DisarmVIZPredicate(uint32_t id, uint64_t generation);
+  const VIZSlot* GetVIZPredicate() const;
+
+  // Backend hooks for VIZ query segments. The base CP owns IDs and slot
+  // sequences.
+  virtual QueryOpenResult OpenVIZQuery(uint32_t id, uint64_t generation) {
+    return QueryOpenResult::kFailed;
+  }
+  // Closes the physical query and queues a resolve. False means no result will
+  // arrive, which is treated as conservative.
+  virtual bool CloseVIZQuery(uint32_t id, uint64_t generation) { return false; }
+  void BeginVIZQuery(uint32_t id);
+  void EndVIZQuery(uint32_t id);
+  void ResolveVIZ(uint32_t id, bool visible);
+  VIZDecision GetVIZDecision(uint32_t token);
+  void UpdateVIZSegment();
+  void CloseVIZSegment();
+  // Backend reports a resolved segment here.
+  void OnVIZResolved(uint32_t id, uint64_t generation, bool visible);
+  void TryResolveVIZ(uint32_t id);
+  void NoteVIZDraw(bool measured);
+  void LogVIZStats(uint64_t frame_current);
+  bool GetActiveVIZQuery(uint32_t& id, uint64_t& generation) const;
+  void ResetVIZState();
+
+#include <rex/graphics/pm4_command_processor_declare.h>
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
-                             const uint32_t* host_address, uint32_t dword_count) = 0;
+                             const uint32_t* host_address, uint32_t dword_count) {
+    return nullptr;
+  }
 
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
-                         IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
-  virtual bool IssueCopy() = 0;
+                         IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                         VIZQueryDrawResult* viz_query_draw_result = nullptr) {
+    if (viz_query_draw_result) {
+      *viz_query_draw_result = VIZQueryDrawResult::kFallback;
+      return true;
+    }
+    return false;
+  }
+  virtual bool IssueCopy() { return false; }
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
 
-  // Shared readback resolve mode with backend legacy-flag alias support.
-  ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
-  // Shared memexport readback enable state with backend legacy-flag override support.
-  bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
+  virtual void InitializeTrace();
 
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
-  RegisterFile* register_file_ = nullptr;
+  RegisterFile* REX_RESTRICT register_file_ = nullptr;
+
+  ReportHandle zpd_next_report_handle_ = 1;
+  std::unordered_map<uint32_t, uint64_t> zpd_slot_sequences_;
+  std::unordered_map<uint32_t, uint32_t> zpd_slot_values_;
+  std::unordered_map<ReportHandle, ZPDReport> logical_zpd_reports_;
+  ActiveZPDSegment zpd_active_segment_{};
+
+  // Cached delta per END.
+  // Fast mode uses this for speculative writeback and orphaned END replay.
+  std::unordered_map<uint32_t, uint32_t> fast_zpd_report_cached_values_;
+
+  uint32_t querybatch_zpd_sample_count_ = UINT32_MAX;
+  bool zpd_force_fake_fallback_ = false;
+
+  std::array<VIZSlot, 64> viz_slots_{};
+  VIZStats viz_stats_;
+  VIZBinding viz_segment_{};
+  VIZBinding viz_predicate_draw_{};
+  std::deque<PendingVIZResolve> viz_resolves_in_flight_;
+
+  // Strict mode defers guest completion until the queued END has retired.
+  ReportHandle zpd_pending_retire_handle_ = kInvalidReportHandle;
+  uint32_t zpd_pending_retire_stalls_ = 0;
+  // Uptime in ms when zpd_pending_retire_handle_ was first set.
+  uint64_t zpd_pending_retire_start_ms_ = 0;
+
+  // Set by the backend when resolution scale changes.
+  uint32_t zpd_draw_resolution_scale_x_ = 1;
+  uint32_t zpd_draw_resolution_scale_y_ = 1;
+
+  uint32_t zpd_draw_resolution_scale_x() const { return zpd_draw_resolution_scale_x_; }
+  uint32_t zpd_draw_resolution_scale_y() const { return zpd_draw_resolution_scale_y_; }
+  // Scale area for the segment being closed.
+  uint32_t GetZPDScaleArea() const {
+    return zpd_active_segment_.scale_area
+               ? zpd_active_segment_.scale_area
+               : zpd_draw_resolution_scale_x_ * zpd_draw_resolution_scale_y_;
+  }
+
+  uint32_t fake_zpd_sample_count_ = 0;
+
+  TraceWriter trace_writer_;
+  enum class TraceState {
+    kDisabled,
+    kStreaming,
+    kSingleFrame,
+  };
+  TraceState trace_state_ = TraceState::kDisabled;
+  std::filesystem::path trace_stream_path_;
+  std::filesystem::path trace_frame_path_;
 
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
@@ -255,9 +637,7 @@ class CommandProcessor {
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
 
-  // Some titles submit writes beyond the emulated register file range in PM4
-  // packets. Preserve these values so dependent packet logic can still observe
-  // them instead of dropping the write entirely.
+  // ReXGlue: values of PM4 register writes beyond the register file range.
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
@@ -273,14 +653,12 @@ class CommandProcessor {
   SwapPostEffect swap_post_effect_desired_ = SwapPostEffect::kNone;
   SwapPostEffect swap_post_effect_actual_ = SwapPostEffect::kNone;
 
-  // Set by backend command processors to their legacy memexport readback cvar
-  // name (for explicit-override compatibility).
-  const char* legacy_readback_memexport_cvar_name_ = nullptr;
-
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+
+  REX_NOINLINE REX_COLD void LogKickoffInitator(uint32_t value);
 };
 
 }  // namespace rex::graphics

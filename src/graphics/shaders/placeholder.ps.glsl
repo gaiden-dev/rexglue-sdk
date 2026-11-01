@@ -9,10 +9,12 @@
 
 #version 460
 
-// Minimal placeholder pixel shader for async pipeline hot-swap.
-// Discarding avoids transient black flashes while real shaders are compiling.
+// Minimal placeholder pixel shader for pipeline hot-swap.
+// Used temporarily while the real shader compiles in the background.
+// Outputs transparent black to minimize visual disruption.
+
 layout(location = 0) out vec4 oC0;
 
 void main() {
-  discard;
+  oC0 = vec4(0.0, 0.0, 0.0, 0.0);
 }

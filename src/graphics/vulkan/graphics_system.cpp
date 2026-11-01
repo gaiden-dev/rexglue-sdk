@@ -11,7 +11,7 @@
 
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/graphics_system.h>
-#include <rex/system/kernel_state.h>
+#include <rex/system/xtypes.h>
 #include <rex/ui/vulkan/provider.h>
 
 namespace rex::graphics::vulkan {
@@ -21,6 +21,10 @@ VulkanGraphicsSystem::VulkanGraphicsSystem() {}
 VulkanGraphicsSystem::~VulkanGraphicsSystem() {}
 
 std::string VulkanGraphicsSystem::name() const {
+  auto vulkan_command_processor = static_cast<VulkanCommandProcessor*>(command_processor());
+  if (vulkan_command_processor != nullptr) {
+    return vulkan_command_processor->GetWindowTitleText();
+  }
   return "Vulkan";
 }
 

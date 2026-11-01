@@ -25,3 +25,7 @@
 
 // Formatting helpers (ptr, hex, boolean)
 #include <rex/logging/format.h>
+
+// xenia-shaped LogLevel / logging::ShouldLog / logging::LoggerBatch, so GPU code
+// ported from xenia-canary can stay verbatim
+#include <rex/logging/xenia_compat.h>

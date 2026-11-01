@@ -17,7 +17,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -29,6 +28,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
+#include <rex/graphics/vulkan/occlusion_query_pool.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
@@ -38,6 +38,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/vulkan/gpu_completion_timeline.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
@@ -45,12 +46,15 @@
 
 namespace rex::graphics::vulkan {
 
-class VulkanCommandProcessor : public CommandProcessor {
+class VulkanCommandProcessor final : public CommandProcessor {
+ protected:
+#define OVERRIDING_BASE_CMDPROCESSOR
+#include <rex/graphics/pm4_command_processor_declare.h>
+#undef OVERRIDING_BASE_CMDPROCESSOR
  public:
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
-    kStorageBufferPairCompute,
     kCount,
   };
 
@@ -131,17 +135,23 @@ class VulkanCommandProcessor : public CommandProcessor {
   ~VulkanCommandProcessor();
 
   void ClearCaches() override;
+  // ReXGlue: host-side guest memory writes that bypass the protection callbacks.
   void InvalidateGpuMemory() override;
+
+  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                               bool blocking) override;
+                               bool blocking,
+                               std::function<void()> completion_callback = nullptr) override;
+
+  void RestoreEdramSnapshot(const void* snapshot) override;
+
+  void PollCompletedSubmission() override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
   }
-
-  bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
-                          std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -151,10 +161,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
 
   bool submission_open() const { return submission_open_; }
-  uint64_t GetCurrentSubmission() const {
-    return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
+  uint64_t GetCurrentSubmission() const { return completion_timeline_.GetUpcomingSubmission(); }
+  uint64_t GetCompletedSubmission() const override {
+    return completion_timeline_.GetCompletedSubmissionFromLastUpdate();
   }
-  uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
@@ -195,10 +205,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Submission must be open.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer);
-  // Overload for transfer operations with dynamic rendering.
-  void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-      VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer,
-      VkImageView transfer_dest_view, bool transfer_dest_is_depth);
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
@@ -247,15 +253,14 @@ class VulkanCommandProcessor : public CommandProcessor {
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
-
+  REX_FORCEINLINE
   void WriteRegister(uint32_t index, uint32_t value) override;
-  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
-  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count) override;
+  REX_FORCEINLINE
+  virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
+                                     uint32_t num_registers) override;
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
-  void OnPrimaryBufferEnd() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -264,8 +269,14 @@ class VulkanCommandProcessor : public CommandProcessor {
                      const uint32_t* host_address, uint32_t dword_count) override;
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
+                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                 VIZQueryDrawResult* viz_query_draw_result = nullptr) override;
   bool IssueCopy() override;
+
+  // ReXGlue: vulkan_submit_on_primary_buffer_end.
+  void OnPrimaryBufferEnd() override;
+
+  void InitializeTrace() override;
 
  private:
   struct CommandBuffer {
@@ -366,26 +377,6 @@ class VulkanCommandProcessor : public CommandProcessor {
 
     kSwapApplyGammaDescriptorSetCount,
   };
-  enum SwapApplyGammaComputeDescriptorSet : uint32_t {
-    kSwapApplyGammaComputeDescriptorSetRamp,
-    kSwapApplyGammaComputeDescriptorSetSource,
-    kSwapApplyGammaComputeDescriptorSetDestination,
-
-    kSwapApplyGammaComputeDescriptorSetCount,
-  };
-  struct SwapApplyGammaConstants {
-    uint32_t size[2];
-  };
-  enum SwapFxaaDescriptorSet : uint32_t {
-    kSwapFxaaDescriptorSetSource,
-    kSwapFxaaDescriptorSetDestination,
-
-    kSwapFxaaDescriptorSetCount,
-  };
-  struct SwapFxaaConstants {
-    uint32_t size[2];
-    float size_inv[2];
-  };
 
   // Framebuffer for the current presenter's guest output image revision, and
   // its usage tracking.
@@ -406,7 +397,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
-  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  void CheckSubmissionCompletionAndDeviceLoss(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -416,82 +407,79 @@ class VulkanCommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
-  bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
-    return !submission_open_ && submissions_in_flight_fences_.empty();
-  }
-  // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
-  // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
+  bool AwaitAllQueueOperationsCompletion() {
+    CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
+    return !submission_open_ && GetCompletedSubmission() + 1u >= GetCurrentSubmission();
+  }
+
+  // Requests a readback buffer for CPU access to GPU data.
+  VkBuffer RequestReadbackBuffer(uint32_t size);
 
   void ClearTransientDescriptorPools();
-  bool IssueCopy_ReadbackResolvePath();
-  bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
-  bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   void SplitPendingBarrier();
 
   void DestroyScratchBuffer();
-  bool InitializeOcclusionQueryResources();
-  void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
-  void InvalidateAllVertexBufferResidency();
-  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
-  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
-  struct ReadbackBuffer {
-    VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    void* mapped_data[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    uint64_t submission_written[2] = {0, 0};
-    uint32_t written_size[2] = {0, 0};
-    uint32_t current_index = 0;
-    uint64_t last_used_frame = 0;
-  };
-  void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
-  static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
-  static constexpr size_t kMaxReadbackBuffers = 256;
-  static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
-  static inline uint32_t AlignReadbackBufferSize(uint32_t size) {
-    if (size < 1 * 1024 * 1024) {
-      return rex::align(size, 256u * 1024u);
+
+  // ZPD occlusion queries backend.
+  // vkCmdBeginQuery is only valid inside a render pass, so segments split at
+  // pass end and resume at the next pass begin. If BEGIN fires outside a pass,
+  // segment_pending_begin waits for the next. Outside a render pass,
+  // DiscardZPDQuery defers the slot release until the submission completes.
+  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
+  // need to open before a pass begins or split an active pass around the clear.
+  void EnsureZPDQueryResources() override;
+  void ShutdownZPDQueryResources() override {
+    zpd_resolves_in_flight_.clear();
+    zpd_deferred_releases_.clear();
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_fsi_ = false;
+    zpd_query_pool_needs_fsi_counter_ = false;
+    zpd_fsi_counter_index_force_update_ = true;
+    if (zpd_host_query_pool_) {
+      zpd_host_query_pool_->Shutdown();
     }
-    if (size < 4 * 1024 * 1024) {
-      return rex::align(size, 1u * 1024u * 1024u);
-    }
-    return rex::align(size, kReadbackBufferSizeIncrement);
   }
-  static inline uint64_t MakeReadbackResolveKey(uint32_t address, uint32_t length) {
-    return (uint64_t(address) << 32) | uint64_t(length);
-  }
-  static inline uint64_t MakeMemexportReadbackKey(uint32_t first_base_address_dwords,
-                                                  uint32_t total_size) {
-    return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
-  }
-  struct ResolveDownscaleConstants {
-    uint32_t scale_x;
-    uint32_t scale_y;
-    uint32_t pixel_size_log2;
-    uint32_t tile_count;
-    uint32_t source_offset_bytes;
-    uint32_t half_pixel_offset;
-  };
-  bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
-  void DestroySwapFxaaSourceImage();
+
+  bool IsZPDQueryPoolReady() const override;
+  bool CanOpenZPDQuery() const override;
+
+  QueryOpenResult OpenZPDQuery(ReportHandle report_handle, bool can_close_submission) override;
+  bool CloseZPDQuery(ReportHandle report_handle, uint64_t& out_submission) override;
+  bool DiscardZPDQuery() override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle, uint64_t wait_for_submission) override;
+
+  // VIZ_QUERY conditional rendering backend.
+  // Shared CP owns IDs and predicates, the backend owns the physical query
+  // slots and predicate buffer.
+  QueryOpenResult OpenVIZQuery(uint32_t id, uint64_t generation) override;
+  bool CloseVIZQuery(uint32_t id, uint64_t generation) override;
+  void PumpVIZResolves() override;
+  void AwaitSubmittedVIZResolve(uint64_t wait_for_submission) override;
+  // One uint32_t predicate slot per ID.
+  bool EnsureVIZPredicateBuffer();
+  // Closes surveys before EndRenderPass. Predicate copies queued for teardown.
+  void CloseVIZOcclusionSegment();
+  // Drains the queued predicate copies.
+  void RecordVIZCopies();
+  // Drains queued copies when the bound slot's value hasn't landed yet.
+  VkBuffer BindVIZPredicate(VkDeviceSize& offset_out);
+  void ShutdownVIZQueryResources();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
-                          reg::RB_DEPTHCONTROL normalized_depth_control);
+                          reg::RB_DEPTHCONTROL normalized_depth_control,
+                          uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                          bool depth_bias_in_pixel_shader);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
-      bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
-      const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
-      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
+      bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
+      uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
@@ -518,23 +506,39 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineStageFlags guest_shader_pipeline_stages_ = 0;
   VkShaderStageFlags guest_shader_vertex_stages_ = 0;
 
-  std::vector<VkFence> fences_free_;
   std::vector<VkSemaphore> semaphores_free_;
 
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
+    bool uses_fsi_counter = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+  };
+  uint32_t zpd_active_query_index_ = UINT32_MAX;
+  uint32_t zpd_active_query_generation_ = 0;
+  bool zpd_active_query_is_fsi_ = false;
+  bool zpd_query_pool_needs_fsi_counter_ = false;
+  bool zpd_fsi_counter_index_force_update_ = true;
+  std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
+  // Fallback buffer for EDRAM descriptor binding 2.
+  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Currently installed binding 2 buffer.
+  VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
+
+  ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;
-  uint64_t submission_completed_ = 0;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
-  std::vector<VkFence> submissions_in_flight_fences_;
   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
-  // Tracks whether any draw in the current frame used an async placeholder
-  // graphics pipeline and may have produced incomplete output.
-  bool frame_used_async_placeholder_pipeline_ = false;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -545,8 +549,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   // <Submission where last used, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, VkDeviceMemory>> destroy_memory_;
   std::deque<std::pair<uint64_t, VkBuffer>> destroy_buffers_;
-  std::deque<std::pair<uint64_t, VkImageView>> destroy_image_views_;
-  std::deque<std::pair<uint64_t, VkImage>> destroy_images_;
   std::deque<std::pair<uint64_t, VkFramebuffer>> destroy_framebuffers_;
 
   std::vector<CommandBuffer> command_buffers_writable_;
@@ -611,6 +613,46 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
 
+  std::unique_ptr<VulkanOcclusionQueryPool> zpd_host_query_pool_;
+
+  std::unique_ptr<VulkanOcclusionQueryPool> viz_host_query_pool_;
+
+  struct ActiveVIZQuery {
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool valid = false;
+    // FSI surveys borrow a ZPD FSI counter slot, no host query.
+    // query_index/query_generation index that pool.
+    bool is_fsi = false;
+  };
+  ActiveVIZQuery viz_active_query_{};
+  // True while IssueDraw is recording a survey, so the system constants route
+  // the FSI counter to the borrowed slot rather than an open ZPD segment.
+  // Reassigned on every draw.
+  bool viz_survey_draw_active_ = false;
+  // One uint32_t predicate slot per ID, filled by copying a finished occlusion
+  // query result, read by conditional rendering on unresolved consumer draws.
+  VkBuffer viz_predicate_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory viz_predicate_buffer_memory_ = VK_NULL_HANDLE;
+  bool viz_predicate_buffer_failed_ = false;
+  // Finished queries waiting to be copied into their predicate slots at the
+  // next pass boundary, so back-to-back ENDs don't each split the pass.
+  struct PendingVIZCopy {
+    uint32_t id;
+    uint32_t query_index;
+  };
+  std::vector<PendingVIZCopy> viz_pending_copies_;
+
+  // Deferred query slot releases for discards that happen outside a render
+  // pass, where vkCmdEndQuery cannot be issued.  The slot is held until the
+  // submission containing the stale BeginQuery completes on the GPU.
+  struct DeferredQueryRelease {
+    uint64_t submission;
+    uint32_t query_index;
+    uint32_t query_generation;
+  };
+  std::deque<DeferredQueryRelease> zpd_deferred_releases_;
+
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
   std::unique_ptr<VulkanTextureCache> texture_cache_;
@@ -641,8 +683,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 
   VkDescriptorSetLayout swap_descriptor_set_layout_sampled_image_ = VK_NULL_HANDLE;
-  VkDescriptorSetLayout swap_descriptor_set_layout_combined_image_sampler_ = VK_NULL_HANDLE;
-  VkDescriptorSetLayout swap_descriptor_set_layout_storage_image_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout swap_descriptor_set_layout_uniform_texel_buffer_ = VK_NULL_HANDLE;
 
   // Descriptor pool for allocating descriptors needed for presentation, such as
@@ -654,53 +694,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::array<VkDescriptorSet, 2 * kMaxFramesInFlight> swap_descriptors_gamma_ramp_;
   // Sampled images.
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_source_;
-  // Combined image sampler descriptors for FXAA.
-  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_fxaa_source_;
-  // Storage image descriptors for the apply-gamma compute pass destination.
-  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_destination_storage_;
-  // Separate storage image descriptors for the FXAA compute destination.
-  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_descriptors_fxaa_destination_storage_;
-
-  VkSampler swap_sampler_linear_clamp_ = VK_NULL_HANDLE;
 
   VkPipelineLayout swap_apply_gamma_pipeline_layout_ = VK_NULL_HANDLE;
-  VkPipelineLayout swap_apply_gamma_compute_pipeline_layout_ = VK_NULL_HANDLE;
-  VkPipelineLayout swap_fxaa_pipeline_layout_ = VK_NULL_HANDLE;
   // Has no dependencies on specific pipeline stages on both ends to simplify
   // use in different scenarios with different pipelines - use explicit barriers
   // for synchronization.
   VkRenderPass swap_apply_gamma_render_pass_ = VK_NULL_HANDLE;
   VkPipeline swap_apply_gamma_256_entry_table_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_apply_gamma_pwl_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_256_entry_table_rb_swap_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_pwl_rb_swap_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_256_entry_table_fxaa_luma_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_pwl_fxaa_luma_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_256_entry_table_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_pwl_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_256_entry_table_rb_swap_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_pwl_rb_swap_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_256_entry_table_fxaa_luma_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_256_entry_table_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
-  VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
-  VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
-  VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
-  VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory resolve_downscale_buffer_memory_ = VK_NULL_HANDLE;
-  uint32_t resolve_downscale_buffer_size_ = 0;
-
-  VkImage swap_fxaa_source_image_ = VK_NULL_HANDLE;
-  VkDeviceMemory swap_fxaa_source_image_memory_ = VK_NULL_HANDLE;
-  VkImageView swap_fxaa_source_image_view_ = VK_NULL_HANDLE;
-  uint32_t swap_fxaa_source_image_width_ = 0;
-  uint32_t swap_fxaa_source_image_height_ = 0;
-  uint64_t swap_fxaa_source_image_submission_ = 0;
-  VkPipelineStageFlags swap_fxaa_source_stage_mask_ = 0;
-  VkAccessFlags swap_fxaa_source_access_mask_ = 0;
-  VkImageLayout swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
   std::array<SwapFramebuffer, ui::vulkan::VulkanPresenter::kMaxActiveGuestOutputImageVersions>
       swap_framebuffers_;
@@ -726,29 +727,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkAccessFlags scratch_buffer_last_access_mask_ = 0;
   uint64_t scratch_buffer_last_usage_submission_ = 0;
   bool scratch_buffer_used_ = false;
-
-  static constexpr uint32_t kMaxOcclusionQueries = 8192;
-  VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
-  VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  uint32_t occlusion_query_readback_memory_type_ = UINT32_MAX;
-  VkDeviceSize occlusion_query_readback_memory_size_ = 0;
-  uint8_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
-  struct VertexBufferState {
-    uint32_t address = UINT32_MAX;
-    uint32_t size = UINT32_MAX;
-  };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
-  uint64_t vertex_buffers_in_sync_[2] = {};
-  std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
-  std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's
@@ -789,11 +767,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
 
   // Cache render pass currently started in the command buffer with the
-  // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
-  // but in_render_pass_ is true.
+  // framebuffer.
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
-  bool in_render_pass_ = false;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is
@@ -811,6 +787,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
+  // The index endian the tessellation constant buffer was filled with, from the
+  // primitive processor for the current draw. Not a register, so changes
+  // between draws invalidate the buffer separately from WriteRegister.
+  xenos::Endian current_tessellation_index_endian_ = xenos::Endian::kNone;
   VkDescriptorSet current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetCount];
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
   // up-to-date data.
@@ -837,8 +817,50 @@ class VulkanCommandProcessor : public CommandProcessor {
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
 
+  // Clip plane constants.
+  SpirvShaderTranslator::ClipPlaneConstants clip_plane_constants_;
+
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // Per-resolve double-buffered readback for delayed sync
+  struct ReadbackBuffer {
+    VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    uint32_t sizes[2] = {0, 0};
+    uint32_t current_index = 0;
+    uint64_t last_used_frame = 0;
+  };
+  // Map: (written_address << 32 | written_length) -> ReadbackBuffer
+  std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+
+  // Simple single buffer for memexport (always syncs, no double-buffering)
+  VkBuffer memexport_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory memexport_readback_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t memexport_readback_buffer_size_ = 0;
+
+  // Resolve downscale compute pipeline for scaled resolution readback,
+  // reversing the scaled resolve buffer packing back to 1x on the GPU.
+  // Set 0 - source storage buffer, set 1 - destination storage buffer, both
+  // with the kStorageBufferCompute transient layout.
+  struct ResolveDownscaleConstants {
+    uint32_t scale_x;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t scale_y;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t pixel_size_log2;  // 0=8bit, 1=16bit, 2=32bit, 3=64bit
+    uint32_t tile_count;       // Number of 32x32 tiles to process
+    // Byte offset of the first tile within the bound source range (the
+    // storage buffer offset alignment remainder).
+    uint32_t source_offset_bytes;
+    // When non-zero, sample from (scale/2, scale/2) within each scaled block
+    // instead of (0, 0).
+    uint32_t half_pixel_offset;
+  };
+  VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
+  // Intermediate device-local buffer for the downscaled output.
+  VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory resolve_downscale_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t resolve_downscale_buffer_size_ = 0;
 };
 
 }  // namespace rex::graphics::vulkan

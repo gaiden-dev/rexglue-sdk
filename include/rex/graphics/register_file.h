@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -8,8 +9,6 @@
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
-
-#pragma once
 
 #include <cstdint>
 #include <cstdlib>
@@ -36,7 +35,7 @@ class RegisterFile {
   RegisterFile();
 
   static const RegisterInfo* GetRegisterInfo(uint32_t index);
-
+  static bool IsValidRegister(uint32_t index);
   static constexpr size_t kRegisterCount = 0x5003;
   uint32_t values[kRegisterCount];
 

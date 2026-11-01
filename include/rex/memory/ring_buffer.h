@@ -17,6 +17,9 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/math.h>
+#include <rex/memory/swcache.h>
+#include <rex/platform.h>
 #include <rex/types.h>
 
 namespace rex::memory {
@@ -78,6 +81,22 @@ class RingBuffer {
   };
   ReadRange BeginRead(size_t count);
   void EndRead(ReadRange read_range);
+
+  // BeginRead, but if there is a second range it prefetches all of its cache
+  // lines (the first range is left to the hardware prefetcher).
+  template <rex::swcache::PrefetchTag tag>
+  REX_FORCEINLINE ReadRange BeginPrefetchedRead(size_t count) {
+    ReadRange range = BeginRead(count);
+    if (range.second) {
+      ring_size_t numlines =
+          rex::align<ring_size_t>(range.second_length, REX_HOST_CACHE_LINE_SIZE) /
+          REX_HOST_CACHE_LINE_SIZE;
+      for (ring_size_t i = 0; i < numlines; ++i) {
+        rex::swcache::Prefetch<tag>(range.second + (i * REX_HOST_CACHE_LINE_SIZE));
+      }
+    }
+    return range;
+  }
 
   size_t Read(uint8_t* buffer, size_t count);
   template <typename T>
@@ -142,3 +161,8 @@ inline uint32_t RingBuffer::ReadAndSwap<uint32_t>() {
 }
 
 }  // namespace rex::memory
+
+namespace rex {
+// Unqualified spelling used by code ported from xenia-canary.
+using memory::RingBuffer;
+}  // namespace rex

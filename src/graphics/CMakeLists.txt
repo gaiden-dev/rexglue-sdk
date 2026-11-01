@@ -25,6 +25,7 @@ set(REXGPU_XENOS_SOURCES
     pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
+    pipeline/texture/replacement.cpp
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
@@ -52,6 +53,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/shader.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
+    vulkan/occlusion_query_pool.cpp
 )
 
 # D3D12 backend
@@ -82,6 +84,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/texture_cache.cpp
         d3d12/deferred_command_list.cpp
         d3d12/pipeline_cache.cpp
+        d3d12/occlusion_query_pool.cpp
     )
 endif()
 
@@ -107,6 +110,7 @@ set_target_properties(rexgpu-xenos PROPERTIES
 
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
+    ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for PNG replacement textures
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
 )
 
@@ -157,8 +161,4 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
     )
-endif()
-
-if(UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64)")
-    target_compile_options(rexgpu-xenos PRIVATE -mssse3)
 endif()

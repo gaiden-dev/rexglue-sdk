@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -293,8 +295,18 @@ void XamLoaderTerminateTitle_entry() {
   REX_KERNEL_STATE()->TerminateTitle();
 }
 
-u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
-  assert_true(unk == 0);
+u32 XamAlloc_entry(u32 flags, u32 size, mapped_u32 out_ptr) {
+  // The first argument is a flags word, not always zero: Spider-Man Edge of
+  // Time passes a nonzero value from its async system-request path
+  // (InitAsyncMessage -> XamAlloc) on the post-title save-game check, and
+  // retail XAM allocates fine. Asserting here hung the game on an invisible
+  // debug-CRT dialog. Allocate regardless; log unusual flags for reference.
+  if (flags != 0) {
+    static std::atomic<uint32_t> s_flagLogs{0};
+    if (s_flagLogs.fetch_add(1, std::memory_order_relaxed) < 4)
+      REXKRNL_INFO("XamAlloc(flags={:08X}, size={}) - nonzero flags accepted", (uint32_t)flags,
+                   (uint32_t)size);
+  }
 
   // Allocate from the heap. Not sure why XAM does this specially, perhaps
   // it keeps stuff in a separate heap?

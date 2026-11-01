@@ -9,199 +9,131 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
-#include <cstdint>
-#include <utility>
-
-#include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
-#include <rex/graphics/pipeline/texture/info.h>
-#include <rex/graphics/pipeline/texture/util.h>
-#include <rex/graphics/register_file.h>
-#include <rex/graphics/xenos.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
+#include <rex/graphics/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
-                     "Texture cache memory limit for render-to-texture (MB)")
-    .range(1, 256)
+REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU",
+                     "Integer pixel width scale used for scaling the rendering resolution "
+                     "opaquely to the game.\n"
+                     "Values from 1 to 7 may be supported, depending on device capabilities. "
+                     "Requires sparse binding (Vulkan) or tiled resources (D3D12) for scales "
+                     "above 1x1. The emulator will automatically clamp to the maximum supported "
+                     "scale if the requested value exceeds device limits.\n"
+                     "Various effects and parts of game rendering pipelines may work "
+                     "incorrectly as pixels become ambiguous from the game's perspective and "
+                     "because half-pixel offset (which normally doesn't affect coverage when "
+                     "MSAA isn't used) becomes full-pixel.")
+    .range(1, 7)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft, 384, "GPU",
-                     "Soft texture cache memory limit (MB)")
-    .range(64, 4096)
+REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU",
+                     "Integer pixel width scale used for scaling the rendering resolution "
+                     "opaquely to the game.\n"
+                     "See draw_resolution_scale_x for more information.")
+    .range(1, 7)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
-                     "Hard texture cache memory limit (MB)")
-    .range(128, 8192)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
-                     "Soft texture cache memory limit lifetime (seconds)")
-    .range(1, 3600);
-
-REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
-                    "Sample problematic 3D textures through 2D-compatible wrappers")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
-                     "Forces anisotropic filtering for eligible textures.\n"
-                     "Higher values keep textures sharper at oblique angles, but increase texture "
-                     "sampling cost.\n"
-                     " -1 = No override\n"
-                     "  0 = Disable anisotropic filtering\n"
-                     "  1 = Force 1x anisotropic filtering\n"
-                     "  2 = Force 2x anisotropic filtering\n"
-                     "  3 = Force 4x anisotropic filtering\n"
-                     "  4 = Force 8x anisotropic filtering\n"
-                     "  5 = Force 16x anisotropic filtering")
-    .range(-1, 5)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
-    .range(1, 8)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
+// ReXGlue: sets both axes at once unless an axis is set explicitly.
 REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
                      "Draw resolution scale for both X and Y axes (same as setting "
                      "draw_resolution_scale_x and draw_resolution_scale_y)")
-    .range(1, 8)
+    .range(1, 7)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(texture_cache_memory_limit_soft, 384, "GPU.Debug",
+                      "Maximum host texture memory usage (in megabytes) above which old textures "
+                      "will be destroyed.")
+    .range(64, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU.Debug",
+                      "Seconds a texture should be unused to be considered old enough to be "
+                      "deleted if texture memory usage exceeds texture_cache_memory_limit_soft.")
+    .range(1, 3600);
+REXCVAR_DEFINE_UINT32(texture_cache_memory_limit_hard, 768, "GPU.Debug",
+                      "Maximum host texture memory usage (in megabytes) above which textures "
+                      "will be destroyed as soon as possible.")
+    .range(128, 8192)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(texture_cache_memory_limit_render_to_texture, 24, "GPU.Debug",
+                      "Part of the host texture memory budget (in megabytes) that will be scaled "
+                      "by the current drawing resolution scale.\n"
+                      "If texture_cache_memory_limit_soft, for instance, is 384, and this is 24, "
+                      "it will be assumed that the game will be using roughly 24 MB of "
+                      "render-to-texture (resolve) targets and 384 - 24 = 360 MB of regular "
+                      "textures - so with 2x2 resolution scaling, the soft limit will be 360 + "
+                      "96 MB, and with 3x3, it will be 360 + 216 MB.")
+    .range(1, 256)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(tiled_shared_memory, true, "GPU.Debug",
+                    "Enable tiled/sparse resources for efficient large address space "
+                    "support. Disable for graphics debugger compatibility.");
 
-REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
-                    "Pre-mask scaled resolve L2 blocks to the write range before iterating");
+REXCVAR_DEFINE_BOOL(texture_dump_enabled, false, "GPU/Texture Replacement",
+                    "Dump all decoded textures to disk as DDS files for replacement authoring")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-// DEFINE_int32(
-//     draw_resolution_scale_x, 1,
-//     "Integer pixel width scale used for scaling the rendering resolution "
-//     "opaquely to the game.\n"
-//     "1, 2 and 3 may be supported, but support of anything above 1 depends on "
-//     "the device properties, such as whether it supports sparse binding / tiled "
-//     "resources, the number of virtual address bits per resource, and other "
-//     "factors.\n"
-//     "Various effects and parts of game rendering pipelines may work "
-//     "incorrectly as pixels become ambiguous from the game's perspective and "
-//     "because half-pixel offset (which normally doesn't affect coverage when "
-//     "MSAA isn't used) becomes full-pixel.",
-//     "GPU");
-// DEFINE_int32(
-//     draw_resolution_scale_y, 1,
-//     "Integer pixel width scale used for scaling the rendering resolution "
-//     "opaquely to the game.\n"
-//     "See draw_resolution_scale_x for more information.",
-//     "GPU");
-// DEFINE_uint32(
-//     texture_cache_memory_limit_soft, 384,
-//     "Maximum host texture memory usage (in megabytes) above which old textures "
-//     "will be destroyed.",
-//     "GPU");
-// DEFINE_uint32(
-//     texture_cache_memory_limit_soft_lifetime, 30,
-//     "Seconds a texture should be unused to be considered old enough to be "
-//     "deleted if texture memory usage exceeds texture_cache_memory_limit_soft.",
-//     "GPU");
-// DEFINE_uint32(
-//     texture_cache_memory_limit_hard, 768,
-//     "Maximum host texture memory usage (in megabytes) above which textures "
-//     "will be destroyed as soon as possible.",
-//     "GPU");
-// DEFINE_uint32(
-//     texture_cache_memory_limit_render_to_texture, 24,
-//     "Part of the host texture memory budget (in megabytes) that will be scaled "
-//     "by the current drawing resolution scale.\n"
-//     "If texture_cache_memory_limit_soft, for instance, is 384, and this is 24, "
-//     "it will be assumed that the game will be using roughly 24 MB of "
-//     "render-to-texture (resolve) targets and 384 - 24 = 360 MB of regular "
-//     "textures - so with 2x2 resolution scaling, the soft limit will be 360 + "
-//     "96 MB, and with 3x3, it will be 360 + 216 MB.",
-//     "GPU");
+REXCVAR_DEFINE_BOOL(texture_replace_enabled, false, "GPU/Texture Replacement",
+                    "Inject replacement textures from disk when available")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(texture_folder, "", "GPU/Texture Replacement",
+                      "Override the textures folder used for dump/replace "
+                      "(empty = <executable folder>/textures)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
+static std::filesystem::path GetTextureReplacementFolder() {
+  const std::string configured_texture_folder = REXCVAR_GET(texture_folder);
+  if (!configured_texture_folder.empty()) {
+    return rex::to_path(configured_texture_folder);
+  }
+  return rex::filesystem::GetExecutableFolder() / "textures";
+}
+
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
-    // k8bpb
-    {3, 4, 1, 4},
-    // k16bpb
-    {4, 4, 2, 4},
-    // k32bpb
-    {4, 4, 4, 3},
-    // k64bpb
-    {4, 4, 8, 2},
-    // k128bpb
-    {4, 4, 16, 1},
-    // kR5G5B5A1ToB5G5R5A1
-    {4, 4, 2, 4},
-    // kR5G6B5ToB5G6R5
-    {4, 4, 2, 4},
-    // kR5G6B5ToRGBA8
-    {4, 4, 4, 4},
-    // kR5G5B6ToB5G6R5WithRBGASwizzle
-    {4, 4, 2, 4},
-    // kRGBA4ToBGRA4
-    {4, 4, 2, 4},
-    // kRGBA4ToARGB4
-    {4, 4, 2, 4},
-    // kRGBA4ToRGBA8
-    {4, 4, 4, 4},
-    // kGBGR8ToGRGB8
-    {4, 4, 4, 3},
-    // kGBGR8ToRGB8
-    {4, 4, 8, 3},
-    // kBGRG8ToRGBG8
-    {4, 4, 4, 3},
-    // kBGRG8ToRGB8
-    {4, 4, 8, 3},
-    // kR10G11B11ToRGBA16
-    {4, 4, 8, 3},
-    // kR10G11B11ToRGBA16SNorm
-    {4, 4, 8, 3},
-    // kR11G11B10ToRGBA16
-    {4, 4, 8, 3},
-    // kR11G11B10ToRGBA16SNorm
-    {4, 4, 8, 3},
-    // kR16UNormToFloat
-    {4, 4, 2, 4},
-    // kR16SNormToFloat
-    {4, 4, 2, 4},
-    // kRG16UNormToFloat
-    {4, 4, 4, 3},
-    // kRG16SNormToFloat
-    {4, 4, 4, 3},
-    // kRGBA16UNormToFloat
-    {4, 4, 8, 2},
-    // kRGBA16SNormToFloat
-    {4, 4, 8, 2},
-    // kDXT1ToRGBA8
-    {4, 4, 4, 2},
-    // kDXT3ToRGBA8
-    {4, 4, 4, 1},
-    // kDXT5ToRGBA8
-    {4, 4, 4, 1},
-    // kDXNToRG8
-    {4, 4, 2, 1},
-    // kDXT3A
-    {4, 4, 1, 2},
-    // kDXT3AAs1111ToBGRA4
-    {4, 4, 2, 2},
-    // kDXT3AAs1111ToARGB4
-    {4, 4, 2, 2},
-    // kDXT5AToR8
-    {4, 4, 1, 2},
-    // kCTX1
-    {4, 4, 2, 2},
-    // kDepthUnorm
-    {4, 4, 4, 3},
-    // kDepthFloat
-    {4, 4, 4, 3},
+    {1, 4},   // k8bpb
+    {2, 4},   // k16bpb
+    {4, 3},   // k32bpb
+    {8, 2},   // k64bpb
+    {16, 1},  // k128bpb
+    {2, 4},   // kR5G5B5A1ToB5G5R5A1
+    {2, 4},   // kR5G6B5ToB5G6R5
+    {4, 4},   // kR5G6B5ToRGBA8
+    {2, 4},   // kR5G5B6ToB5G6R5WithRBGASwizzle
+    {2, 4},   // kRGBA4ToBGRA4
+    {2, 4},   // kRGBA4ToARGB4
+    {4, 4},   // kRGBA4ToRGBA8
+    {4, 3},   // kGBGR8ToGRGB8
+    {8, 3},   // kGBGR8ToRGB8
+    {4, 3},   // kBGRG8ToRGBG8
+    {8, 3},   // kBGRG8ToRGB8
+    {8, 3},   // kR10G11B11ToRGBA16
+    {8, 3},   // kR10G11B11ToRGBA16SNorm
+    {8, 3},   // kR11G11B10ToRGBA16
+    {8, 3},   // kR11G11B10ToRGBA16SNorm
+    {2, 4},   // kR16UNormToFloat
+    {2, 4},   // kR16SNormToFloat
+    {4, 3},   // kRG16UNormToFloat
+    {4, 3},   // kRG16SNormToFloat
+    {8, 2},   // kRGBA16UNormToFloat
+    {8, 2},   // kRGBA16SNormToFloat
+    {4, 2},   // kDXT1ToRGBA8
+    {4, 1},   // kDXT3ToRGBA8
+    {4, 1},   // kDXT5ToRGBA8
+    {2, 1},   // kDXNToRG8
+    {1, 2},   // kDXT3A
+    {2, 2},   // kDXT3AAs1111ToBGRA4
+    {2, 2},   // kDXT3AAs1111ToARGB4
+    {1, 2},   // kDXT5AToR8
+    {2, 2},   // kCTX1
+    {4, 3},   // kDepthUnorm
+    {4, 3},   // kDepthFloat
 };
 
 TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shared_memory,
@@ -209,7 +141,9 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     : register_file_(register_file),
       shared_memory_(shared_memory),
       draw_resolution_scale_x_(draw_resolution_scale_x),
-      draw_resolution_scale_y_(draw_resolution_scale_y) {
+      draw_resolution_scale_y_(draw_resolution_scale_y),
+      draw_resolution_scale_x_divisor_(draw_resolution_scale_x),
+      draw_resolution_scale_y_divisor_(draw_resolution_scale_y) {
   assert_true(draw_resolution_scale_x >= 1);
   assert_true(draw_resolution_scale_x <= kMaxDrawResolutionScaleAlongAxis);
   assert_true(draw_resolution_scale_y >= 1);
@@ -223,6 +157,22 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
   }
+
+  // Initialise the replacement pipeline in the configured textures folder:
+  //   <texture_folder>/dump/     - dumped DDS files written here
+  //   <texture_folder>/replace/  - replacement files read from here
+  InitTextureReplacement(GetTextureReplacementFolder());
+}
+
+void TextureCache::InitTextureReplacement(const std::filesystem::path& textures_dir) {
+  replacement_ = std::make_unique<TextureReplacement>(textures_dir);
+}
+
+void TextureCache::RescanTextureReplacements() {
+  if (replacement_) {
+    replacement_->Rescan();
+    base_page_hash_cache_.clear();
+  }
 }
 
 TextureCache::~TextureCache() {
@@ -234,19 +184,60 @@ TextureCache::~TextureCache() {
 }
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
-  uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
-  bool use_shared_scale = rex::cvar::HasNonDefaultValue("resolution_scale");
-  uint32_t config_x = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")
-                          ? shared_scale
-                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_x)));
-  uint32_t config_y = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")
-                          ? shared_scale
-                          : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
+  uint32_t config_x = uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_x)));
+  uint32_t config_y = uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
+  // ReXGlue: resolution_scale applies to any axis that isn't set explicitly.
+  if (rex::cvar::HasNonDefaultValue("resolution_scale")) {
+    uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
+    if (!rex::cvar::HasNonDefaultValue("draw_resolution_scale_x")) {
+      config_x = shared_scale;
+    }
+    if (!rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")) {
+      config_y = shared_scale;
+    }
+  }
+
   uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
   uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
   x_out = clamped_x;
   y_out = clamped_y;
   return clamped_x == config_x && clamped_y == config_y;
+}
+
+bool TextureCache::ClampDrawResolutionScaleToMaxSupported(
+    uint32_t& scale_x, uint32_t& scale_y, bool sparse_bind_supported,
+    uint32_t virtual_address_bits_per_resource) {
+  // Without sparse/tiled resource support, resolution scaling is not possible
+  // because the scaled address space exceeds what simple buffers can handle.
+  if (!sparse_bind_supported) {
+    bool was_clamped = scale_x > 1 || scale_y > 1;
+    scale_x = 1;
+    scale_y = 1;
+    return !was_clamped;
+  }
+
+  // With sparse binding, limit based on virtual address space if specified.
+  bool was_clamped = false;
+  if (virtual_address_bits_per_resource > 0) {
+    while (scale_x > 1 || scale_y > 1) {
+      uint64_t highest_scaled_address =
+          uint64_t(SharedMemory::kBufferSize) * (scale_x * scale_y) - 1;
+      if (uint32_t(64) - rex::lzcnt(highest_scaled_address) <= virtual_address_bits_per_resource) {
+        break;
+      }
+      // When reducing from a square size, prefer decreasing the horizontal
+      // resolution as vertical resolution difference is visible more clearly in
+      // perspective.
+      was_clamped = true;
+      if (scale_x >= scale_y) {
+        --scale_x;
+      } else {
+        --scale_y;
+      }
+    }
+  }
+
+  return !was_clamped;
 }
 
 void TextureCache::ClearCache() {
@@ -318,7 +309,8 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                       bool resolution_scaled) {
   if (length_unscaled == 0) {
     return;
   }
@@ -339,8 +331,17 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      scaled_resolve_pages_[i] |= add_bits;
-      scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      if (resolution_scaled) {
+        scaled_resolve_pages_[i] |= add_bits;
+        scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      } else {
+        // Native resolve data is in shared memory.
+        // Clear the same way the CPU write watch does.
+        scaled_resolve_pages_[i] &= ~add_bits;
+        if (!scaled_resolve_pages_[i]) {
+          scaled_resolve_pages_l2_[i >> 6] &= ~(UINT64_C(1) << (i & 63));
+        }
+      }
     }
   }
 
@@ -366,90 +367,6 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
   return host_swizzle;
 }
 
-bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
-                                      PendingSharedMemoryRange* pending_ranges_out,
-                                      size_t& pending_range_count_out) {
-  uint32_t outdated_mask = texture.outdated_mask();
-  if (!outdated_mask) {
-    return false;
-  }
-
-  bool base_outdated = false;
-  bool mips_outdated = false;
-  {
-    auto global_lock = global_critical_region_.Acquire();
-    if (outdated_mask & Texture::kOutdatedBitBase) {
-      base_outdated = texture.base_outdated(global_lock);
-    }
-    if (outdated_mask & Texture::kOutdatedBitMips) {
-      mips_outdated = texture.mips_outdated(global_lock);
-    }
-  }
-  if (!base_outdated && !mips_outdated) {
-    return false;
-  }
-
-  pending_load_out.texture = &texture;
-  pending_load_out.load_base = base_outdated;
-  pending_load_out.load_mips = mips_outdated;
-  pending_range_count_out = 0;
-
-  TextureKey texture_key = texture.key();
-  if (base_outdated) {
-    PendingSharedMemoryRange pending_range;
-    pending_range.start = texture_key.base_page << 12;
-    pending_range.length =
-        static_cast<uint32_t>(rex::align(texture.GetGuestBaseSize(), UINT32_C(16)));
-    pending_ranges_out[pending_range_count_out++] = pending_range;
-  }
-  if (mips_outdated) {
-    PendingSharedMemoryRange pending_range;
-    pending_range.start = texture_key.mip_page << 12;
-    pending_range.length =
-        static_cast<uint32_t>(rex::align(texture.GetGuestMipsSize(), UINT32_C(16)));
-    pending_ranges_out[pending_range_count_out++] = pending_range;
-  }
-
-  return true;
-}
-
-bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_load) {
-  if (!pending_load.texture || (!pending_load.load_base && !pending_load.load_mips)) {
-    return true;
-  }
-
-  Texture& texture = *pending_load.texture;
-  TextureKey texture_key = texture.key();
-  if (texture_key.scaled_resolve) {
-    // Make sure all the scaled resolve memory is resident and accessible from
-    // the shader, including any possible padding that hasn't yet been touched
-    // by an actual resolve, but is still included in the texture size, so the
-    // GPU won't be trying to access unmapped memory.
-    if (pending_load.load_base && !EnsureScaledResolveMemoryCommitted(
-                                      texture_key.base_page << 12, texture.GetGuestBaseSize(), 4)) {
-      return false;
-    }
-    if (pending_load.load_mips && !EnsureScaledResolveMemoryCommitted(
-                                      texture_key.mip_page << 12, texture.GetGuestMipsSize(), 4)) {
-      return false;
-    }
-  }
-
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                             pending_load.load_mips)) {
-    return false;
-  }
-
-  // Mark the ranges as uploaded and watch them. This is needed for scaled
-  // resolves as well to detect when the CPU wants to reuse the memory for a
-  // regular texture or a vertex buffer, and thus the scaled resolve version is
-  // not up to date anymore.
-  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
-  texture.LogAction("Loaded");
-
-  return true;
-}
-
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
@@ -462,36 +379,19 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
   // Update the texture keys and the textures.
   uint32_t bindings_changed = 0;
-  std::vector<PendingTextureLoad> pending_texture_loads;
-  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
-  auto queue_pending_texture_load = [&](Texture* texture) {
-    if (texture == nullptr) {
-      return;
-    }
-    for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      if (pending_load.texture == texture) {
-        return;
-      }
-    }
-    PendingTextureLoad pending_load;
-    PendingSharedMemoryRange pending_ranges[2];
-    size_t pending_range_count = 0;
-    if (!PrepareTextureLoad(*texture, pending_load, pending_ranges, pending_range_count)) {
-      return;
-    }
-    pending_texture_loads.push_back(pending_load);
-    for (size_t i = 0; i < pending_range_count; ++i) {
-      pending_shared_memory_ranges.push_back(pending_ranges[i]);
-    }
-  };
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
   uint32_t index = 0;
+
+  Texture* textures_to_load[64];  // max bits = 32, can be unsigned + signed
+                                  // means max array size = 64
+  uint32_t num_textures_to_load = 0;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
     uint32_t index_bit = UINT32_C(1) << index;
-    textures_remaining &= ~index_bit;
+    textures_remaining = rex::clear_lowest_bit(textures_remaining);
     TextureBinding& binding = texture_bindings_[index];
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
+    uint32_t old_integer_scale_bits = binding.integer_scale_bits;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
@@ -504,6 +404,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    binding.integer_scale_bits =
+        GetIntegerScaleBits(fetch.format, fetch.num_format, fetch.swizzle, binding.swizzled_signs);
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -513,7 +415,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     bool any_sign_was_signed = texture_util::IsAnySignSigned(old_swizzled_signs);
     bool any_sign_is_not_signed = texture_util::IsAnySignNotSigned(binding.swizzled_signs);
     bool any_sign_is_signed = texture_util::IsAnySignSigned(binding.swizzled_signs);
-    if (key_changed || binding.host_swizzle != old_host_swizzle ||
+    if (key_changed || binding.integer_scale_bits != old_integer_scale_bits ||
+        binding.host_swizzle != old_host_swizzle ||
         any_sign_is_not_signed != any_sign_was_not_signed ||
         any_sign_is_signed != any_sign_was_signed) {
       bindings_changed |= index_bit;
@@ -553,41 +456,16 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
       binding.texture_signed = nullptr;
     }
-    if (load_unsigned_data) {
-      queue_pending_texture_load(binding.texture);
+    if (load_unsigned_data && binding.texture != nullptr) {
+      textures_to_load[num_textures_to_load++] = binding.texture;
     }
-    if (load_signed_data) {
-      queue_pending_texture_load(binding.texture_signed);
+    if (load_signed_data && binding.texture_signed != nullptr) {
+      textures_to_load[num_textures_to_load++] = binding.texture_signed;
     }
   }
 
-  COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
-                    uint32_t(pending_texture_loads.size()));
-  COUNT_profile_set("gpu/texture_cache/request_textures_pending_range_count",
-                    uint32_t(pending_shared_memory_ranges.size()));
+  LoadTexturesData(textures_to_load, num_textures_to_load);
 
-  bool batched_shared_memory_request_succeeded = true;
-  std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
-  if (!pending_shared_memory_ranges.empty()) {
-    pending_shared_memory_range_pairs.reserve(pending_shared_memory_ranges.size());
-    for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
-      pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
-    }
-    batched_shared_memory_request_succeeded = shared_memory().RequestRanges(
-        pending_shared_memory_range_pairs.data(), pending_shared_memory_range_pairs.size());
-  }
-
-  if (batched_shared_memory_request_succeeded) {
-    for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      CommitPreparedTextureLoad(pending_load);
-    }
-  } else {
-    for (const PendingTextureLoad& pending_load : pending_texture_loads) {
-      if (pending_load.texture != nullptr) {
-        LoadTextureData(*pending_load.texture);
-      }
-    }
-  }
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
   }
@@ -610,23 +488,23 @@ const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension d
 }
 
 void TextureCache::TextureKey::LogAction(const char* action) const {
-  REXGPU_TRACE(
+  REXGPU_INFO(
       "{} {} {}{}x{}x{} {} {} texture with {} {}packed mip level{}, "
       "base at 0x{:08X} (pitch {}), mips at 0x{:08X}",
       action, tiled ? "tiled" : "linear", scaled_resolve ? "scaled " : "", GetWidth(), GetHeight(),
-      GetDepthOrArraySize(), GetLogDimensionName(), FormatInfo::Get(format)->name,
-      mip_max_level + 1, packed_mips ? "" : "un", mip_max_level != 0 ? "s" : "", base_page << 12,
-      pitch << 5, mip_page << 12);
+      GetDepthOrArraySize(), GetLogDimensionName(), FormatInfo::GetName(format), mip_max_level + 1,
+      packed_mips ? "" : "un", mip_max_level != 0 ? "s" : "", base_page << 12, pitch << 5,
+      mip_page << 12);
 }
 
 void TextureCache::Texture::LogAction(const char* action) const {
-  REXGPU_TRACE(
+  REXGPU_INFO(
       "{} {} {}{}x{}x{} {} {} texture with {} {}packed mip level{}, "
       "base at 0x{:08X} (pitch {}, size 0x{:08X}), mips at 0x{:08X} (size "
       "0x{:08X})",
       action, key_.tiled ? "tiled" : "linear", key_.scaled_resolve ? "scaled " : "",
       key_.GetWidth(), key_.GetHeight(), key_.GetDepthOrArraySize(), key_.GetLogDimensionName(),
-      FormatInfo::Get(key_.format)->name, key_.mip_max_level + 1, key_.packed_mips ? "" : "un",
+      FormatInfo::GetName(key_.format), key_.mip_max_level + 1, key_.packed_mips ? "" : "un",
       key_.mip_max_level != 0 ? "s" : "", key_.base_page << 12, key_.pitch << 5, GetGuestBaseSize(),
       key_.mip_page << 12, GetGuestMipsSize());
 }
@@ -657,9 +535,6 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
   // Never try to upload data that doesn't exist.
   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
   mips_outdated_ = guest_layout().mips_total_extent_bytes != 0;
-  outdated_mask_.store(
-      (base_outdated_ ? kOutdatedBitBase : 0) | (mips_outdated_ ? kOutdatedBitMips : 0),
-      std::memory_order_relaxed);
 }
 
 TextureCache::Texture::~Texture() {
@@ -670,6 +545,7 @@ TextureCache::Texture::~Texture() {
     texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
   }
 
+  // Only remove from usage list if we were added to it (track_usage=true).
   if (in_usage_list_) {
     if (used_previous_) {
       used_previous_->used_next_ = used_next_;
@@ -686,26 +562,37 @@ TextureCache::Texture::~Texture() {
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
 }
 
-void TextureCache::Texture::MakeUpToDateAndWatch(
-    const std::unique_lock<std::recursive_mutex>& global_lock) {
+bool TextureCache::Texture::MakeUpToDateAndWatch(const global_unique_lock_type& global_lock) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  if (base_outdated_) {
+  const bool watch_base = base_outdated_;
+  const bool watch_mips = mips_outdated_;
+  assert_true(global_lock.owns_lock());
+  if (watch_base && !shared_memory.IsRangeValid(key().base_page << 12,
+                                                rex::align(GetGuestBaseSize(), UINT32_C(16)))) {
+    return false;
+  }
+  if (watch_mips && !shared_memory.IsRangeValid(key().mip_page << 12,
+                                                rex::align(GetGuestMipsSize(), UINT32_C(16)))) {
+    return false;
+  }
+
+  if (watch_base) {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = false;
     base_watch_handle_ = shared_memory.WatchMemoryRange(
         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
-    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
   }
-  if (mips_outdated_) {
+  if (watch_mips) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
-    outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
   }
+  return true;
 }
 
 void TextureCache::Texture::MarkAsUsed() {
+  // Textures not in usage tracking (track_usage=false) should not be linked.
   if (!in_usage_list_) {
     return;
   }
@@ -733,23 +620,21 @@ void TextureCache::Texture::MarkAsUsed() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+    [[maybe_unused]] const global_unique_lock_type& global_lock, bool is_mip) {
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
     mips_watch_handle_ = nullptr;
-    outdated_mask_.fetch_or(kOutdatedBitMips, std::memory_order_release);
   } else {
     assert_not_zero(GetGuestBaseSize());
     base_outdated_ = true;
+    texture_cache_.InvalidateHashCache(key().base_page);
     base_watch_handle_ = nullptr;
-    outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
   }
 }
 
-void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
-                                 void* context, void* data, uint64_t argument,
-                                 bool invalidated_by_gpu) {
+void TextureCache::WatchCallback(const global_unique_lock_type& global_lock, void* context,
+                                 void* data, uint64_t argument, bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
@@ -775,6 +660,8 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
   }
 
+  // ReXGlue: if the host can't support the full extent, first drop resolution
+  // scaling, then fall back to the first stored mip level (see the TODO below).
   auto get_host_extent = [this, &key](uint32_t& host_width_out, uint32_t& host_height_out,
                                       uint32_t& host_depth_or_array_size_out) {
     host_width_out = key.GetWidth();
@@ -829,9 +716,10 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   };
   uint32_t host_width, host_height, host_depth_or_array_size;
   get_host_extent(host_width, host_height, host_depth_or_array_size);
-  // If the host can't support the full texture extent, first try using the
-  // unscaled version of a scaled resolve texture, then fall back to the first
-  // stored mip level only.
+  // With 3x resolution scaling, a 2D texture may become bigger than the
+  // Direct3D 11 limit, and with 2x, a 3D one as well.
+  // TODO(Triang3l): Skip mips on Vulkan in this case - the minimum requirement
+  // there is 4096, which is below the Xenos maximum texture size of 8192.
   uint32_t max_host_width_height = GetMaxHostTextureWidthHeight(key.dimension);
   uint32_t max_host_depth_or_array_size = GetMaxHostTextureDepthOrArraySize(key.dimension);
   while (true) {
@@ -856,7 +744,58 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     get_host_extent(host_width, host_height, host_depth_or_array_size);
   }
 
-  // Try to find an existing texture.
+  // Replacement injection: if a replacement exists for this texture's content
+  // hash, override the key dimensions and retain the pixels for upload.
+  // This must happen BEFORE textures_.find so we look up and return the
+  // already-mutated key entry on subsequent calls (avoiding duplicate textures).
+  const TextureReplacementData* repl = nullptr;
+  texture_util::TextureGuestLayout original_guest_layout{};
+  bool has_replacement = false;
+  uint64_t replacement_content_hash = 0;
+  if (replacement_ && REXCVAR_GET(texture_replace_enabled) && key.base_page != 0 &&
+      !key.scaled_resolve) {
+    const uint32_t guest_addr = key.base_page << 12;
+    // Capture the original guest layout BEFORE mutating the key.
+    original_guest_layout = key.GetGuestLayout();
+    const uint32_t guest_size = original_guest_layout.base.level_data_extent_bytes;
+    if (guest_size > 0) {
+      // Use cached hash if available - only rehash when guest memory changed.
+      auto hash_it = base_page_hash_cache_.find(key.base_page);
+      if (hash_it != base_page_hash_cache_.end()) {
+        replacement_content_hash = hash_it->second;
+      } else {
+        const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
+        replacement_content_hash = TextureReplacement::HashGuestData(guest_bytes, guest_size);
+        base_page_hash_cache_.emplace(uint32_t(key.base_page), replacement_content_hash);
+      }
+      repl = replacement_->FindReplacement(replacement_content_hash);
+      if (repl) {
+        // Clamp to the host backend's maximum texture size.
+        const uint32_t max_wh = GetMaxHostTextureWidthHeight(key.dimension);
+        if (repl->width <= max_wh && repl->height <= max_wh && repl->width > 0 &&
+            repl->height > 0) {
+          const uint32_t orig_w = key.GetWidth();
+          const uint32_t orig_h = key.GetHeight();
+          key.width_minus_1 = repl->width - 1;
+          key.height_minus_1 = repl->height - 1;
+          // Force a plain RGBA8 host format so the upload impl can copy the
+          // RGBA8 replacement pixels directly without needing a BC encoder.
+          key.format = xenos::TextureFormat::k_8_8_8_8;
+          // Replacements are single-mip.
+          key.mip_max_level = 0;
+          has_replacement = true;
+          REXGPU_DEBUG(
+              "TextureReplacement: injecting {}x{} replacement for "
+              "original {}x{} (hash {:016x})",
+              repl->width, repl->height, orig_w, orig_h, replacement_content_hash);
+        } else {
+          repl = nullptr;  // out of bounds - don't attach
+        }
+      }
+    }
+  }
+
+  // Try to find an existing texture using the (possibly mutated) key.
   // TODO(Triang3l): Reuse a texture with mip_page unchanged, but base_page
   // previously 0, now not 0, to save memory - common case in streaming.
   auto found_texture_it = textures_.find(key);
@@ -873,6 +812,15 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       return nullptr;
     }
     assert_true(new_texture->key() == key);
+    // Store the hash so the load path can look up the replacement pointer
+    // directly from the cache - no pixel data is owned by the Texture.
+    if (has_replacement) {
+      new_texture->replacement_content_hash_ = replacement_content_hash;
+      // Restore the original guest layout so that MakeUpToDateAndWatch and
+      // shared-memory watch registration use the real guest memory extents,
+      // not the extents computed from the mutated (RGBA8, replacement-sized) key.
+      new_texture->OverrideGuestLayout(original_guest_layout);
+    }
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
@@ -880,23 +828,304 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   return texture;
 }
 
+// Packs the integer scale the fetch shader reads from the system constant to
+// undo the host sampler's normalization - the guest wants e.g. [0, 255], not
+// [0, 1]. 6 bits per output component: bits 0:3 = width - 1, bit 4 = signed,
+// bit 5 = unsigned-biased. The scale lands after swizzling, so each output lane
+// walks the guest swizzle back to its source component's width. component_bits
+// only describes the stored width, so the source component is clamped to the
+// last stored channel the same way the host swizzle expands the formats.
+// (k_16 has a 16 bit width in all four components, k_5_6_5 gives blue in W.)
+// Constant (0/1) lanes, gamma, and non-fixed formats have nothing to rescale
+// and stay 0. Bit 24 for normalized fixed fetches.
+uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format, uint32_t num_format,
+                                           uint32_t guest_swizzle, uint8_t swizzled_signs) {
+  const FormatInfo& format_info = *FormatInfo::Get(guest_format);
+  uint32_t scale_bits = 0;
+
+  if (!format_info.fixed) {
+    return 0;
+  }
+
+  if (!num_format) {
+    return swizzled_signs == kSwizzledSignsUnsigned ? UINT32_C(1) << 24 : 0;
+  }
+
+  uint32_t last_stored_component = 0;
+  for (uint32_t i = 1; i < 4; ++i) {
+    if (format_info.component_bits[i]) {
+      last_stored_component = i;
+    }
+  }
+
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t source_component = (guest_swizzle >> (i * 3)) & 0b111;
+    if (source_component >= xenos::XE_GPU_TEXTURE_SWIZZLE_0) {
+      continue;
+    }
+    source_component = std::min(source_component, last_stored_component);
+
+    xenos::TextureSign sign = xenos::TextureSign((swizzled_signs >> (i * 2)) & 0b11);
+
+    uint8_t width = format_info.component_bits[source_component];
+    if (!width || width > 16 || sign == xenos::TextureSign::kGamma) {
+      continue;
+    }
+
+    uint32_t component_scale = uint32_t(width - 1);
+    if (sign == xenos::TextureSign::kSigned) {
+      component_scale |= UINT32_C(1) << 4;
+      // Unsigned-biased: halve the scaled value and apply an extra offset.
+    } else if (sign == xenos::TextureSign::kUnsignedBiased) {
+      component_scale |= UINT32_C(1) << 5;
+    }
+
+    scale_bits |= component_scale << (i * 6);
+  }
+
+  return scale_bits;
+}
+
+void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
+  assert_true(n_textures <= 64);
+  if (n_textures < 2) {
+    if (!n_textures) {
+      return;
+    } else {
+      LoadTextureData(*textures[0]);
+      return;
+    }
+  }
+
+  // Lockless pre-check: count how many textures appear outdated.
+  // If none appear outdated, skip the lock entirely.
+  uint32_t likely_outdated = 0;
+  for (uint32_t i = 0; i < n_textures; ++i) {
+    Texture* current = textures[i];
+    if (current->base_outdated_lockless() || current->mips_outdated_lockless()) {
+      ++likely_outdated;
+    }
+  }
+  if (likely_outdated == 0) {
+    // All textures appear up-to-date, skip lock acquisition
+    return;
+  }
+
+  uint64_t index_base_outdated = 0;
+  uint64_t index_mips_outdated = 0;
+  uint32_t nkept = 0;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (uint32_t i = 0; i < n_textures; ++i) {
+      Texture* current = textures[i];
+
+      auto base_outdated = current->base_outdated(global_lock);
+      auto mips_outdated = current->mips_outdated(global_lock);
+
+      index_base_outdated |= static_cast<uint64_t>(base_outdated) << i;
+      index_mips_outdated |= static_cast<uint64_t>(mips_outdated) << i;
+      if (!base_outdated && !mips_outdated) {
+        textures[i] = nullptr;
+
+      } else {
+        nkept++;
+      }
+    }
+  }
+
+  if (nkept == 0) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < n_textures; ++i) {
+    Texture* p_texture = textures[i];
+    if (!p_texture) {
+      continue;
+    }
+    textures[i] = nullptr;
+    Texture& texture = *p_texture;
+
+    TextureKey texture_key = texture.key();
+    // Implementation may load multiple blocks at once via accesses of up to 128
+    // bits (R32G32B32A32_UINT), so aligning the size to this value to make sure
+    // if the texture is small (especially if it's linear), the last blocks
+    // won't be cut off (hosts may return 0, 0, 0, 0 for the whole
+    // R32G32B32A32_UINT access for the non-16-aligned tail even if 1...15 bytes
+    // are actually provided for it).
+
+    // Request uploading of the texture data to the shared memory.
+    // This is also necessary when resolution scaling is used - the texture
+    // cache relies on shared memory for invalidation of both unscaled and
+    // scaled textures. Plus a texture may be unscaled partially, when only a
+    // portion of its pages is invalidated, in this case we'll need the texture
+    // from the shared memory to load the unscaled parts.
+    // TODO(Triang3l): Load unscaled parts.
+    if (index_base_outdated & (1ULL << i)) {
+      if (!shared_memory().RequestRange(texture_key.base_page << 12,
+                                        rex::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+        continue;
+      }
+    }
+    if (index_mips_outdated & (1ULL << i)) {
+      if (!shared_memory().RequestRange(texture_key.mip_page << 12,
+                                        rex::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+        continue;
+      }
+    }
+    if (texture_key.scaled_resolve) {
+      // Make sure all the scaled resolve memory is resident and accessible from
+      // the shader, including any possible padding that hasn't yet been touched
+      // by an actual resolve, but is still included in the texture size, so the
+      // GPU won't be trying to access unmapped memory.
+      if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12,
+                                              texture.GetGuestBaseSize(), 4)) {
+        continue;
+      }
+      if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
+                                              texture.GetGuestMipsSize(), 4)) {
+        continue;
+      }
+    }
+
+    // Actually load the texture data.
+    if (!LoadTextureDataFromMemoryOrReplacement(texture, (index_base_outdated & (1ULL << i)) != 0,
+                                                (index_mips_outdated & (1ULL << i)) != 0)) {
+      continue;
+    }
+
+    // reque for makeuptodatandwatch
+    textures[i] = &texture;
+  }
+  {
+    auto crit = global_critical_region_.Acquire();
+
+    for (uint32_t i = 0; i < n_textures; ++i) {
+      auto texture = textures[i];
+      if (!texture) {
+        continue;
+      }
+      // Mark the ranges as uploaded and watch them. This is needed for scaled
+      // resolves as well to detect when the CPU wants to reuse the memory for a
+      // regular texture or a vertex buffer, and thus the scaled resolve version
+      // is not up to date anymore.
+      if (!texture->MakeUpToDateAndWatch(crit)) {
+        continue;
+      }
+
+      texture->LogAction("Loaded");
+    }
+  }
+}
+bool TextureCache::LoadTextureDataFromMemoryOrReplacement(Texture& texture, bool load_base,
+                                                          bool load_mips) {
+  const TextureKey& texture_key = texture.key();
+
+  // If a replacement was attached, look it up directly from the cache
+  // (const pointer - no copy) and upload; fall back to guest memory on failure.
+  const TextureReplacementData* replacement =
+      (texture.replacement_content_hash_ != 0 && replacement_)
+          ? replacement_->FindReplacement(texture.replacement_content_hash_)
+          : nullptr;
+  if (!(replacement && LoadTextureDataFromReplacementImpl(texture, *replacement))) {
+    if (!LoadTextureDataFromResidentMemoryImpl(texture, load_base, load_mips)) {
+      return false;
+    }
+  }
+
+  // Texture dump: write the guest bytes to disk so replacement authors can
+  // identify and recreate textures. Base mip level only.
+  if (replacement_ && load_base && REXCVAR_GET(texture_dump_enabled)) {
+    const uint32_t guest_addr = texture_key.base_page << 12;
+    const uint32_t guest_size = texture.GetGuestBaseSize();
+    if (guest_size > 0) {
+      const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
+      const uint64_t content_hash = TextureReplacement::HashGuestData(guest_bytes, guest_size);
+      replacement_->DumpTexture(content_hash, texture_key.GetWidth(), texture_key.GetHeight(),
+                                texture_key.pitch, texture_key.tiled != 0, texture_key.format,
+                                texture_key.endianness, guest_bytes, guest_size);
+    }
+  }
+  return true;
+}
+
 bool TextureCache::LoadTextureData(Texture& texture) {
-  PendingTextureLoad pending_load;
-  PendingSharedMemoryRange pending_ranges[2];
-  size_t pending_range_count = 0;
-  if (!PrepareTextureLoad(texture, pending_load, pending_ranges, pending_range_count)) {
+  // Lockless pre-check: if texture appears up-to-date, skip the lock.
+  // This is safe because worst case is a false positive (we acquire lock
+  // unnecessarily), never a false negative.
+  if (!texture.base_outdated_lockless() && !texture.mips_outdated_lockless()) {
     return true;
   }
 
-  std::pair<uint32_t, uint32_t> pending_range_pairs[2];
-  for (size_t i = 0; i < pending_range_count; ++i) {
-    pending_range_pairs[i] = std::make_pair(pending_ranges[i].start, pending_ranges[i].length);
+  // Check what needs to be uploaded.
+  bool base_outdated, mips_outdated;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    base_outdated = texture.base_outdated(global_lock);
+    mips_outdated = texture.mips_outdated(global_lock);
   }
-  if (!shared_memory().RequestRanges(pending_range_pairs, pending_range_count)) {
+  if (!base_outdated && !mips_outdated) {
+    return true;
+  }
+
+  TextureKey texture_key = texture.key();
+
+  // Implementation may load multiple blocks at once via accesses of up to 128
+  // bits (R32G32B32A32_UINT), so aligning the size to this value to make sure
+  // if the texture is small (especially if it's linear), the last blocks won't
+  // be cut off (hosts may return 0, 0, 0, 0 for the whole R32G32B32A32_UINT
+  // access for the non-16-aligned tail even if 1...15 bytes are actually
+  // provided for it).
+
+  // Request uploading of the texture data to the shared memory.
+  // This is also necessary when resolution scaling is used - the texture cache
+  // relies on shared memory for invalidation of both unscaled and scaled
+  // textures. Plus a texture may be unscaled partially, when only a portion of
+  // its pages is invalidated, in this case we'll need the texture from the
+  // shared memory to load the unscaled parts.
+  // TODO(Triang3l): Load unscaled parts.
+  if (base_outdated) {
+    if (!shared_memory().RequestRange(texture_key.base_page << 12,
+                                      rex::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+      return false;
+    }
+  }
+  if (mips_outdated) {
+    if (!shared_memory().RequestRange(texture_key.mip_page << 12,
+                                      rex::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+      return false;
+    }
+  }
+  if (texture_key.scaled_resolve) {
+    // Make sure all the scaled resolve memory is resident and accessible from
+    // the shader, including any possible padding that hasn't yet been touched
+    // by an actual resolve, but is still included in the texture size, so the
+    // GPU won't be trying to access unmapped memory.
+    if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12, texture.GetGuestBaseSize(),
+                                            4)) {
+      return false;
+    }
+    if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12, texture.GetGuestMipsSize(),
+                                            4)) {
+      return false;
+    }
+  }
+
+  // Actually load the texture data.
+  if (!LoadTextureDataFromMemoryOrReplacement(texture, base_outdated, mips_outdated)) {
     return false;
   }
 
-  return CommitPreparedTextureLoad(pending_load);
+  // Mark the ranges as uploaded and watch them. This is needed for scaled
+  // resolves as well to detect when the CPU wants to reuse the memory for a
+  // regular texture or a vertex buffer, and thus the scaled resolve version is
+  // not up to date anymore.
+  if (!texture.MakeUpToDateAndWatch(global_critical_region_.Acquire())) {
+    return false;
+  }
+
+  texture.LogAction("Loaded");
+
+  return true;
 }
 
 void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
@@ -934,19 +1163,35 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   texture_util::GetSubresourcesFromFetchConstant(fetch, &width_minus_1, &height_minus_1,
                                                  &depth_or_array_size_minus_1, &base_page,
                                                  &mip_page, nullptr, &mip_max_level);
-  if (base_page == 0 && mip_page == 0) {
-    // No texture data at all.
+  if (base_page == 0 && mip_page == 0 && (fetch.swizzle & 0b110110110110) != 0b100100100100) {
+    // No texture data at all. Any header taking every swizzle component from
+    // literal 0s or 1s may still be valid. 4D530919 binds one as the dummy
+    // alpha plane of Bink movies. Such examples get a texture with their
+    // dimensions for LOD queries. Zero extents skip the upload and watches.
     return;
   }
+  uint32_t pitch = fetch.pitch;
   if (fetch.dimension == xenos::DataDimension::k1D) {
     bool is_invalid_1d = false;
-    // TODO(Triang3l): Support long 1D textures.
+    // Handle wide 1D textures (> 8192 wide) by mapping them to a 2D grid.
+    // The shaders will convert 1D coordinates to 2D using the original width
+    // from the fetch constant.
     if (width_minus_1 >= xenos::kTexture2DCubeMaxWidthHeight) {
-      REXGPU_ERROR(
-          "1D texture is too wide ({}) - ignoring! Report the game to Xenia "
-          "developers",
-          width_minus_1 + 1);
-      is_invalid_1d = true;
+      uint32_t total_width = width_minus_1 + 1;
+      uint32_t row_width = xenos::kTexture2DCubeMaxWidthHeight;
+      uint32_t num_rows = (total_width + row_width - 1) / row_width;
+      num_rows = std::min(num_rows, xenos::kTexture1DWideMaxRows);
+      width_minus_1 = row_width - 1;
+      height_minus_1 = num_rows - 1;
+      // Disable mipmaps for wide 1D textures. The shader's coordinate remapping
+      // assumes base level dimensions (num_rows), but at mip level N, the 2D
+      // texture becomes (8192 >> N) x (num_rows >> N), which breaks the mapping
+      // when num_rows >> N becomes 1 while the shader still expects multiple
+      // rows. Mipmaps are rarely used with 1D lookup textures anyway.
+      mip_max_level = 0;
+      // The guest pitch is meaningless for a texture the guest believes is 1D
+      // (the 9 bit field couldn't even express the line width).
+      pitch = xenos::kTexture2DCubeMaxWidthHeight >> 5;
     }
     assert_false(fetch.tiled);
     if (fetch.tiled) {
@@ -977,7 +1222,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   key_out.width_minus_1 = width_minus_1;
   key_out.height_minus_1 = height_minus_1;
   key_out.depth_or_array_size_minus_1 = depth_or_array_size_minus_1;
-  key_out.pitch = fetch.pitch;
+  key_out.pitch = pitch;
   key_out.mip_max_level = mip_max_level;
   key_out.tiled = fetch.tiled;
   key_out.packed_mips = fetch.packed_mips;
@@ -1063,17 +1308,18 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   return false;
 }
 
-void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
-    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
-    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+void TextureCache::ScaledResolveGlobalWatchCallbackThunk(const global_unique_lock_type& global_lock,
+                                                         void* context, uint32_t address_first,
+                                                         uint32_t address_last,
+                                                         bool invalidated_by_gpu) {
   TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
   texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
                                                   invalidated_by_gpu);
 }
 
-void TextureCache::ScaledResolveGlobalWatchCallback(
-    const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
-    uint32_t address_last, bool invalidated_by_gpu) {
+void TextureCache::ScaledResolveGlobalWatchCallback(const global_unique_lock_type& global_lock,
+                                                    uint32_t address_first, uint32_t address_last,
+                                                    bool invalidated_by_gpu) {
   assert_true(IsDrawResolutionScaled());
   if (invalidated_by_gpu) {
     // Resolves themselves do exactly the opposite of what this should do.
@@ -1089,14 +1335,12 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
     uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
-    if (REXCVAR_GET(pre_mask_resolve_l2_block)) {
-      // Pre-mask to only process blocks within the write range.
-      if (i == resolve_l2_block_first) {
-        resolve_l2_block &= ~((UINT64_C(1) << (resolve_block_first & 63)) - 1);
-      }
-      if (i == resolve_l2_block_last && (resolve_block_last & 63) != 63) {
-        resolve_l2_block &= (UINT64_C(1) << ((resolve_block_last & 63) + 1)) - 1;
-      }
+    // Pre-mask to only process blocks within the write range.
+    if (i == resolve_l2_block_first) {
+      resolve_l2_block &= ~((UINT64_C(1) << (resolve_block_first & 63)) - 1);
+    }
+    if (i == resolve_l2_block_last && (resolve_block_last & 63) != 63) {
+      resolve_l2_block &= (UINT64_C(1) << ((resolve_block_last & 63) + 1)) - 1;
     }
     uint32_t resolve_block_relative_index;
     while (rex::bit_scan_forward(resolve_l2_block, &resolve_block_relative_index)) {

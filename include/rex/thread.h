@@ -118,6 +118,13 @@ void Sleep(std::chrono::duration<Rep, Period> duration) {
   Sleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
 }
 
+// Sleeps the current thread for the given number of nanoseconds, using the
+// finest-grained sleep primitive the platform offers.
+void NanoSleep(int64_t ns);
+// Like NanoSleep but trades a brief busy-wait tail for sub-millisecond
+// precision where the platform sleep is coarse.
+void NanoSleepPrecise(int64_t ns);
+
 enum class SleepResult {
   kSuccess,
   kAlerted,
@@ -274,6 +281,10 @@ class Event : public WaitHandle {
   // If this is a manual reset event the event stays signaled until Reset() is
   // called. If this is an auto reset event until exactly one wait is satisfied.
   virtual void Set() = 0;
+
+  // xenia's Set() variant that also boosts the priority of the woken thread;
+  // plain Set() here.
+  virtual void SetBoostPriority() { Set(); }
 
   // Sets the specified event object to the nonsignaled state.
   // Resetting an event that is already reset has no effect.

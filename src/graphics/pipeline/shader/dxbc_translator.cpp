@@ -11,10 +11,7 @@
 
 #include "thirdparty/dxbc/DXBCChecksum.h"
 
-#include <algorithm>
-#include <atomic>
 #include <cstring>
-#include <memory>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -24,9 +21,18 @@
 #include <rex/math.h>
 #include <rex/ui/graphics_provider.h>
 
-REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in DXBC");
-
-REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+// The test case for AMD is 4D5307E6 (checked in 2018).
+REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU.Debug",
+                    "Use switch rather than if for flow control. Turning this off or "
+                    "on may improve stability, though this heavily depends on the "
+                    "driver - on AMD, it's recommended to have this set to true, as "
+                    "some titles appear to crash when if is used for flow control "
+                    "(possibly the shader compiler tries to flatten them). On Intel "
+                    "HD Graphics, this is ignored because of a crash with the switch "
+                    "instruction.");
+REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU.Debug",
+                    "Disassemble Xenos instructions as comments in the resulting DXBC "
+                    "for debugging.");
 
 namespace rex::graphics {
 using namespace ucode;
@@ -84,7 +90,9 @@ std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader() {
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_pixel_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
   Shader shader(xenos::ShaderType::kPixel, 0, nullptr, 0);
-  shader.AnalyzeUcode(instruction_disassembly_buffer_);
+  if (!shader.is_ucode_analyzed()) {
+    shader.AnalyzeUcode(instruction_disassembly_buffer_);
+  }
   Shader::Translation& translation = *shader.GetOrCreateTranslation(0);
   TranslateAnalyzedShader(translation);
   is_depth_only_pixel_shader_ = false;
@@ -160,6 +168,7 @@ void DxbcShaderTranslator::Reset() {
   uav_count_ = 0;
   uav_index_shared_memory_ = kBindingIndexUnallocated;
   uav_index_edram_ = kBindingIndexUnallocated;
+  uav_index_zpd_rov_counter_ = kBindingIndexUnallocated;
 
   sampler_bindings_.clear();
 
@@ -606,6 +615,14 @@ void DxbcShaderTranslator::StartPixelShader() {
         a_.OpDerivRTYCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0010), in_position_z);
       }
     }
+  } else if (DSV_IsApplyingPolygonOffset() && !current_shader().writes_depth()) {
+    // The decal path uses the original triangle depth slope. Take it before
+    // guest control flow or kill changes which pixels are still active.
+    assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+    dxbc::Src in_position_z(dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
+    in_position_used_ |= 0b0100;
+    a_.OpDerivRTXCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0001), in_position_z);
+    a_.OpDerivRTYCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0010), in_position_z);
   }
 
   // If not translating anything, we only need the depth.
@@ -657,15 +674,15 @@ void DxbcShaderTranslator::StartPixelShader() {
     // correct derivative magnitude and LODs.
     in_position_used_ |= 0b0011;
     a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, 0b0011), dxbc::Src::V1D(in_reg_ps_position_));
-    uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+    uint32_t resolution_scaled_axes = uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
+                                      (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
     if (resolution_scaled_axes) {
       // Revert resolution scale - after truncating, so if the pixel position
       // is passed to tfetch (assuming the game doesn't round it by itself),
       // it will be sampled with higher resolution too.
       a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
-               dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
-                             1.0f));
+               dxbc::Src::LF(1.0f / GetCurrentDrawResolutionScaleX(),
+                             1.0f / GetCurrentDrawResolutionScaleY(), 1.0f, 1.0f));
     }
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
@@ -723,8 +740,8 @@ void DxbcShaderTranslator::StartPixelShader() {
         dxbc::Dest::R(system_temp_memexport_enabled_and_eM_written_, 0b0001));
     dxbc::Src memexport_enabled_src(
         dxbc::Src::R(system_temp_memexport_enabled_and_eM_written_, dxbc::Src::kXXXX));
-    uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+    uint32_t resolution_scaled_axes = uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
+                                      (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
     if (resolution_scaled_axes) {
       uint32_t memexport_condition_temp = PushSystemTemp();
       // Only do memexport for one host pixel in a guest pixel - prefer the
@@ -735,12 +752,14 @@ void DxbcShaderTranslator::StartPixelShader() {
       in_position_used_ |= resolution_scaled_axes;
       a_.OpFToU(dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                 dxbc::Src::V1D(in_reg_ps_position_));
-      a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
-                dxbc::Src::R(memexport_condition_temp),
-                dxbc::Src::LU(draw_resolution_scale_x_, draw_resolution_scale_y_, 0, 0));
+      a_.OpUDiv(
+          dxbc::Dest::Null(), dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
+          dxbc::Src::R(memexport_condition_temp),
+          dxbc::Src::LU(GetCurrentDrawResolutionScaleX(), GetCurrentDrawResolutionScaleY(), 0, 0));
       a_.OpIEq(dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                dxbc::Src::R(memexport_condition_temp),
-               dxbc::Src::LU(draw_resolution_scale_x_ >> 1, draw_resolution_scale_y_ >> 1, 0, 0));
+               dxbc::Src::LU(GetCurrentDrawResolutionScaleX() >> 1,
+                             GetCurrentDrawResolutionScaleY() >> 1, 0, 0));
       for (uint32_t i = 0; i < 2; ++i) {
         if (!(resolution_scaled_axes & (1 << i))) {
           continue;
@@ -837,6 +856,9 @@ void DxbcShaderTranslator::StartTranslation() {
         // X holds the guest oDepth - make sure it's always initialized because
         // assumptions can't be made about the integrity of the guest code.
         depth_stencil_temp_zero_mask = 0b0001;
+      } else if (DSV_IsApplyingPolygonOffset()) {
+        // XY hold raster depth gradients for the host RT decal path.
+        depth_stencil_temp_zero_mask = 0b0000;
       } else {
         assert_true(edram_rov_used_);
         if (ROV_IsDepthStencilEarly()) {
@@ -1417,9 +1439,6 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
       dest = dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_);
       break;
     case InstructionStorageTarget::kExportAddress:
-      if (!can_store_memexport_address) {
-        return;
-      }
       if (!current_shader().memexport_eM_written()) {
         return;
       }
@@ -1884,7 +1903,7 @@ void DxbcShaderTranslator::ProcessAllocInstruction(const ParsedAllocInstruction&
   }
 }
 
-const DxbcShaderTranslator::ShaderRdefType
+constexpr DxbcShaderTranslator::ShaderRdefType
     DxbcShaderTranslator::rdef_types_[size_t(DxbcShaderTranslator::ShaderRdefTypeIndex::kCount)] = {
         // kFloat
         {"float", dxbc::RdefVariableClass::kScalar, dxbc::RdefVariableType::kFloat, 1, 1, 0,
@@ -1932,56 +1951,59 @@ const DxbcShaderTranslator::ShaderRdefType
          ShaderRdefTypeIndex::kUint4},
 };
 
-const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_constant_rdef_[size_t(
-    DxbcShaderTranslator::SystemConstants::Index::kCount)] = {
-    {"xe_flags", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_tessellation_factor_range", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
-    {"xe_line_loop_closing_index", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+constexpr DxbcShaderTranslator::SystemConstantRdef
+    DxbcShaderTranslator::system_constant_rdef_[size_t(
+        DxbcShaderTranslator::SystemConstants::Index::kCount)] = {
+        {"xe_flags", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+        {"xe_tessellation_factor_range", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
+        {"xe_line_loop_closing_index", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
 
-    {"xe_vertex_index_endian", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_vertex_index_offset", ShaderRdefTypeIndex::kUint, sizeof(int32_t)},
-    {"xe_vertex_index_min_max", ShaderRdefTypeIndex::kUint2, sizeof(uint32_t) * 2},
+        {"xe_vertex_index_endian", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+        {"xe_vertex_index_offset", ShaderRdefTypeIndex::kUint, sizeof(int32_t)},
+        {"xe_vertex_index_min_max", ShaderRdefTypeIndex::kUint2, sizeof(uint32_t) * 2},
 
-    {"xe_user_clip_planes", ShaderRdefTypeIndex::kFloat4Array6, sizeof(float) * 4 * 6},
+        {"xe_user_clip_planes", ShaderRdefTypeIndex::kFloat4Array6, sizeof(float) * 4 * 6},
 
-    {"xe_ndc_scale", ShaderRdefTypeIndex::kFloat3, sizeof(float) * 3},
-    {"xe_point_vertex_diameter_min", ShaderRdefTypeIndex::kFloat, sizeof(float)},
+        {"xe_ndc_scale", ShaderRdefTypeIndex::kFloat3, sizeof(float) * 3},
+        {"xe_point_vertex_diameter_min", ShaderRdefTypeIndex::kFloat, sizeof(float)},
 
-    {"xe_ndc_offset", ShaderRdefTypeIndex::kFloat3, sizeof(float) * 3},
-    {"xe_point_vertex_diameter_max", ShaderRdefTypeIndex::kFloat, sizeof(float)},
+        {"xe_ndc_offset", ShaderRdefTypeIndex::kFloat3, sizeof(float) * 3},
+        {"xe_point_vertex_diameter_max", ShaderRdefTypeIndex::kFloat, sizeof(float)},
 
-    {"xe_point_constant_diameter", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
-    {"xe_point_screen_diameter_to_ndc_radius", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
+        {"xe_point_constant_diameter", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
+        {"xe_point_screen_diameter_to_ndc_radius", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
 
-    {"xe_texture_swizzled_signs", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
+        {"xe_texture_swizzled_signs", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
 
-    {"xe_textures_resolution_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_sample_count_log2", ShaderRdefTypeIndex::kUint2, sizeof(uint32_t) * 2},
-    {"xe_alpha_test_reference", ShaderRdefTypeIndex::kFloat, sizeof(float)},
+        {"xe_textures_resolution_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+        {"xe_sample_count_log2", ShaderRdefTypeIndex::kUint2, sizeof(uint32_t) * 2},
+        {"xe_alpha_test_reference", ShaderRdefTypeIndex::kFloat, sizeof(float)},
 
-    {"xe_alpha_to_mask", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_edram_32bpp_tile_pitch_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
-    {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t),
-     sizeof(uint32_t)},
+        {"xe_alpha_to_mask", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+        {"xe_edram_32bpp_tile_pitch_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+        {"xe_edram_depth_base_dwords_scaled", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
+        {"xe_zpd_rov_counter_index", ShaderRdefTypeIndex::kUint, sizeof(uint32_t)},
 
-    {"xe_color_exp_bias", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+        {"xe_color_exp_bias", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 
-    {"xe_edram_poly_offset_front", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
-    {"xe_edram_poly_offset_back", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
+        {"xe_edram_poly_offset_front", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
+        {"xe_edram_poly_offset_back", ShaderRdefTypeIndex::kFloat2, sizeof(float) * 2},
 
-    {"xe_edram_stencil", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
+        {"xe_edram_stencil", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
 
-    {"xe_edram_rt_base_dwords_scaled", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
+        {"xe_edram_rt_base_dwords_scaled", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
-    {"xe_edram_rt_format_flags", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
+        {"xe_edram_rt_format_flags", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
-    {"xe_edram_rt_clamp", ShaderRdefTypeIndex::kFloat4Array4, sizeof(float) * 4 * 4},
+        {"xe_edram_rt_clamp", ShaderRdefTypeIndex::kFloat4Array4, sizeof(float) * 4 * 4},
 
-    {"xe_edram_rt_keep_mask", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
+        {"xe_edram_rt_keep_mask", ShaderRdefTypeIndex::kUint4Array2, sizeof(uint32_t) * 4 * 2},
 
-    {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
+        {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
-    {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+        {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+
+        {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8, sizeof(uint32_t) * 32},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {
@@ -2320,6 +2342,10 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   if (uav_index_edram_ != kBindingIndexUnallocated) {
     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_edram");
   }
+  uint32_t zpd_rov_counter_name_ptr = name_ptr;
+  if (uav_index_zpd_rov_counter_ != kBindingIndexUnallocated) {
+    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_zpd_rov_counter_uav");
+  }
 
   uint32_t bindings_position_dwords = uint32_t(shader_object_.size());
 
@@ -2444,6 +2470,13 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
         uav.dimension = dxbc::RdefDimension::kUAVBuffer;
         uav.sample_count = UINT32_MAX;
         uav.bind_point = uint32_t(UAVRegister::kEdram);
+      } else if (i == uav_index_zpd_rov_counter_) {
+        // ROV ZPD counter buffer.
+        uav.name_ptr = zpd_rov_counter_name_ptr;
+        uav.type = dxbc::RdefInputType::kUAVRWByteAddress;
+        uav.return_type = dxbc::ResourceReturnType::kMixed;
+        uav.dimension = dxbc::RdefDimension::kUAVBuffer;
+        uav.bind_point = uint32_t(UAVRegister::kZpdRovCounter);
       } else {
         assert_unhandled_case(i);
       }
@@ -2647,7 +2680,7 @@ void DxbcShaderTranslator::WriteInputSignature() {
     // shading.
     size_t sample_index_position = SIZE_MAX;
     if (current_shader().memexport_eM_written() && IsSampleRate()) {
-      size_t sample_index_position = shader_object_.size();
+      sample_index_position = shader_object_.size();
       shader_object_.resize(shader_object_.size() + kParameterDwords);
       ++parameter_count;
       {
@@ -3006,7 +3039,8 @@ void DxbcShaderTranslator::WriteOutputSignature() {
 
       // Depth (SV_Depth or SV_DepthLessEqual).
       size_t depth_position = SIZE_MAX;
-      if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth()) {
+      if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
+          DSV_IsApplyingPolygonOffset()) {
         depth_position = shader_object_.size();
         shader_object_.resize(shader_object_.size() + kParameterDwords);
         ++parameter_count;
@@ -3046,7 +3080,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
           depth.semantic_name_ptr = semantic_offset;
         }
         const char* depth_semantic_name;
-        if (!current_shader().writes_depth() &&
+        if (!current_shader().writes_depth() && !DSV_IsApplyingPolygonOffset() &&
             shader_modification.pixel.depth_stencil_mode ==
                 Modification::DepthStencilMode::kFloat24Truncating) {
           depth_semantic_name = "SV_DepthLessEqual";
@@ -3249,6 +3283,11 @@ void DxbcShaderTranslator::WriteShaderCode() {
           dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
           dxbc::Src::U(dxbc::Src::Dcl, uav_index_edram_, uint32_t(UAVRegister::kEdram),
                        uint32_t(UAVRegister::kEdram)));
+    } else if (i == uav_index_zpd_rov_counter_) {
+      // ROV ZPD counter buffer.
+      ao_.OpDclUnorderedAccessViewRaw(0, dxbc::Src::U(dxbc::Src::Dcl, uav_index_zpd_rov_counter_,
+                                                      uint32_t(UAVRegister::kZpdRovCounter),
+                                                      uint32_t(UAVRegister::kZpdRovCounter)));
     } else {
       assert_unhandled_case(i);
     }
@@ -3376,9 +3415,10 @@ void DxbcShaderTranslator::WriteShaderCode() {
         ao_.OpDclOutput(dxbc::Dest::OMask());
       }
       // Depth output.
-      if (is_writing_float24_depth || shader_writes_depth) {
-        if (!shader_writes_depth && GetDxbcShaderModification().pixel.depth_stencil_mode ==
-                                        Modification::DepthStencilMode::kFloat24Truncating) {
+      if (is_writing_float24_depth || DSV_IsApplyingPolygonOffset() || shader_writes_depth) {
+        if (!shader_writes_depth && !DSV_IsApplyingPolygonOffset() &&
+            GetDxbcShaderModification().pixel.depth_stencil_mode ==
+                Modification::DepthStencilMode::kFloat24Truncating) {
           ao_.OpDclOutput(dxbc::Dest::ODepthLE());
         } else {
           ao_.OpDclOutput(dxbc::Dest::ODepth());

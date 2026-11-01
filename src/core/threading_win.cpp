@@ -101,6 +101,37 @@ void Sleep(std::chrono::microseconds duration) {
   }
 }
 
+namespace {
+typedef NTSTATUS(NTAPI* NtDelayExecutionFn)(BOOLEAN alertable, PLARGE_INTEGER delay_interval);
+NtDelayExecutionFn ResolveNtDelayExecution() {
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) {
+    return nullptr;
+  }
+  return reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
+}
+}  // namespace
+
+void NanoSleep(int64_t ns) {
+  static const NtDelayExecutionFn nt_delay_execution = ResolveNtDelayExecution();
+  if (!nt_delay_execution) {
+    Sleep(std::chrono::nanoseconds(ns));
+    return;
+  }
+  // NtDelayExecution works in 100 nanosecond increments; negative is relative.
+  int64_t in_nt_increments = ns / 100LL;
+  if (in_nt_increments == 0 && ns != 0) {
+    in_nt_increments = 1;
+  }
+  LARGE_INTEGER delay;
+  delay.QuadPart = -in_nt_increments;
+  nt_delay_execution(FALSE, &delay);
+}
+
+void NanoSleepPrecise(int64_t ns) {
+  NanoSleep(ns);
+}
+
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
     return SleepResult::kAlerted;
