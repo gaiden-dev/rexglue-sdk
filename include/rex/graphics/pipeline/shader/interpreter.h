@@ -15,11 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <rex/assert.h>
-#include <rex/graphics/format/ucode.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
-#include <rex/graphics/xenos.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/memory.h>
 
 namespace rex::graphics {
@@ -32,10 +30,12 @@ class ShaderInterpreter {
   class ExportSink {
    public:
     virtual ~ExportSink() = default;
-    virtual void AllocExport(ucode::AllocType /*type*/, uint32_t /*size*/) {}
-    virtual void Export(ucode::ExportRegister /*export_register*/, const float* /*value*/,
-                        uint32_t /*value_mask*/) {}
+    virtual void AllocExport(ucode::AllocType type, uint32_t size) {}
+    virtual void Export(ucode::ExportRegister export_register, const float* value,
+                        uint32_t value_mask) {}
   };
+
+  void SetTraceWriter(TraceWriter* new_trace_writer) { trace_writer_ = new_trace_writer; }
 
   ExportSink* GetExportSink() const { return export_sink_; }
   void SetExportSink(ExportSink* new_export_sink) { export_sink_ = new_export_sink; }
@@ -114,12 +114,15 @@ class ShaderInterpreter {
   const std::array<float, 4> GetFloatConstant(uint32_t address, bool is_relative,
                                               bool relative_address_is_a0) const;
 
+  static float ReduceFloatPrecision(float value, uint32_t mantissa_bits);
   void ExecuteAluInstruction(ucode::AluInstruction instr);
   void StoreFetchResult(uint32_t dest, bool is_dest_relative, uint32_t swizzle, const float* value);
   void ExecuteVertexFetchInstruction(ucode::VertexFetchInstruction instr);
 
   const RegisterFile& register_file_;
   const memory::Memory& memory_;
+
+  TraceWriter* trace_writer_ = nullptr;
 
   ExportSink* export_sink_ = nullptr;
 

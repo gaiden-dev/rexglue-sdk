@@ -12,12 +12,16 @@
 #include <cstdint>
 
 #include <rex/assert.h>
-#include <rex/graphics/flags.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
+                    "Use approximate compare for alpha values to prevent flickering on "
+                    "NVIDIA graphics cards");
 
 namespace rex::graphics {
 using namespace ucode;
@@ -48,12 +52,100 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // system_temp_rov_params_.y = Y host pixel position as uint
   in_position_used_ |= 0b0011;
   a_.OpFToU(dxbc::Dest::R(system_temp_rov_params_, 0b0011), dxbc::Src::V1D(in_reg_ps_position_));
-  // Convert the position from pixels to samples.
+  // Convert the position from pixels to canonical sample 0 coordinates,
+  // meaning the coordinates of the pixel's sample 0 in the single sampled
+  // view of the EDRAM data. The layout is described in XeEdramOffsetBytes
+  // (see edram.xesli). What matters here is that the offsets of the other
+  // samples from sample 0 are constant, so the sample loops just add them, and
+  // that with resolution scaling the rearrangement happens at guest pixel
+  // granularity.
   // system_temp_rov_params_.x = X sample 0 position
   // system_temp_rov_params_.y = Y sample 0 position
-  a_.OpIShL(dxbc::Dest::R(system_temp_rov_params_, 0b0011), dxbc::Src::R(system_temp_rov_params_),
+  {
+    uint32_t scale_x = draw_resolution_scale_x_;
+    uint32_t scale_y = draw_resolution_scale_y_;
+    bool resolution_scaled = scale_x > 1 || scale_y > 1;
+    uint32_t guest_pixel_temp = UINT32_MAX;
+    if (resolution_scaled) {
+      guest_pixel_temp = PushSystemTemp();
+    }
+    dxbc::Src guest_x(resolution_scaled ? dxbc::Src::R(guest_pixel_temp, dxbc::Src::kXXXX)
+                                        : dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX));
+    dxbc::Src guest_y(resolution_scaled ? dxbc::Src::R(guest_pixel_temp, dxbc::Src::kYYYY)
+                                        : dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY));
+    auto emit_guest_pixel_split = [&]() {
+      if (!resolution_scaled) {
+        return;
+      }
+      // guest_pixel_temp.xy = guest pixel
+      // guest_pixel_temp.zw = host subpixel offset
+      a_.OpUDiv(dxbc::Dest::R(guest_pixel_temp, 0b0011), dxbc::Dest::R(guest_pixel_temp, 0b1100),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXYXY),
+                dxbc::Src::LU(scale_x, scale_y, scale_x, scale_y));
+    };
+    auto emit_host_pixel_restore = [&]() {
+      if (!resolution_scaled) {
+        return;
+      }
+      a_.OpUMAd(dxbc::Dest::R(system_temp_rov_params_, 0b0011),
+                dxbc::Src::R(system_temp_rov_params_), dxbc::Src::LU(scale_x, scale_y, 1, 1),
+                dxbc::Src::R(guest_pixel_temp, 0b1110));
+    };
+    // Check if 4x MSAA is enabled.
+    a_.OpIf(true,
             LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
-                               offsetof(SystemConstants, sample_count_log2), 0b0100));
+                               offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
+    {
+      emit_guest_pixel_split();
+      // system_temp_rov_params_.z = X >> 1
+      a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b0100), guest_x, dxbc::Src::LU(1));
+      // system_temp_rov_params_.w = X & 1
+      a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b1000), guest_x, dxbc::Src::LU(1));
+      // system_temp_rov_params_.x = ((X >> 1) << 2) | (X & 1)
+      a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(30), dxbc::Src::LU(2),
+               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ),
+               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW));
+      // system_temp_rov_params_.z = Y >> 1
+      a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b0100), guest_y, dxbc::Src::LU(1));
+      // system_temp_rov_params_.w = Y & 1
+      a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b1000), guest_y, dxbc::Src::LU(1));
+      // system_temp_rov_params_.y = ((Y >> 1) << 2) | (Y & 1)
+      a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0010), dxbc::Src::LU(30), dxbc::Src::LU(2),
+               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ),
+               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW));
+      emit_host_pixel_restore();
+    }
+    a_.OpElse();
+    {
+      // Check if 2x MSAA is enabled.
+      a_.OpIf(true,
+              LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
+                                 offsetof(SystemConstants, sample_count_log2), dxbc::Src::kYYYY));
+      {
+        emit_guest_pixel_split();
+        // system_temp_rov_params_.z = X >> 1
+        a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b0100), guest_x, dxbc::Src::LU(1));
+        // system_temp_rov_params_.z = Y with bit 1 = X bit 1
+        a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+                 dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ), guest_y);
+        // system_temp_rov_params_.w = Y >> 1
+        a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b1000), guest_y, dxbc::Src::LU(1));
+        // system_temp_rov_params_.y = ((Y >> 1) << 2) | (X & 2) | (Y & 1)
+        a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0010), dxbc::Src::LU(30),
+                 dxbc::Src::LU(2), dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kWWWW),
+                 dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kZZZZ));
+        // system_temp_rov_params_.x = X & ~2
+        a_.OpAnd(dxbc::Dest::R(system_temp_rov_params_, 0b0001), guest_x,
+                 dxbc::Src::LU(~uint32_t(2)));
+        emit_host_pixel_restore();
+      }
+      a_.OpEndIf();
+    }
+    a_.OpEndIf();
+    if (resolution_scaled) {
+      PopSystemTemp();
+    }
+  }
   // For cases of both color and depth:
   //   Get 40 x 16 x resolution scale 32bpp half-tile or 40x16 64bpp tile index
   //   to system_temp_rov_params_.zw, and put the sample index within such a
@@ -335,16 +427,11 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
                                    offsetof(SystemConstants, sample_count_log2), dxbc::Src::kXXXX));
   {
-    // Copy the 4x AA coverage to system_temp_rov_params_.x, making top-right
-    // the sample [2] and bottom-left the sample [1] (the opposite of Direct3D
-    // 12), because on the Xbox 360, 2x MSAA doubles the storage height, 4x MSAA
-    // doubles the storage width.
-    // Flip samples in bits 0:1 to bits 29:30.
-    a_.OpBFRev(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::VCoverage());
-    a_.OpUShR(dxbc::Dest::R(system_temp_rov_params_, 0b0001),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::LU(29));
-    a_.OpBFI(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(1),
-             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX), dxbc::Src::VCoverage());
+    // Copy the 4x AA coverage to system_temp_rov_params_.x. The guest sample
+    // numbering matches Direct3D 10.1+, bit 0 horizontal and bit 1 vertical,
+    // just like the canonical layout where the horizontal sample bit of a 4x
+    // view selects the horizontally adjacent sample column pair.
+    a_.OpMov(dxbc::Dest::R(system_temp_rov_params_, 0b0001), dxbc::Src::VCoverage());
   }
   // Handle 1 or 2 samples.
   a_.OpElse();
@@ -543,7 +630,8 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
         case 1:
           // - 2x MSAA: Bottom sample -> bottom-right (3) with Direct3D 11's
           //   ForcedSampleCount 4.
-          // - 4x MSAA: Bottom-left Xenia sample -> Direct3D 11 sample 2.
+          // - 4x MSAA: Top-right guest sample (the horizontal sample bit is
+          //   bit 0) -> Direct3D 11 sample 1.
           // Check if 4x MSAA is used.
           a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
                                            offsetof(SystemConstants, sample_count_log2),
@@ -554,10 +642,10 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
           // temp.z = biased depth in the center
           // temp.w if late = saturated sample 1 depth at 4x MSAA
           a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[2][0] * (1.0f / 16.0f)),
+                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[1][0] * (1.0f / 16.0f)),
                    temp_z_src);
           a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
-                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[2][1] * (1.0f / 16.0f)),
+                   dxbc::Src::LF(draw_util::kD3D10StandardSamplePositions4x[1][1] * (1.0f / 16.0f)),
                    sample_depth_stencil_src, true);
           a_.OpElse();
           // 2x MSAA as ForcedSampleCount 4 on the host.
@@ -574,14 +662,14 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
           a_.OpEndIf();
           break;
         default: {
-          // Xenia samples 2 and 3 (top-right and bottom-right) -> Direct3D 11
-          // samples 1 and 3.
+          // Guest samples 2 and 3, bottom left and bottom right with the
+          // vertical sample bit being bit 1, map to Direct3D 11 samples 2
+          // and 3.
           // temp.x if early = ddx(z)
           // temp.y if early = ddy(z)
           // temp.z = biased depth in the center
           // temp.w if late = saturated sample 2 or 3 depth
-          const int8_t* sample_position =
-              draw_util::kD3D10StandardSamplePositions4x[i ^ (((i & 1) ^ (i >> 1)) * 0b11)];
+          const int8_t* sample_position = draw_util::kD3D10StandardSamplePositions4x[i];
           a_.OpMAd(sample_depth_stencil_dest, z_ddx_src,
                    dxbc::Src::LF(sample_position[0] * (1.0f / 16.0f)), temp_z_src);
           a_.OpMAd(sample_depth_stencil_dest, z_ddy_src,
@@ -1007,13 +1095,28 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     // Close the sample conditional.
     a_.OpEndIf();
 
-    // Go to the next sample (samples are at +0, +(80*scale_x), +1,
-    // +(80*scale_x+1), so need to do +(80*scale_x), -(80*scale_x-1),
-    // +(80*scale_x) and -(80*scale_x+1) after each sample).
-    uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
-    a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-              dxbc::Src::LI((i & 1) ? -int32_t(tile_width) + 2 - i : int32_t(tile_width)));
+    // Go to the next sample. The canonical layout puts the samples of a
+    // pixel at +0, +(2*scale_x), +(2*scale_y rows) and +(2*scale_x +
+    // 2*scale_y rows) dwords. So the deltas after each sample are
+    // +(2*scale_x), +(2*scale_y rows - 2*scale_x), +(2*scale_x), and after
+    // the last sample -(2*scale_x + 2*scale_y rows) to restore the sample 0
+    // address.
+    {
+      uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+      int32_t sample_column_delta = int32_t(2 * draw_resolution_scale_x_);
+      int32_t sample_row_delta = int32_t(2 * draw_resolution_scale_y_ * tile_width);
+      int32_t sample_delta;
+      if (!(i & 1)) {
+        sample_delta = sample_column_delta;
+      } else if (i == 1) {
+        sample_delta = sample_row_delta - sample_column_delta;
+      } else {
+        sample_delta = -(sample_row_delta + sample_column_delta);
+      }
+      a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                dxbc::Src::LI(sample_delta));
+    }
   }
 
   if (ROV_IsDepthStencilEarly()) {
@@ -1185,8 +1288,9 @@ void DxbcShaderTranslator::ROV_UnpackColor(uint32_t rt_index, uint32_t packed_te
     // Unpack the components.
     a_.OpUBFE(color_components_dest, dxbc::Src::LU(16), dxbc::Src::LU(0, 16, 0, 16),
               dxbc::Src::R(packed_temp, 0b01010000 + packed_temp_components * 0b01010101));
-    // Convert from 16-bit float.
-    a_.OpF16ToF32(color_components_dest, dxbc::Src::R(color_temp));
+    // Convert from extended-range float16, exponent 31 holds finite values on
+    // the guest.
+    Float16ExtendedRangeTo32(color_temp, i ? 0b1111 : 0b0011);
     a_.OpBreak();
   }
 
@@ -1344,15 +1448,19 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(uint32_t rt_index, uint32_t c
     a_.OpCase(dxbc::Src::LU(RenderTargetCache::AddPSIColorFormatFlags(
         i ? xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT
           : xenos::ColorRenderTargetFormat::k_16_16_FLOAT)));
+    // Convert to extended-range float16 instead of the plain IEEE conversion,
+    // exponent 31 holds finite values on the guest.
+    Float32ToF16ExtendedRange(color_temp, i ? 0b1111 : 0b0011);
     for (uint32_t j = 0; j < (uint32_t(2) << i); ++j) {
       dxbc::Dest packed_dest_half(
           dxbc::Dest::R(packed_temp, 1 << (packed_temp_components + (j >> 1))));
-      // Convert to 16-bit float.
-      a_.OpF32ToF16((j & 1) ? temp1_dest : packed_dest_half, dxbc::Src::R(color_temp).Select(j));
-      // Pack green or alpha.
+      // Pack green or alpha into the high half.
       if (j & 1) {
-        a_.OpBFI(packed_dest_half, dxbc::Src::LU(16), dxbc::Src::LU(16), temp1_src,
+        a_.OpBFI(packed_dest_half, dxbc::Src::LU(16), dxbc::Src::LU(16),
+                 dxbc::Src::R(color_temp).Select(j),
                  dxbc::Src::R(packed_temp).Select(packed_temp_components + (j >> 1)));
+      } else {
+        a_.OpMov(packed_dest_half, dxbc::Src::R(color_temp).Select(j));
       }
     }
     a_.OpBreak();
@@ -1563,6 +1671,127 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
       }
       a_.OpEndIf();
     }
+    // For RT0 with MIN/MAX blend op, pre-multiply by the source blend factor
+    // (since D3D12 MIN/MAX ignores blend factors, but Xbox 360 applies them).
+    if (i == 0 && !edram_rov_used_) {
+      xenos::BlendFactor rgb_factor_for_premult =
+          GetDxbcShaderModification().pixel.rt0_blend_rgb_factor_for_premult;
+      xenos::BlendFactor a_factor_for_premult =
+          GetDxbcShaderModification().pixel.rt0_blend_a_factor_for_premult;
+      bool premult_rgb = rgb_factor_for_premult != xenos::BlendFactor::kOne;
+      bool premult_a = a_factor_for_premult != xenos::BlendFactor::kOne;
+      if (premult_rgb || premult_a) {
+        uint32_t premult_temp = PushSystemTemp();
+        // Compute and apply RGB factor.
+        if (premult_rgb) {
+          switch (rgb_factor_for_premult) {
+            case xenos::BlendFactor::kZero:
+              a_.OpMov(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::LF(0.0f));
+              break;
+            case xenos::BlendFactor::kSrcColor:
+              // Multiply by itself (square).
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(system_temp_color));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcColor:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0111), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp));
+              break;
+            case xenos::BlendFactor::kSrcAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kConstantColor:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                          offsetof(SystemConstants, edram_blend_constant),
+                                          dxbc::Src::kXYZW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantColor:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0111), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                           offsetof(SystemConstants, edram_blend_constant),
+                                           dxbc::Src::kXYZW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp));
+              break;
+            case xenos::BlendFactor::kConstantAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                          offsetof(SystemConstants, edram_blend_constant),
+                                          dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                           offsetof(SystemConstants, edram_blend_constant),
+                                           dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            default:
+              // kOne or unsupported - no pre-multiply.
+              break;
+          }
+        }
+        // Compute and apply alpha factor.
+        if (premult_a) {
+          switch (a_factor_for_premult) {
+            case xenos::BlendFactor::kZero:
+              a_.OpMov(dxbc::Dest::R(system_temp_color, 0b1000), dxbc::Src::LF(0.0f));
+              break;
+            case xenos::BlendFactor::kSrcColor:
+            case xenos::BlendFactor::kSrcAlpha:
+              // Alpha * Alpha.
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusSrcColor:
+            case xenos::BlendFactor::kOneMinusSrcAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kConstantColor:
+            case xenos::BlendFactor::kConstantAlpha:
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                          offsetof(SystemConstants, edram_blend_constant),
+                                          dxbc::Src::kWWWW));
+              break;
+            case xenos::BlendFactor::kOneMinusConstantColor:
+            case xenos::BlendFactor::kOneMinusConstantAlpha:
+              a_.OpAdd(dxbc::Dest::R(premult_temp, 0b0001), dxbc::Src::LF(1.0f),
+                       -LoadSystemConstant(SystemConstants::Index::kEdramBlendConstant,
+                                           offsetof(SystemConstants, edram_blend_constant),
+                                           dxbc::Src::kWWWW));
+              a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                       dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                       dxbc::Src::R(premult_temp, dxbc::Src::kXXXX));
+              break;
+            case xenos::BlendFactor::kSrcAlphaSaturate:
+              // For alpha, SrcAlphaSaturate is 1.0, so no pre-multiply needed.
+              break;
+            default:
+              // kOne or unsupported - no pre-multiply.
+              break;
+          }
+        }
+        PopSystemTemp();  // premult_temp
+      }
+    }
     // Copy the color from a readable temp register to an output register.
     a_.OpMov(dxbc::Dest::O(i), dxbc::Src::R(system_temp_color));
   }
@@ -1572,6 +1801,32 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
 
 void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
   bool shader_writes_depth = current_shader().writes_depth();
+  bool apply_polygon_offset = DSV_IsApplyingPolygonOffset();
+  auto write_polygon_offset_depth = [&](dxbc::Dest depth_dest, uint32_t temp,
+                                        dxbc::Src unbiased_depth) {
+    dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
+    dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
+    in_front_face_used_ = true;
+    assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+    a_.OpMax(temp_x_dest, dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX).Abs(),
+             dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kYYYY).Abs());
+    a_.OpIf(true, dxbc::Src::V1D(in_reg_ps_front_face_sample_index_, dxbc::Src::kXXXX));
+    a_.OpMAd(
+        temp_x_dest, temp_x_src,
+        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetFront,
+                           offsetof(SystemConstants, edram_poly_offset_front), dxbc::Src::kXXXX),
+        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetFront,
+                           offsetof(SystemConstants, edram_poly_offset_front), dxbc::Src::kYYYY));
+    a_.OpElse();
+    a_.OpMAd(
+        temp_x_dest, temp_x_src,
+        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetBack,
+                           offsetof(SystemConstants, edram_poly_offset_back), dxbc::Src::kXXXX),
+        LoadSystemConstant(SystemConstants::Index::kEdramPolyOffsetBack,
+                           offsetof(SystemConstants, edram_poly_offset_back), dxbc::Src::kYYYY));
+    a_.OpEndIf();
+    a_.OpAdd(depth_dest, temp_x_src, unbiased_depth);
+  };
 
   if (!DSV_IsWritingFloat24Depth()) {
     if (shader_writes_depth) {
@@ -1587,6 +1842,15 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
       a_.OpEndIf();
       // Write the depth from the temporary to the system depth output.
       a_.OpMov(dxbc::Dest::ODepth(), dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX));
+    } else if (apply_polygon_offset) {
+      // Some decal draws use bias values too small for host RT depth bias to
+      // stay stable. Writing the biased depth here keeps those redraws stable
+      // against the receiver without forcing larger bias on unrelated draws.
+      uint32_t temp = PushSystemTemp();
+      dxbc::Src in_position_z(dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
+      in_position_used_ |= 0b0100;
+      write_polygon_offset_depth(dxbc::Dest::ODepth(), temp, in_position_z);
+      PopSystemTemp();
     }
     return;
   }
@@ -1606,8 +1870,17 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
     // assumption of it being clamped while working with the bit representation.
     temp = PushSystemTemp();
     in_position_used_ |= 0b0100;
-    a_.OpMul(dxbc::Dest::R(temp, 0b0001), dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ),
-             dxbc::Src::LF(2.0f), true);
+    dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
+    dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
+    dxbc::Src in_position_z(dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
+    if (apply_polygon_offset) {
+      // Bias host depth first, then reuse the normal float24 conversion. D24FS
+      // scaling was handled when the polygon offset constants were uploaded.
+      write_polygon_offset_depth(temp_x_dest, temp, in_position_z);
+      a_.OpMul(temp_x_dest, temp_x_src, dxbc::Src::LF(2.0f), true);
+    } else {
+      a_.OpMul(temp_x_dest, in_position_z, dxbc::Src::LF(2.0f), true);
+    }
   }
 
   dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
@@ -1615,8 +1888,12 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
   dxbc::Dest temp_y_dest(dxbc::Dest::R(temp, 0b0010));
   dxbc::Src temp_y_src(dxbc::Src::R(temp, dxbc::Src::kYYYY));
 
-  if (GetDxbcShaderModification().pixel.depth_stencil_mode ==
-      Modification::DepthStencilMode::kFloat24Truncating) {
+  Modification::DepthStencilMode depth_stencil_mode =
+      GetDxbcShaderModification().pixel.depth_stencil_mode;
+  bool depth_float24_truncating =
+      depth_stencil_mode == Modification::DepthStencilMode::kFloat24Truncating ||
+      depth_stencil_mode == Modification::DepthStencilMode::kFloat24TruncatingPolygonOffset;
+  if (depth_float24_truncating) {
     // Simplified conversion, always less than or equal to the original value -
     // just drop the lower bits.
     // The float32 exponent bias is 127.
@@ -1626,7 +1903,9 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
     // The smallest denormalized 20e4 number is -34 - should drop 23 mantissa
     // bits at -34.
     // Anything smaller than 2^-34 becomes 0.
-    dxbc::Dest truncate_dest(shader_writes_depth ? dxbc::Dest::ODepth() : dxbc::Dest::ODepthLE());
+    dxbc::Dest truncate_dest((shader_writes_depth || apply_polygon_offset)
+                                 ? dxbc::Dest::ODepth()
+                                 : dxbc::Dest::ODepthLE());
     // Check if the number is representable as a float24 after truncation - the
     // exponent is at least -34.
     a_.OpUGE(temp_y_dest, temp_x_src, dxbc::Src::LU(0x2E800000));
@@ -1817,6 +2096,51 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
   a_.OpEndIf();
 }
 
+void DxbcShaderTranslator::ROV_AddPassedMSAASamplesToCounter() {
+  if (uav_index_zpd_rov_counter_ == kBindingIndexUnallocated) {
+    uav_index_zpd_rov_counter_ = uav_count_++;
+  }
+
+  uint32_t temp = PushSystemTemp();
+  dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
+  dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
+  dxbc::Dest temp_y_dest(dxbc::Dest::R(temp, 0b0010));
+  dxbc::Src temp_y_src(dxbc::Src::R(temp, dxbc::Src::kYYYY));
+
+  dxbc::Src counter_index_src(LoadSystemConstant(SystemConstants::Index::kZpdRovCounterIndex,
+                                                 offsetof(SystemConstants, zpd_rov_counter_index),
+                                                 dxbc::Src::kXXXX));
+
+  // UINT32_MAX means no counter segment is currently open for this draw.
+  a_.OpINE(temp_x_dest, counter_index_src, dxbc::Src::LU(UINT32_MAX));
+  a_.OpIf(true, temp_x_src);
+
+  {
+    // Only bits 0:3 are surviving coverage. 4:7 are deferred depth/stencil
+    // writes and don't contribute to the counter.
+    a_.OpAnd(temp_x_dest, dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kXXXX),
+             dxbc::Src::LU((uint32_t(1) << 4) - 1));
+    a_.OpCountBits(temp_x_dest, temp_x_src);
+    a_.OpIf(true, temp_x_src);
+    {
+      // The counter UAV is raw, so address it in bytes.
+      // One counter slot is one uint32_t.
+      a_.OpUMul(dxbc::Dest::Null(), temp_y_dest, counter_index_src,
+                dxbc::Src::LU(sizeof(uint32_t)));
+      // Add the number of samples that survived depth/stencil for this pixel to
+      // the active query slot. This slot is copied to the readback buffer when
+      // the counter segment is closed.
+      a_.OpAtomicIAdd(
+          dxbc::Dest::U(uav_index_zpd_rov_counter_, uint32_t(UAVRegister::kZpdRovCounter), 0),
+          temp_y_src, 0b0001, temp_x_src);
+    }
+    a_.OpEndIf();
+  }
+  a_.OpEndIf();
+
+  PopSystemTemp();
+}
+
 void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   uint32_t temp = PushSystemTemp();
   dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
@@ -1853,13 +2177,15 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       }
       // Close the write check.
       a_.OpEndIf();
-      // Go to the next sample (samples are at +0, +(80*scale_x), +1,
-      // +(80*scale_x+1), so need to do +(80*scale_x), -(80*scale_x-1),
-      // +(80*scale_x) and -(80*scale_x+1) after each sample).
+      // Go to the next sample, with the same deltas as in the depth sample
+      // loop above, just without restoring the sample 0 address at the end.
       if (i < 3) {
-        a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-                  dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-                  dxbc::Src::LI((i & 1) ? -int32_t(tile_width) + 2 - i : int32_t(tile_width)));
+        int32_t sample_column_delta = int32_t(2 * draw_resolution_scale_x_);
+        int32_t sample_row_delta = int32_t(2 * draw_resolution_scale_y_ * tile_width);
+        a_.OpIAdd(
+            dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+            dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+            dxbc::Src::LI((i & 1) ? sample_row_delta - sample_column_delta : sample_column_delta));
       }
     }
   } else {
@@ -1868,6 +2194,8 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
 
   // system_temp_rov_params_.y (the depth / stencil sample address) is not
   // needed anymore, can be used for color writing.
+
+  ROV_AddPassedMSAASamplesToCounter();
 
   if (!is_depth_only_pixel_shader_) {
     // Check if any sample is still covered after depth testing and writing,
@@ -2303,30 +2631,99 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
             a_.OpMin(color_temp_rgb_dest, color_temp_src, rt_clamp_vec_src.Select(2));
           }
           // Need to do min/max for color.
+          // Note: Unlike Vulkan/D3D12 fixed-function blend which ignores
+          // factors for MIN/MAX, the Xbox 360 applies blend factors before
+          // min/max.
           a_.OpElse();
           {
-            // Extract the color min (0) or max (1) bit to temp.x
-            // temp.x = whether min or max should be used for color.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
-            // Check if need to do min or max for color.
-            // temp.x = free.
+            uint32_t blend_src_temp = PushSystemTemp();
+            dxbc::Dest blend_src_temp_rgb_dest(dxbc::Dest::R(blend_src_temp, 0b0111));
+            dxbc::Src blend_src_temp_src(dxbc::Src::R(blend_src_temp));
+
+            // Apply source color factor for min/max.
+            // Extract the source color factor to temp.x.
+            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU((1 << 5) - 1));
             a_.OpIf(true, temp_x_src);
             {
-              // Choose max of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMax(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+              a_.OpSwitch(temp_x_src);
+              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_src_temp);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+              // Multiply source by factor.
+              a_.OpMul(blend_src_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]),
+                       blend_src_temp_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_src_temp_rgb_dest, blend_src_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
             }
-            // Need to do min.
+            a_.OpElse();
+            { a_.OpMov(blend_src_temp_rgb_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Apply destination color factor for min/max.
+            uint32_t blend_dest_temp = PushSystemTemp();
+            dxbc::Dest blend_dest_temp_rgb_dest(dxbc::Dest::R(blend_dest_temp, 0b0111));
+            dxbc::Src blend_dest_temp_src(dxbc::Src::R(blend_dest_temp));
+
+            // Extract the destination color factor to temp.x.
+            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(8), rt_blend_factors_ops_src);
+            a_.OpIf(true, temp_x_src);
+            {
+              a_.OpSwitch(temp_x_src);
+              ROV_HandleColorBlendFactorCases(system_temps_color_[i], color_temp, blend_dest_temp);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              a_.OpAnd(temp_x_dest, rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointColor));
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+              // Multiply destination by factor.
+              a_.OpMul(blend_dest_temp_rgb_dest, color_temp_src, blend_dest_temp_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, temp_x_src);
+              {
+                a_.OpMax(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(0));
+                a_.OpMin(blend_dest_temp_rgb_dest, blend_dest_temp_src, rt_clamp_vec_src.Select(2));
+              }
+              a_.OpEndIf();
+            }
+            a_.OpElse();
+            { a_.OpMov(blend_dest_temp_rgb_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Now do min or max on the factored values.
+            // Extract the color min (0) or max (1) bit to temp.x.
+            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 5));
+            a_.OpIf(true, temp_x_src);
+            {
+              // MAX: color_temp.xyz = max(src * srcFactor, dst * dstFactor)
+              a_.OpMax(color_temp_rgb_dest, blend_src_temp_src, blend_dest_temp_src);
+            }
             a_.OpElse();
             {
-              // Choose min of the colors without applying the factors to
-              // color_temp.xyz.
-              // color_temp.xyz = blended color.
-              a_.OpMin(color_temp_rgb_dest, dxbc::Src::R(system_temps_color_[i]), color_temp_src);
+              // MIN: color_temp.xyz = min(src * srcFactor, dst * dstFactor)
+              a_.OpMin(color_temp_rgb_dest, blend_src_temp_src, blend_dest_temp_src);
             }
-            // Close the min or max check.
             a_.OpEndIf();
+
+            PopSystemTemp();  // blend_dest_temp
+            PopSystemTemp();  // blend_src_temp
           }
           // Close the color factor blending or min/max check.
           a_.OpEndIf();
@@ -2484,31 +2881,94 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
             a_.OpMin(color_temp_a_dest, color_temp_a_src, rt_clamp_vec_src.Select(3));
           }
           // Need to do min/max for alpha.
+          // Note: Unlike Vulkan/D3D12 fixed-function blend which ignores
+          // factors for MIN/MAX, the Xbox 360 applies blend factors before
+          // min/max.
           a_.OpElse();
           {
-            // Extract the alpha min (0) or max (1) bit to temp.x.
-            // temp.x = whether min or max should be used for alpha.
-            a_.OpAnd(temp_x_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
-            // Check if need to do min or max for alpha.
-            // temp.x = free.
+            // We'll use temp.x for source alpha (factored) and temp.y for
+            // destination alpha (factored).
+
+            // Apply source alpha factor for min/max.
+            // Extract the source alpha factor to temp.x (bits 16-20).
+            a_.OpUBFE(temp_x_dest, dxbc::Src::LU(5), dxbc::Src::LU(16), rt_blend_factors_ops_src);
             a_.OpIf(true, temp_x_src);
             {
-              // Choose max of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMax(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              a_.OpSwitch(temp_x_src);
+              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 0);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              uint32_t alpha_is_fixed_temp = PushSystemTemp();
+              a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp, 0b0001), rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+              {
+                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+              // Multiply source alpha by factor.
+              a_.OpMul(temp_x_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
+                       temp_x_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp, dxbc::Src::kXXXX));
+              PopSystemTemp();  // alpha_is_fixed_temp
+              {
+                a_.OpMax(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_x_dest, temp_x_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
             }
-            // Need to do min.
+            a_.OpElse();
+            { a_.OpMov(temp_x_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Apply destination alpha factor for min/max.
+            // Extract the destination alpha factor to temp.y (bits 24-28).
+            a_.OpUBFE(temp_y_dest, dxbc::Src::LU(5), dxbc::Src::LU(24), rt_blend_factors_ops_src);
+            a_.OpIf(true, temp_y_src);
+            {
+              a_.OpSwitch(temp_y_src);
+              ROV_HandleAlphaBlendFactorCases(system_temps_color_[i], color_temp, temp, 1);
+              a_.OpEndSwitch();
+              // Check if fixed-point and needs clamping.
+              uint32_t alpha_is_fixed_temp2 = PushSystemTemp();
+              a_.OpAnd(dxbc::Dest::R(alpha_is_fixed_temp2, 0b0001), rt_format_flags_src,
+                       dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_FixedPointAlpha));
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp2, dxbc::Src::kXXXX));
+              {
+                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+              // Multiply destination alpha by factor.
+              a_.OpMul(temp_y_dest, color_temp_a_src, temp_y_src);
+              // Clamp result if fixed-point.
+              a_.OpIf(true, dxbc::Src::R(alpha_is_fixed_temp2, dxbc::Src::kXXXX));
+              PopSystemTemp();  // alpha_is_fixed_temp2
+              {
+                a_.OpMax(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(1));
+                a_.OpMin(temp_y_dest, temp_y_src, rt_clamp_vec_src.Select(3));
+              }
+              a_.OpEndIf();
+            }
+            a_.OpElse();
+            { a_.OpMov(temp_y_dest, dxbc::Src::LF(0.0f)); }
+            a_.OpEndIf();
+
+            // Now do min or max on the factored alpha values.
+            // Extract the alpha min (0) or max (1) bit to color_temp.w.
+            a_.OpAnd(color_temp_a_dest, rt_blend_factors_ops_src, dxbc::Src::LU(1 << 21));
+            a_.OpIf(true, color_temp_a_src);
+            {
+              // MAX: color_temp.w = max(src * srcFactor, dst * dstFactor)
+              a_.OpMax(color_temp_a_dest, temp_x_src, temp_y_src);
+            }
             a_.OpElse();
             {
-              // Choose min of the alphas without applying the factors to
-              // color_temp.w.
-              // color_temp.w = blended alpha.
-              a_.OpMin(color_temp_a_dest, dxbc::Src::R(system_temps_color_[i], dxbc::Src::kWWWW),
-                       color_temp_a_src);
+              // MIN: color_temp.w = min(src * srcFactor, dst * dstFactor)
+              a_.OpMin(color_temp_a_dest, temp_x_src, temp_y_src);
             }
-            // Close the min or max check.
             a_.OpEndIf();
           }
           // Close the alpha factor blending or min/max check.
@@ -2588,28 +3048,27 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Close the sample covered check.
       a_.OpEndIf();
 
-      // Go to the next sample (samples are at +0, +(80*scale_x), +dwpp,
-      // +(80*scale_x+dwpp), so need to do +(80*scale_x), -(80*scale_x-dwpp),
-      // +(80*scale_x) and -(80*scale_x+dwpp) after each sample).
-      // Though no need to do this for the last sample as for the next render
-      // target, the address will be recalculated.
+      // Go to the next sample, the same walk as in the depth sample loop,
+      // except the deltas are in sample columns here and a 64bpp sample
+      // column is 2 dwords wide, while a row is 80*scale_x dwords either way.
+      // No need to do this for the last sample as for the next render target,
+      // the address will be recalculated.
       if (j < 3) {
-        if (j & 1) {
-          // temp.z = whether the render target is 64bpp.
-          a_.OpAnd(temp_z_dest, rt_format_flags_src,
-                   dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
-          // temp.z = offset from the current sample to the next.
-          a_.OpMovC(temp_z_dest, temp_z_src,
-                    dxbc::Src::LI(-int32_t(tile_width) + 2 * (2 - int32_t(j))),
-                    dxbc::Src::LI(-int32_t(tile_width) + (2 - int32_t(j))));
-          // temp.z = free.
-          a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-                    dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), temp_z_src);
-        } else {
-          a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
-                    dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-                    dxbc::Src::LU(tile_width));
-        }
+        int32_t sample_row_delta = int32_t(2 * draw_resolution_scale_y_ * tile_width);
+        int32_t sample_column_delta_32bpp = int32_t(2 * draw_resolution_scale_x_);
+        int32_t sample_column_delta_64bpp = 2 * sample_column_delta_32bpp;
+        // temp.z = whether the render target is 64bpp.
+        a_.OpAnd(temp_z_dest, rt_format_flags_src,
+                 dxbc::Src::LU(RenderTargetCache::kPSIColorFormatFlag_64bpp));
+        // temp.z = offset from the current sample to the next.
+        a_.OpMovC(temp_z_dest, temp_z_src,
+                  dxbc::Src::LI((j & 1) ? sample_row_delta - sample_column_delta_64bpp
+                                        : sample_column_delta_64bpp),
+                  dxbc::Src::LI((j & 1) ? sample_row_delta - sample_column_delta_32bpp
+                                        : sample_column_delta_32bpp));
+        // temp.z = free.
+        a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                  dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY), temp_z_src);
       }
     }
 
@@ -2646,7 +3105,6 @@ void DxbcShaderTranslator::CompletePixelShader() {
     // X - mask, then masked result (SGPR for loading, VGPR for masking).
     // Y - operation result (SGPR for mask operations, VGPR for alpha
     //     operations).
-    // Z - fuzzy diff (alpha - reference), used when fuzzy epsilon is enabled.
     uint32_t alpha_test_temp = PushSystemTemp();
     dxbc::Dest alpha_test_mask_dest(dxbc::Dest::R(alpha_test_temp, 0b0001));
     dxbc::Src alpha_test_mask_src(dxbc::Src::R(alpha_test_temp, dxbc::Src::kXXXX));
@@ -2674,7 +3132,7 @@ void DxbcShaderTranslator::CompletePixelShader() {
       dxbc::Src alpha_test_reference_src(
           LoadSystemConstant(SystemConstants::Index::kAlphaTestReference,
                              offsetof(SystemConstants, alpha_test_reference), dxbc::Src::kXXXX));
-      // Epsilon for fuzzy alpha checks (prevents flickering on NVIDIA GPUs).
+      // Epsilon for alpha checks
       dxbc::Src fuzzy_epsilon = dxbc::Src::LF(1e-3f);
       // Handle "not equal" specially (specifically as "not equal" so it's true
       // for NaN, not "less or greater" which is false for NaN).
@@ -2684,8 +3142,8 @@ void DxbcShaderTranslator::CompletePixelShader() {
       {
         if (REXCVAR_GET(use_fuzzy_alpha_epsilon)) {
           a_.OpAdd(alpha_test_fuzzy_diff_dest, alpha_src, -alpha_test_reference_src);
-          // Check if distance to desired value is less than epsilon (false for
-          // NaN) and write the negated result.
+          // Check if distance to desired value is less then eps (false for NaN)
+          // and write the negated result
           a_.OpLT(alpha_test_mask_dest, alpha_test_fuzzy_diff_src.Abs(), fuzzy_epsilon);
           a_.OpNot(alpha_test_mask_dest, alpha_test_mask_src);
         } else {
@@ -2715,7 +3173,6 @@ void DxbcShaderTranslator::CompletePixelShader() {
           a_.OpLT(alpha_test_op_dest, alpha_src, alpha_test_reference_src);
           a_.OpOr(alpha_test_op_dest, alpha_test_op_src, dxbc::Src::LU(~uint32_t(1 << 0)));
           a_.OpAnd(alpha_test_mask_dest, alpha_test_mask_src, alpha_test_op_src);
-          // Equals to.
           a_.OpEq(alpha_test_op_dest, alpha_src, alpha_test_reference_src);
           a_.OpOr(alpha_test_op_dest, alpha_test_op_src, dxbc::Src::LU(~uint32_t(1 << 1)));
           a_.OpAnd(alpha_test_mask_dest, alpha_test_mask_src, alpha_test_op_src);
@@ -2757,6 +3214,63 @@ void DxbcShaderTranslator::CompletePixelShader() {
     CompletePixelShader_WriteToRTVs();
     CompletePixelShader_DSV_DepthTo24Bit();
   }
+}
+
+void DxbcShaderTranslator::Float32ToF16ExtendedRange(uint32_t reg, uint32_t components) {
+  uint32_t original_temp = PushSystemTemp();
+  uint32_t mask_temp = PushSystemTemp();
+  // The Xbox 360 float16 has no NaN, map it to 0 before converting. Otherwise
+  // the overflow check below reads its exponent as an overflow, and since min
+  // and max drop the NaN operand in DXBC, the clamp would turn it into
+  // +131008.
+  a_.OpNE(dxbc::Dest::R(mask_temp, components), dxbc::Src::R(reg), dxbc::Src::R(reg));
+  a_.OpMovC(dxbc::Dest::R(reg, components), dxbc::Src::R(mask_temp), dxbc::Src::LF(0.0f),
+            dxbc::Src::R(reg));
+  // Keep the original float32 values for the overflow path.
+  a_.OpMov(dxbc::Dest::R(original_temp, components), dxbc::Src::R(reg));
+  // The standard conversion covers magnitudes up to 65504, anything larger
+  // becomes Inf with all five exponent bits set.
+  a_.OpF32ToF16(dxbc::Dest::R(reg, components), dxbc::Src::R(reg));
+  // Find the lanes that overflowed.
+  a_.OpAnd(dxbc::Dest::R(mask_temp, components), dxbc::Src::R(reg), dxbc::Src::LU(0x7C00));
+  a_.OpIEq(dxbc::Dest::R(mask_temp, components), dxbc::Src::R(mask_temp), dxbc::Src::LU(0x7C00));
+  // Encode the overflowed lanes into exponent 31, which the Xbox 360 treats
+  // as finite. Clamp to the 131008 limit, halve so the exponent lands at 30
+  // or below, convert, then add one to the exponent to undo the halving.
+  a_.OpMin(dxbc::Dest::R(original_temp, components), dxbc::Src::R(original_temp),
+           dxbc::Src::LF(131008.0f));
+  a_.OpMax(dxbc::Dest::R(original_temp, components), dxbc::Src::R(original_temp),
+           dxbc::Src::LF(-131008.0f));
+  a_.OpMul(dxbc::Dest::R(original_temp, components), dxbc::Src::R(original_temp),
+           dxbc::Src::LF(0.5f));
+  a_.OpF32ToF16(dxbc::Dest::R(original_temp, components), dxbc::Src::R(original_temp));
+  a_.OpIAdd(dxbc::Dest::R(original_temp, components), dxbc::Src::R(original_temp),
+            dxbc::Src::LU(0x0400));
+  // Choose the encoded value for the overflowed lanes.
+  a_.OpMovC(dxbc::Dest::R(reg, components), dxbc::Src::R(mask_temp), dxbc::Src::R(original_temp),
+            dxbc::Src::R(reg));
+  // Release original_temp and mask_temp.
+  PopSystemTemp(2);
+}
+
+void DxbcShaderTranslator::Float16ExtendedRangeTo32(uint32_t reg, uint32_t components) {
+  uint32_t reduced_temp = PushSystemTemp();
+  uint32_t mask_temp = PushSystemTemp();
+  // Find the exponent 31 lanes, which hold finite values on the Xbox 360
+  // rather than Inf or NaN.
+  a_.OpAnd(dxbc::Dest::R(mask_temp, components), dxbc::Src::R(reg), dxbc::Src::LU(0x7C00));
+  a_.OpIEq(dxbc::Dest::R(mask_temp, components), dxbc::Src::R(mask_temp), dxbc::Src::LU(0x7C00));
+  // Lower their exponent by one so the conversion sees a normal float16, then
+  // double the result to undo it.
+  a_.OpIAdd(dxbc::Dest::R(reduced_temp, components), dxbc::Src::R(reg), dxbc::Src::LI(-0x0400));
+  a_.OpMovC(dxbc::Dest::R(reg, components), dxbc::Src::R(mask_temp), dxbc::Src::R(reduced_temp),
+            dxbc::Src::R(reg));
+  a_.OpF16ToF32(dxbc::Dest::R(reg, components), dxbc::Src::R(reg));
+  a_.OpMul(dxbc::Dest::R(reduced_temp, components), dxbc::Src::R(reg), dxbc::Src::LF(2.0f));
+  a_.OpMovC(dxbc::Dest::R(reg, components), dxbc::Src::R(mask_temp), dxbc::Src::R(reduced_temp),
+            dxbc::Src::R(reg));
+  // Release reduced_temp and mask_temp.
+  PopSystemTemp(2);
 }
 
 void DxbcShaderTranslator::PreClampedFloat32To7e3(dxbc::Assembler& a, uint32_t f10_temp,

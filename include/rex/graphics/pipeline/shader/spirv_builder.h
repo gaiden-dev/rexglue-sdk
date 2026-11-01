@@ -18,6 +18,7 @@
 #include <SPIRV/SpvBuilder.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/shader/spirv_compatibility.h>
 
 namespace rex::graphics {
 
@@ -30,6 +31,45 @@ class SpirvBuilder : public spv::Builder {
 
   // Make public rather than protected.
   using spv::Builder::createSelectionMerge;
+
+  // ReXGlue: the vendored glslang has these signatures natively.
+#if REX_SPIRV_GLSLANG_SCOPED_ENUMS
+  // Backward compatibility wrapper for createBranch
+  void createBranch(spv::Block* block) { spv::Builder::createBranch(true, block); }
+
+  // Backward compatibility wrapper for makeFunctionEntry
+  // For shaders, we use LinkageType::Max which means no linkage decoration
+  spv::Function* makeFunctionEntry(spv::Decoration precision, spv::Id returnType, const char* name,
+                                   const std::vector<spv::Id>& paramTypes,
+                                   const std::vector<std::vector<spv::Decoration>>& precisions,
+                                   spv::Block** entry = nullptr) {
+    // LinkageType::Max means no linkage decoration will be added (correct for
+    // shader entry points)
+    return spv::Builder::makeFunctionEntry(precision, returnType, name, spv::LinkageType::Max,
+                                           paramTypes, precisions, entry);
+  }
+
+  // Hide base class createAccessChain to workaround the way
+  // glslang 11.6.0+ uses internal accessChain state instead of parameters.
+  spv::Id createAccessChain(spv::StorageClass storage_class, spv::Id base,
+                            const std::vector<spv::Id>& offsets) {
+    // glslang 11.6.0+ uses the accessChain member
+    // in getResultingAccessChainType() but doesn't populate it from the
+    // parameters. We need to set it up correctly before calling the parent.
+    clearAccessChain();
+    setAccessChainLValue(base);
+    for (const auto& offset : offsets) {
+      accessChainPush(offset, {}, 0);
+    }
+
+    spv::Id result = spv::Builder::createAccessChain(storage_class, base, offsets);
+
+    // Clear the state again to avoid affecting subsequent operations
+    clearAccessChain();
+
+    return result;
+  }
+#endif  // REX_SPIRV_GLSLANG_SCOPED_ENUMS
 
   spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
                        spv::Id operand3, spv::Id operand4);
@@ -45,11 +85,15 @@ class SpirvBuilder : public spv::Builder {
   spv::Id createTriBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
                                spv::Id operand1, spv::Id operand2, spv::Id operand3);
 
+  // Makes a constant of a float scalar or vector value_type with all
+  // components set to value.
+  spv::Id smearFloatConstant(float value, spv::Id value_type);
+
   // Helper to use for building nested control flow with if-then-else with
   // additions over SpvBuilder::If.
   class IfBuilder {
    public:
-    IfBuilder(spv::Id condition, unsigned int control, SpirvBuilder& builder,
+    IfBuilder(spv::Id condition, spv::SelectionControlMask control, SpirvBuilder& builder,
               unsigned int thenWeight = 0, unsigned int elseWeight = 0);
 
     ~IfBuilder() {
@@ -80,7 +124,7 @@ class SpirvBuilder : public spv::Builder {
 
     SpirvBuilder& builder;
     spv::Id condition;
-    unsigned int control;
+    spv::SelectionControlMask control;
     unsigned int thenWeight;
     unsigned int elseWeight;
 
@@ -103,7 +147,8 @@ class SpirvBuilder : public spv::Builder {
   // block) compared to makeSwitch.
   class SwitchBuilder {
    public:
-    SwitchBuilder(spv::Id selector, unsigned int selection_control, SpirvBuilder& builder);
+    SwitchBuilder(spv::Id selector, spv::SelectionControlMask selection_control,
+                  SpirvBuilder& builder);
     ~SwitchBuilder() { assert_true(current_branch_ == Branch::kMerge); }
 
     void makeBeginDefault();
@@ -127,7 +172,7 @@ class SpirvBuilder : public spv::Builder {
 
     SpirvBuilder& builder_;
     spv::Id selector_;
-    unsigned int selection_control_;
+    spv::SelectionControlMask selection_control_;
 
     spv::Function& function_;
 

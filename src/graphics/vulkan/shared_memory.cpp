@@ -9,10 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
 #include <cstring>
-#include <utility>
-#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -23,17 +20,23 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
-                    "Use sparse shared memory on Vulkan")
+REXCVAR_DECLARE(bool, gpu_allow_invalid_upload_range);
+
+REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "Vulkan",
+                    "Enable sparse binding for shared memory emulation. Disabling it "
+                    "increases video memory usage - a 512 MB buffer is created - but "
+                    "allows graphics debuggers that don't support sparse binding to "
+                    "work.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
-                                       memory::Memory& memory,
+                                       memory::Memory& memory, TraceWriter& trace_writer,
                                        VkPipelineStageFlags guest_shader_pipeline_stages)
     : SharedMemory(memory),
       command_processor_(command_processor),
+      trace_writer_(trace_writer),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
 VulkanSharedMemory::~VulkanSharedMemory() {
@@ -41,7 +44,9 @@ VulkanSharedMemory::~VulkanSharedMemory() {
 }
 
 bool VulkanSharedMemory::Initialize() {
-  InitializeCommon();
+  if (!InitializeCommon()) {
+    return false;
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -170,6 +175,8 @@ bool VulkanSharedMemory::Initialize() {
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
+  ResetTraceDownload();
+
   upload_buffer_pool_.reset();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -187,6 +194,12 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   if (!from_destructor) {
     ShutdownCommon();
   }
+}
+
+void VulkanSharedMemory::ClearCache() {
+  SharedMemory::ClearCache();
+
+  upload_buffer_pool_->ClearCache();
 }
 
 void VulkanSharedMemory::CompletedSubmissionUpdated() {
@@ -225,6 +238,75 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   }
   last_written_range_ = written_range;
+}
+
+bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
+  ResetTraceDownload();
+  PrepareForTraceDownload();
+  uint32_t download_page_count = trace_download_page_count();
+  if (!download_page_count) {
+    return false;
+  }
+
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          command_processor_.GetVulkanDevice(), download_page_count << page_size_log2(),
+          VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
+          trace_download_buffer_, trace_download_buffer_memory_)) {
+    REXGPU_ERROR(
+        "Shared memory: Failed to create a {} KB GPU-written memory download "
+        "buffer for frame tracing",
+        download_page_count << page_size_log2() >> 10);
+    ResetTraceDownload();
+    return false;
+  }
+
+  Use(Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+
+  size_t download_range_count = trace_download_ranges().size();
+  VkBufferCopy* download_regions = command_buffer.CmdCopyBufferEmplace(
+      buffer_, trace_download_buffer_, uint32_t(download_range_count));
+  VkDeviceSize download_buffer_offset = 0;
+  for (size_t i = 0; i < download_range_count; ++i) {
+    VkBufferCopy& download_region = download_regions[i];
+    const std::pair<uint32_t, uint32_t>& download_range = trace_download_ranges()[i];
+    download_region.srcOffset = download_range.first;
+    download_region.dstOffset = download_buffer_offset;
+    download_region.size = download_range.second;
+    download_buffer_offset += download_range.second;
+  }
+
+  command_processor_.PushBufferMemoryBarrier(
+      trace_download_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+
+  return true;
+}
+
+void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
+  if (!trace_download_buffer_memory_) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  void* download_mapping;
+  if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
+                      &download_mapping) == VK_SUCCESS) {
+    uint32_t download_buffer_offset = 0;
+    for (const auto& download_range : trace_download_ranges()) {
+      trace_writer_.WriteMemoryRead(
+          download_range.first, download_range.second,
+          reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
+    }
+    dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
+  } else {
+    REXGPU_ERROR(
+        "Shared memory: Failed to map the GPU-written memory download buffer "
+        "for frame tracing");
+  }
+  ResetTraceDownload();
 }
 
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -268,17 +350,20 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
   return true;
 }
 
-bool VulkanSharedMemory::UploadRanges(
-    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
-  if (upload_page_ranges.empty()) {
+bool VulkanSharedMemory::UploadRanges(const std::pair<uint32_t, uint32_t>* upload_page_ranges,
+                                      uint32_t num_upload_ranges) {
+  if (!num_upload_ranges) {
     return true;
   }
+
+  auto& range_front = upload_page_ranges[0];
+  auto& range_back = upload_page_ranges[num_upload_ranges - 1];
+
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
+      std::make_pair(range_front.first << page_size_log2(),
+                     (range_back.first + range_back.second - range_front.first)
                          << page_size_log2()));
   command_processor_.SubmitBarriers(true);
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
@@ -286,9 +371,32 @@ bool VulkanSharedMemory::UploadRanges(
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
-  for (auto upload_range : upload_page_ranges) {
-    uint32_t upload_range_start = upload_range.first;
-    uint32_t upload_range_length = upload_range.second;
+
+  // for (auto upload_range : upload_page_ranges) {
+  for (unsigned int i = 0; i < num_upload_ranges; ++i) {
+    uint32_t upload_range_start = upload_page_ranges[i].first;
+    uint32_t upload_range_length = upload_page_ranges[i].second;
+    trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
+                                  upload_range_length << page_size_log2());
+
+    if (upload_range_length > 0 && !REXCVAR_GET(gpu_allow_invalid_upload_range)) {
+      const uint32_t range_start_addr = upload_range_start << page_size_log2();
+      const uint32_t upload_range_last_page = upload_range_start + upload_range_length - 1;
+      const uint32_t range_end_addr = upload_range_last_page << page_size_log2();
+
+      const memory::PageAccess start_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_start_addr, range_start_addr);
+      const memory::PageAccess end_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_end_addr, range_end_addr);
+      if (start_access == rex::memory::PageAccess::kNoAccess ||
+          end_access == rex::memory::PageAccess::kNoAccess) {
+        REXGPU_ERROR("Vulkan shared memory: Invalid upload range {:08X} length {:08X}",
+                     upload_range_start, upload_range_length);
+        successful = false;
+        break;
+      }
+    }
+
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
@@ -301,9 +409,17 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+
+      if (upload_buffer_size < (1ULL << 32) && upload_buffer_size > 8192) {
+        memory::vastcpy(upload_buffer_mapping,
+                        memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                        static_cast<uint32_t>(upload_buffer_size));
+        swcache::WriteFence();
+      } else {
+        std::memcpy(upload_buffer_mapping,
+                    memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                    upload_buffer_size);
+      }
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -337,7 +453,7 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
   switch (usage) {
     case Usage::kComputeWrite:
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -359,6 +475,15 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
     default:
       assert_unhandled_case(usage);
   }
+}
+
+void VulkanSharedMemory::ResetTraceDownload() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, trace_download_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, trace_download_buffer_memory_);
+  ReleaseTraceDownloadRanges();
 }
 
 }  // namespace rex::graphics::vulkan

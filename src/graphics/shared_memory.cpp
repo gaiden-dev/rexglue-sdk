@@ -9,16 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
-#include <cstring>
-#include <utility>
-
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
-#include <rex/math.h>
-#include <rex/memory.h>
+#include <rex/logging.h>
 
 namespace rex::graphics {
 
@@ -30,13 +25,30 @@ SharedMemory::~SharedMemory() {
   ShutdownCommon();
 }
 
-void SharedMemory::InitializeCommon() {
-  num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
-  system_page_flags_valid_.assign(num_system_page_flags_, 0);
-  system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+bool SharedMemory::InitializeCommon() {
+  size_t num_system_page_flags_entries = ((kBufferSize >> page_size_log2_) + 63) / 64;
+  num_system_page_flags_ = static_cast<uint32_t>(num_system_page_flags_entries);
 
+  // in total on windows the page flags take up 2048 entries per fields, with 3
+  // fields and 8 bytes per entry thats 49152 bytes. having page alignment for
+  // them is probably beneficial, we do waste 16384 bytes with this alloc though
+
+  uint64_t* system_page_flags_base = (uint64_t*)memory::AllocFixed(
+      nullptr, num_system_page_flags_ * 2 * sizeof(uint64_t),
+      memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite);
+
+  if (!system_page_flags_base) {
+    REXGPU_ERROR("SharedMemory: Failed to allocate system page flags");
+    return false;
+  }
+
+  system_page_flags_valid_ = system_page_flags_base;
+  system_page_flags_valid_and_gpu_written_ = system_page_flags_base + num_system_page_flags_;
+  memset(system_page_flags_valid_, 0, 8 * num_system_page_flags_entries);
+  memset(system_page_flags_valid_and_gpu_written_, 0, 8 * num_system_page_flags_entries);
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
+  return true;
 }
 
 void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {
@@ -48,6 +60,8 @@ void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {
 }
 
 void SharedMemory::ShutdownCommon() {
+  ReleaseTraceDownloadRanges();
+
   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, false);
   assert_true(global_watches_.empty());
   // No watches now, so no references to the pools accessible by guest threads -
@@ -81,28 +95,19 @@ void SharedMemory::ShutdownCommon() {
   host_gpu_memory_sparse_allocated_.clear();
   host_gpu_memory_sparse_allocated_.shrink_to_fit();
   host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
-
-  system_page_flags_valid_.clear();
-  system_page_flags_valid_.shrink_to_fit();
-  system_page_flags_valid_and_gpu_written_.clear();
-  system_page_flags_valid_and_gpu_written_.shrink_to_fit();
+  memory::DeallocFixed(system_page_flags_valid_, 0, memory::DeallocationType::kRelease);
+  system_page_flags_valid_ = nullptr;
+  system_page_flags_valid_and_gpu_written_ = nullptr;
   num_system_page_flags_ = 0;
 }
 
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
-
-  std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
-  std::fill(system_page_flags_valid_and_gpu_written_.begin(),
-            system_page_flags_valid_and_gpu_written_.end(), uint64_t(0));
-}
-
-void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
-  auto global_lock = global_critical_region_.Acquire();
-
-  // Pages that are valid only because the CPU uploaded them lose their valid
-  // bit here, so the next frame re-reads them from guest memory.
-  system_page_flags_valid_ = system_page_flags_valid_and_gpu_written_;
+  if (!num_system_page_flags_) {
+    return;
+  }
+  memset(system_page_flags_valid_, 0, sizeof(uint64_t) * num_system_page_flags_);
+  memset(system_page_flags_valid_and_gpu_written_, 0, sizeof(uint64_t) * num_system_page_flags_);
 }
 
 void SharedMemory::ClearCache() {
@@ -125,6 +130,14 @@ void SharedMemory::ClearCache() {
   SetSystemPageBlocksValidWithGpuDataWritten();
 }
 
+void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+  auto global_lock = global_critical_region_.Acquire();
+
+  for (unsigned i = 0; i < num_system_page_flags_; ++i) {
+    system_page_flags_valid_[i] = system_page_flags_valid_and_gpu_written_[i];
+  }
+}
+
 SharedMemory::GlobalWatchHandle SharedMemory::RegisterGlobalWatch(GlobalWatchCallback callback,
                                                                   void* callback_context) {
   GlobalWatch* watch = new GlobalWatch;
@@ -142,7 +155,7 @@ void SharedMemory::UnregisterGlobalWatch(GlobalWatchHandle handle) {
 
   {
     auto global_lock = global_critical_region_.Acquire();
-    auto it = std::find(global_watches_.begin(), global_watches_.end(), watch);
+    auto it = std::ranges::find(global_watches_, watch);
     assert_false(it == global_watches_.end());
     if (it != global_watches_.end()) {
       global_watches_.erase(it);
@@ -165,8 +178,8 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
   uint32_t watch_page_last = (start + length - 1) >> page_size_log2_;
   uint32_t bucket_first = watch_page_first << page_size_log2_ >> kWatchBucketSizeLog2;
   uint32_t bucket_last = watch_page_last << page_size_log2_ >> kWatchBucketSizeLog2;
-
-  auto global_lock = global_critical_region_.Acquire();
+  // chrispy: Not required the global lock is always held by the caller
+  // auto global_lock = global_critical_region_.Acquire();
 
   // Allocate the range.
   WatchRange* range = watch_range_first_free_;
@@ -240,14 +253,26 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   // Fire per-range watches.
   for (uint32_t i = bucket_first; i <= bucket_last; ++i) {
     WatchNode* node = watch_buckets_[i];
+    if (i + 1 <= bucket_last) {
+      WatchNode* nextnode = watch_buckets_[i + 1];
+      if (nextnode) {
+        swcache::PrefetchL1(nextnode->range);
+      }
+    }
     while (node != nullptr) {
       WatchRange* range = node->range;
       // Store the next node now since when the callback is triggered, the links
       // will be broken.
       node = node->bucket_node_next;
+      if (node) {
+        swcache::PrefetchL1(node);
+      }
       if (page_first <= range->page_last && page_last >= range->page_first) {
         range->callback(global_lock, range->callback_context, range->callback_data,
                         range->callback_argument, invalidated_by_gpu);
+        if (node && node->range) {
+          swcache::PrefetchL1(node->range);
+        }
         UnlinkWatchRange(range);
       }
     }
@@ -302,13 +327,19 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
+      // SystemPageFlagsBlock& block = system_page_flags_[i];
       system_page_flags_valid_[i] |= valid_bits;
-      uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
-      gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+      if (written_by_gpu) {
+        system_page_flags_valid_and_gpu_written_[i] |= valid_bits;
+      } else {
+        system_page_flags_valid_and_gpu_written_[i] &= ~valid_bits;
+      }
     }
   }
 
   if (memory_invalidation_callback_handle_) {
+    // A page that isn't writable here gets no watch. A later guest
+    // protect-to-writable invalidates it so its writes are still caught.
     memory().EnablePhysicalMemoryAccessCallbacks(
         valid_page_first << page_size_log2_,
         (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
@@ -336,141 +367,146 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   range->next_free = watch_range_first_free_;
   watch_range_first_free_ = range;
 }
-
-bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
-  if (ranges == nullptr || !count) {
+// todo: optimize, an enormous amount of cpu time (1.34%) is spent here.
+bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  if (!length) {
+    // Some texture or buffer is empty, for example - safe to draw in this case.
     return true;
   }
-
-  // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    uint32_t start = ranges[i].first;
-    uint32_t length = ranges[i].second;
-    if (!length) {
-      continue;
-    }
-    if (start > kBufferSize || (kBufferSize - start) < length) {
-      return false;
-    }
-    merged_ranges.emplace_back(start, length);
-  }
-  if (merged_ranges.empty()) {
-    return true;
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
   }
 
   SCOPE_profile_cpu_f("gpu");
 
-  std::sort(merged_ranges.begin(), merged_ranges.end(),
-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
-              return a.first < b.first;
-            });
-  size_t merged_write = 0;
-  for (size_t i = 1; i < merged_ranges.size(); ++i) {
-    std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
-    const std::pair<uint32_t, uint32_t>& range_current = merged_ranges[i];
-    uint64_t previous_end = uint64_t(range_previous.first) + uint64_t(range_previous.second);
-    uint64_t current_start = uint64_t(range_current.first);
-    if (current_start <= previous_end) {
-      uint64_t current_end = current_start + uint64_t(range_current.second);
-      if (current_end > previous_end) {
-        range_previous.second = uint32_t(current_end - uint64_t(range_previous.first));
-      }
-    } else {
-      merged_ranges[++merged_write] = range_current;
-    }
+  if (!EnsureHostGpuMemoryAllocated(start, length)) {
+    return false;
   }
-  merged_ranges.resize(merged_write + 1);
 
-  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
-    if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
-      return false;
-    }
-  }
+  unsigned int current_upload_range = 0;
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
 
   upload_ranges_.clear();
-  auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
-    if (!page_count) {
-      return;
-    }
-    if (!upload_ranges_.empty()) {
-      std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
-      if (last_upload_range.first + last_upload_range.second == page_start) {
-        last_upload_range.second += page_count;
-        return;
-      }
-    }
-    upload_ranges_.emplace_back(page_start, page_count);
-  };
+
+  std::pair<uint32_t, uint32_t>* uploads =
+      reinterpret_cast<std::pair<uint32_t, uint32_t>*>(upload_ranges_.data());
+
+  uint32_t block_first = page_first >> 6;
+  // swcache::PrefetchL1(&system_page_flags_[block_first]);
+  uint32_t block_last = page_last >> 6;
+  uint32_t range_start = UINT32_MAX;
+
   {
     auto global_lock = global_critical_region_.Acquire();
-    for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
-      uint32_t page_first = range.first >> page_size_log2_;
-      uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
-      uint32_t block_first = page_first >> 6;
-      uint32_t block_last = page_last >> 6;
-      uint32_t range_start = UINT32_MAX;
-      for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = system_page_flags_valid_[i];
-        // Consider pages in the block outside the requested range valid.
-        if (i == block_first) {
-          uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
-          block_valid |= block_before;
-        }
-        if (i == block_last && (page_last & 63) != 63) {
-          uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
-          block_valid |= ~block_inside;
-        }
-
-        while (true) {
-          uint32_t block_page;
-          if (range_start == UINT32_MAX) {
-            // Check if need to open a new range.
-            if (!rex::bit_scan_forward(~block_valid, &block_page)) {
-              break;
-            }
-            range_start = (i << 6) + block_page;
-          } else {
-            // Check if need to close the range.
-            // Ignore the valid pages before the beginning of the range.
-            uint64_t block_valid_from_start = block_valid;
-            if (i == (range_start >> 6)) {
-              block_valid_from_start &= ~((uint64_t(1) << (range_start & 63)) - 1);
-            }
-            if (!rex::bit_scan_forward(block_valid_from_start, &block_page)) {
-              break;
-            }
-            append_upload_range(range_start, (i << 6) + block_page - range_start);
-            // In the next iteration within this block, consider this range
-            // valid since it has been queued for upload.
-            block_valid |= (uint64_t(1) << block_page) - 1;
-            range_start = UINT32_MAX;
-          }
-        }
-      }
-      if (range_start != UINT32_MAX) {
-        append_upload_range(range_start, page_last + 1 - range_start);
-      }
-    }
+    TryFindUploadRange(block_first, block_last, page_first, page_last, range_start,
+                       current_upload_range, uploads);
   }
-
-  COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
-  COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
-                    uint32_t(merged_ranges.size()));
-  COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
-                    uint32_t(upload_ranges_.size()));
-
-  if (upload_ranges_.empty()) {
+  if (range_start != UINT32_MAX) {
+    uploads[current_upload_range++] = (std::make_pair(range_start, page_last + 1 - range_start));
+  }
+  if (!current_upload_range) {
     return true;
   }
 
-  return UploadRanges(upload_ranges_);
+  return UploadRanges(uploads, current_upload_range);
 }
 
-bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
-  std::pair<uint32_t, uint32_t> range(start, length);
-  return RequestRanges(&range, 1);
+bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t valid_mask = UINT64_MAX;
+    if (i == block_first) {
+      valid_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      valid_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if ((system_page_flags_valid_[i] & valid_mask) != valid_mask) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename T>
+REX_FORCEINLINE REX_NOALIAS static T mod_shift_left(T value, uint32_t by) {
+#if REX_ARCH_AMD64 == 1
+  // arch has modular shifts
+  return value << by;
+#else
+  return value << (by % (sizeof(T) * CHAR_BIT));
+#endif
+}
+void SharedMemory::TryFindUploadRange(const uint32_t& block_first, const uint32_t& block_last,
+                                      const uint32_t& page_first, const uint32_t& page_last,
+                                      uint32_t& range_start, unsigned int& current_upload_range,
+                                      std::pair<uint32_t, uint32_t>* uploads) {
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t block_valid = system_page_flags_valid_[i];
+    if (i == block_first) {
+      uint64_t block_before = mod_shift_left(uint64_t(1), page_first) - 1;
+      block_valid |= block_before;
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      uint64_t block_inside = mod_shift_left(uint64_t(1), page_last + 1) - 1;
+      block_valid |= ~block_inside;
+    }
+    TryGetNextUploadRange(range_start, block_valid, i, current_upload_range, uploads);
+  }
+}
+
+static bool UploadRange_DoBestScanForward(uint64_t v, uint32_t* out) {
+  // ReXGlue: no runtime CPU feature query (amd64::GetFeatureFlags); portable scan only.
+  return rex::bit_scan_forward(v, out);
+}
+
+void SharedMemory::TryGetNextUploadRange(uint32_t& range_start, uint64_t& block_valid,
+                                         const uint32_t& i, unsigned int& current_upload_range,
+                                         std::pair<uint32_t, uint32_t>* uploads) {
+  while (true) {
+    uint32_t block_page = 0;
+    if (range_start == UINT32_MAX) {
+      // Check if need to open a new range.
+      if (!UploadRange_DoBestScanForward(~block_valid, &block_page)) {
+        break;
+      }
+      range_start = (i << 6) + block_page;
+    } else {
+      // Check if need to close the range.
+      // Ignore the valid pages before the beginning of the range.
+      uint64_t block_valid_from_start = block_valid;
+      if (i == (range_start >> 6)) {
+        block_valid_from_start &= ~(mod_shift_left(uint64_t(1), range_start) - 1);
+      }
+      if (!UploadRange_DoBestScanForward(block_valid_from_start, &block_page)) {
+        break;
+      }
+      if (current_upload_range + 1 < MAX_UPLOAD_RANGES) {
+        uploads[current_upload_range++] =
+            std::make_pair(range_start, (i << 6) + block_page - range_start);
+        // In the next iteration within this block, consider this range valid
+        // since it has been queued for upload.
+        block_valid |= (uint64_t(1) << block_page) - 1;
+        range_start = UINT32_MAX;
+      } else {
+        rex::FatalError(
+            "Hit max upload ranges in shared_memory.cc, tell a dev to "
+            "raise the limit!");
+      }
+    }
+  }
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
@@ -534,43 +570,135 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
                                                            << page_size_log2_);
 }
 
-bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length) {
-  if (host_gpu_memory_sparse_granularity_log2_ == UINT32_MAX) {
-    return true;
-  }
-  if (!length) {
-    return true;
-  }
-  if (start > kBufferSize || (kBufferSize - start) < length) {
-    return false;
-  }
-  uint32_t page_first = start >> page_size_log2_;
-  uint32_t page_last = (start + length - 1) >> page_size_log2_;
-  uint32_t allocation_first =
-      page_first << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
-  uint32_t allocation_last =
-      page_last << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
-  while (true) {
-    std::pair<size_t, size_t> allocation_range =
-        rex::bit::GetNextRangeUnset(host_gpu_memory_sparse_allocated_.data(), allocation_first,
-                                    allocation_last - allocation_first + 1);
-    if (!allocation_range.second) {
-      break;
+void SharedMemory::PrepareForTraceDownload() {
+  ReleaseTraceDownloadRanges();
+  assert_true(trace_download_ranges_.empty());
+  assert_zero(trace_download_page_count_);
+
+  // Invalidate the entire memory CPU->GPU memory copy so all the history
+  // doesn't have to be written into every frame trace, and collect the list of
+  // ranges with data modified on the GPU.
+
+  uint32_t fire_watches_range_start = UINT32_MAX;
+  uint32_t gpu_written_range_start = UINT32_MAX;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t i = 0; i < num_system_page_flags_; ++i) {
+    // SystemPageFlagsBlock& page_flags_block = system_page_flags_[i];
+    uint64_t previously_valid_block = system_page_flags_valid_[i];
+    uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
+    system_page_flags_valid_[i] = gpu_written_block;
+
+    // Fire watches on the invalidated pages.
+    uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;
+    uint64_t fire_watches_break_block = ~fire_watches_block;
+    while (true) {
+      uint32_t fire_watches_block_page;
+      if (!rex::bit_scan_forward(fire_watches_range_start == UINT32_MAX ? fire_watches_block
+                                                                        : fire_watches_break_block,
+                                 &fire_watches_block_page)) {
+        break;
+      }
+      uint32_t fire_watches_page = (i << 6) + fire_watches_block_page;
+      if (fire_watches_range_start == UINT32_MAX) {
+        fire_watches_range_start = fire_watches_page;
+      } else {
+        FireWatches(fire_watches_range_start, fire_watches_page - 1, false);
+        fire_watches_range_start = UINT32_MAX;
+      }
+      uint64_t fire_watches_block_mask = ~((uint64_t(1) << fire_watches_block_page) - 1);
+      fire_watches_block &= fire_watches_block_mask;
+      fire_watches_break_block &= fire_watches_block_mask;
     }
-    if (!AllocateSparseHostGpuMemoryRange(uint32_t(allocation_range.first),
-                                          uint32_t(allocation_range.second))) {
+
+    // Add to the GPU-written ranges.
+    uint64_t gpu_written_break_block = ~gpu_written_block;
+    while (true) {
+      uint32_t gpu_written_block_page;
+      if (!rex::bit_scan_forward(
+              gpu_written_range_start == UINT32_MAX ? gpu_written_block : gpu_written_break_block,
+              &gpu_written_block_page)) {
+        break;
+      }
+      uint32_t gpu_written_page = (i << 6) + gpu_written_block_page;
+      if (gpu_written_range_start == UINT32_MAX) {
+        gpu_written_range_start = gpu_written_page;
+      } else {
+        uint32_t gpu_written_range_length = gpu_written_page - gpu_written_range_start;
+        // Call EnsureHostGpuMemoryAllocated in case the page was marked as
+        // GPU-written not as a result to an actual write to the shared memory
+        // buffer, but, for instance, by resolving with resolution scaling (to a
+        // separate buffer).
+        if (EnsureHostGpuMemoryAllocated(gpu_written_range_start << page_size_log2_,
+                                         gpu_written_range_length << page_size_log2_)) {
+          trace_download_ranges_.push_back(
+              std::make_pair(gpu_written_range_start << page_size_log2_,
+                             gpu_written_range_length << page_size_log2_));
+          trace_download_page_count_ += gpu_written_range_length;
+        }
+        gpu_written_range_start = UINT32_MAX;
+      }
+      uint64_t gpu_written_block_mask = ~((uint64_t(1) << gpu_written_block_page) - 1);
+      gpu_written_block &= gpu_written_block_mask;
+      gpu_written_break_block &= gpu_written_block_mask;
+    }
+  }
+  uint32_t page_count = kBufferSize >> page_size_log2_;
+  if (fire_watches_range_start != UINT32_MAX) {
+    FireWatches(fire_watches_range_start, page_count - 1, false);
+  }
+  if (gpu_written_range_start != UINT32_MAX) {
+    uint32_t gpu_written_range_length = page_count - gpu_written_range_start;
+    if (EnsureHostGpuMemoryAllocated(gpu_written_range_start << page_size_log2_,
+                                     gpu_written_range_length << page_size_log2_)) {
+      trace_download_ranges_.push_back(std::make_pair(gpu_written_range_start << page_size_log2_,
+                                                      gpu_written_range_length << page_size_log2_));
+      trace_download_page_count_ += gpu_written_range_length;
+    }
+  }
+}
+
+void SharedMemory::ReleaseTraceDownloadRanges() {
+  trace_download_ranges_.clear();
+  trace_download_ranges_.shrink_to_fit();
+  trace_download_page_count_ = 0;
+}
+
+bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length) {
+  if (host_gpu_memory_sparse_granularity_log2_ != UINT32_MAX && length) {
+    if (start <= kBufferSize && (kBufferSize - start) >= length) {
+      uint32_t page_first = start >> page_size_log2_;
+      uint32_t page_last = (start + length - 1) >> page_size_log2_;
+      uint32_t allocation_first =
+          page_first << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
+      uint32_t allocation_last =
+          page_last << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
+      while (true) {
+        std::pair<size_t, size_t> allocation_range =
+            rex::bit::GetNextRangeUnset(host_gpu_memory_sparse_allocated_.data(), allocation_first,
+                                        allocation_last - allocation_first + 1);
+        if (!allocation_range.second) {
+          break;
+        }
+        if (!AllocateSparseHostGpuMemoryRange(uint32_t(allocation_range.first),
+                                              uint32_t(allocation_range.second))) {
+          return false;
+        }
+        rex::bit::SetRange(host_gpu_memory_sparse_allocated_.data(), allocation_range.first,
+                           allocation_range.second);
+        ++host_gpu_memory_sparse_allocations_;
+        COUNT_profile_set("gpu/shared_memory/host_gpu_memory_sparse_allocations",
+                          host_gpu_memory_sparse_allocations_);
+        host_gpu_memory_sparse_used_bytes_ += uint32_t(allocation_range.second)
+                                              << host_gpu_memory_sparse_granularity_log2_;
+        COUNT_profile_set("gpu/shared_memory/host_gpu_memory_sparse_used_mb",
+                          (host_gpu_memory_sparse_used_bytes_ + ((1 << 20) - 1)) >> 20);
+        allocation_first = uint32_t(allocation_range.first + allocation_range.second);
+      }
+    } else {
       return false;
     }
-    rex::bit::SetRange(host_gpu_memory_sparse_allocated_.data(), allocation_range.first,
-                       allocation_range.second);
-    ++host_gpu_memory_sparse_allocations_;
-    COUNT_profile_set("gpu/shared_memory/host_gpu_memory_sparse_allocations",
-                      host_gpu_memory_sparse_allocations_);
-    host_gpu_memory_sparse_used_bytes_ += uint32_t(allocation_range.second)
-                                          << host_gpu_memory_sparse_granularity_log2_;
-    COUNT_profile_set("gpu/shared_memory/host_gpu_memory_sparse_used_mb",
-                      (host_gpu_memory_sparse_used_bytes_ + ((1 << 20) - 1)) >> 20);
-    allocation_first = uint32_t(allocation_range.first + allocation_range.second);
+  } else {
+    return true;
   }
   return true;
 }

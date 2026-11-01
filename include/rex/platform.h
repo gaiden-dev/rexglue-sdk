@@ -138,6 +138,61 @@
 #define REX_HAS_BUILTIN_STRLEN 0
 #endif
 
+// Optimization / codegen hint macros (ported from xenia-canary's platform.h).
+#if REX_COMPILER_MSVC
+#define REX_FORCEINLINE __forceinline
+#define REX_NOINLINE __declspec(noinline)
+#define REX_COLD __declspec(code_seg(".cold"))
+#define REX_LIKELY(...) (!!(__VA_ARGS__))
+#define REX_UNLIKELY(...) (!!(__VA_ARGS__))
+#define REX_MSVC_ASSUME(...) __assume(__VA_ARGS__)
+#define REX_NOALIAS __declspec(noalias)
+#elif REX_COMPILER_CLANG || REX_COMPILER_GNUC
+#define REX_FORCEINLINE __attribute__((always_inline)) inline
+#define REX_NOINLINE __attribute__((noinline))
+#define REX_COLD __attribute__((cold))
+#define REX_LIKELY(...) __builtin_expect(!!(__VA_ARGS__), true)
+#define REX_UNLIKELY(...) __builtin_expect(!!(__VA_ARGS__), false)
+#define REX_NOALIAS
+#define REX_MSVC_ASSUME(...) static_cast<void>(0)
+#else
+#define REX_FORCEINLINE inline
+#define REX_NOINLINE
+#define REX_COLD
+#define REX_LIKELY(...) (!!(__VA_ARGS__))
+#define REX_UNLIKELY(...) (!!(__VA_ARGS__))
+#define REX_NOALIAS
+#define REX_MSVC_ASSUME(...) static_cast<void>(0)
+#endif
+
+#if REX_COMPILER_MSVC
+#define REX_MSVC_OPTIMIZE_SMALL() __pragma(optimize("s", on))
+#define REX_MSVC_OPTIMIZE_REVERT() __pragma(optimize("", on))
+#define REX_MSVC_REORDER_BARRIER() _ReadWriteBarrier()
+#else
+#define REX_MSVC_OPTIMIZE_SMALL()
+#define REX_MSVC_OPTIMIZE_REVERT()
+#define REX_MSVC_REORDER_BARRIER() static_cast<void>(0)
+#endif
+
+#if REX_COMPILER_CLANG || REX_COMPILER_GNUC
+#define REX_LIKELY_IF(...) if (REX_LIKELY(__VA_ARGS__))
+#define REX_UNLIKELY_IF(...) if (REX_UNLIKELY(__VA_ARGS__))
+#define REX_MAYBE_UNUSED __attribute__((unused))
+#else
+#define REX_LIKELY_IF(...) if (!!(__VA_ARGS__)) [[likely]]
+#define REX_UNLIKELY_IF(...) if (!!(__VA_ARGS__)) [[unlikely]]
+#define REX_MAYBE_UNUSED
+#endif
+
+#if REX_COMPILER_MSVC || REX_COMPILER_CLANG || REX_COMPILER_GNUC
+#define REX_RESTRICT __restrict
+#else
+#define REX_RESTRICT
+#endif
+
+#define REX_HOST_CACHE_LINE_SIZE 64
+
 namespace rex::platform {
 
 #if REX_PLATFORM_WIN32

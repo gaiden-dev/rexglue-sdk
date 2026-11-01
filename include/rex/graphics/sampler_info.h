@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -9,10 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#pragma once
-
 #include <rex/graphics/pipeline/shader/shader.h>
-#include <rex/graphics/xenos.h>
 
 namespace rex::graphics {
 

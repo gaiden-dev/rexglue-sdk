@@ -9,14 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
-
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 #include <rex/math.h>
-#include <rex/system/kernel_state.h>
+#include <rex/system/xtypes.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
 namespace rex::graphics::d3d12 {
@@ -37,9 +35,7 @@ std::string D3D12GraphicsSystem::name() const {
   return "Direct3D 12";
 }
 
-void D3D12GraphicsSystem::CreateProvider(bool /*with_presentation*/) {
-  // D3D12 doesn't differentiate headless vs. swapchain-capable providers;
-  // swapchains are created lazily per-window by the presenter.
+void D3D12GraphicsSystem::CreateProvider(bool with_presentation) {
   provider_ = rex::ui::d3d12::D3D12Provider::Create();
 }
 

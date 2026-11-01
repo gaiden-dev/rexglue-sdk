@@ -17,6 +17,8 @@
 
 #include <cstring>
 
+#include <rex/perf/counter.h>
+
 namespace rex::debug {
 
 // Returns true if a debugger is attached to this process.
@@ -42,6 +44,11 @@ void DebugPrint(fmt::string_view format, const Args&... args) {
 }
 
 }  // namespace rex::debug
+
+namespace rex {
+// Unqualified spelling used by code ported from xenia-canary (Profiler::Flip()).
+using perf::Profiler;
+}  // namespace rex
 
 #ifdef REXGLUE_ENABLE_PROFILING
 

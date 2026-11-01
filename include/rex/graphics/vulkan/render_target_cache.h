@@ -17,7 +17,6 @@
 #include <memory>
 #include <unordered_map>
 
-#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/vulkan/texture_cache.h>
@@ -55,7 +54,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // If VK_FORMAT_D24_UNORM_S8_UINT is not supported, this must be kD24FS8
       // even for kD24S8.
       xenos::DepthRenderTargetFormat depth_format : xenos::kDepthRenderTargetFormatBits;  // 8
-      // Linear or sRGB included if host sRGB is used.
       xenos::ColorRenderTargetFormat color_0_view_format
           : xenos::kColorRenderTargetFormatBits;  // 12
       xenos::ColorRenderTargetFormat color_1_view_format
@@ -85,7 +83,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   };
 
   VulkanRenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
-                          uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                          TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
+                          uint32_t draw_resolution_scale_y,
                           VulkanCommandProcessor& command_processor);
   ~VulkanRenderTargetCache();
 
@@ -104,10 +103,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
-  // frame for calling.
+  // frame for calling. copy_dest_info_out, if not null, receives the
+  // destination info with the format normalized to the xenos::TextureFormat
+  // the copy was actually performed with (only meaningful when a nonzero
+  // length was written).
+  // written_scaled_out: whether the data went to the scaled resolve address
+  // space rather than shared memory (native resolves don't).
   bool Resolve(const memory::Memory& memory, VulkanSharedMemory& shared_memory,
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out, reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
+               bool* written_scaled_out = nullptr);
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
@@ -115,14 +120,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
-  void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
-                                         uint32_t* color_attachment_count_out,
-                                         VkRenderingAttachmentInfo* depth_attachment,
-                                         VkRenderingAttachmentInfo* stencil_attachment) const;
 
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
   // configuration.
+  // ReXGlue: not truncated when drawn as float16 (MoltenVK SNORM16 fallback).
   bool IsFixedRG16TruncatedToMinus1To1() const {
     return GetPath() == Path::kHostRenderTargets && !color_rg16_draw_format_fallback_to_float_ &&
            !REXCVAR_GET(snorm16_render_target_full_range);
@@ -131,7 +133,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     return GetPath() == Path::kHostRenderTargets && !color_rgba16_draw_format_fallback_to_float_ &&
            !REXCVAR_GET(snorm16_render_target_full_range);
   }
-  bool gamma_render_target_as_unorm16() const { return gamma_render_target_as_unorm16_; }
 
   bool depth_unorm24_vulkan_format_supported() const {
     return depth_unorm24_vulkan_format_supported_;
@@ -159,20 +160,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
-  VkFormat GetColorOwnershipTransferVulkanFormat(
-      xenos::ColorRenderTargetFormat format,
-      xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X,
-      bool* is_integer_out = nullptr) const;
+  VkFormat GetColorOwnershipTransferVulkanFormat(xenos::ColorRenderTargetFormat format,
+                                                 bool* is_integer_out = nullptr) const;
 
  protected:
+  bool IsGammaFormatHostStorageSeparate() const override;
+
   uint32_t GetMaxRenderTargetWidth() const override;
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
 
   bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const override;
-
-  bool IsGammaFormatHostStorageSeparate() const override;
 
   void RequestPixelShaderInterlockBarrier() override;
 
@@ -202,7 +201,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     kComputeRead,
     // Resolve - copying from host render targets.
     kComputeWrite,
+    // Trace recording.
     kTransferRead,
+    // Trace playback.
     kTransferWrite,
   };
 
@@ -235,7 +236,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   static void GetEdramBufferUsageMasks(EdramBufferUsage usage, VkPipelineStageFlags& stage_mask_out,
                                        VkAccessFlags& access_mask_out);
-  bool IsColor16FormatFloatLike(xenos::ColorRenderTargetFormat format) const;
   void UseEdramBuffer(EdramBufferUsage new_usage);
   void MarkEdramBufferModified(EdramBufferModificationStatus modification_status =
                                    EdramBufferModificationStatus::kViaUnordered);
@@ -244,6 +244,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           EdramBufferModificationStatus::kViaFragmentShaderInterlock);
 
   VulkanCommandProcessor& command_processor_;
+  TraceWriter& trace_writer_;
 
   Path path_ = Path::kHostRenderTargets;
 
@@ -268,6 +269,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   std::array<VkPipeline, size_t(draw_util::ResolveCopyShaderIndex::kCount)>
       resolve_copy_pipelines_{};
+  // Unscaled variants for fully native resolves. Only created with resolution
+  // scaling, otherwise the main set is already unscaled. A separate set
+  // because the scaled shaders can't just run at 1x1, their push constants
+  // and destination address space assume the scaled resolve buffer.
+  VkPipelineLayout resolve_copy_native_pipeline_layout_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, size_t(draw_util::ResolveCopyShaderIndex::kCount)>
+      resolve_copy_native_pipelines_{};
 
   // On the fragment shader interlock path, the render pass key is used purely
   // for passing parameters to pipeline setup - there's always only one render
@@ -302,7 +310,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VulkanRenderTarget(RenderTargetKey key, VulkanRenderTargetCache& render_target_cache,
                        VkImage image, VkDeviceMemory memory, VkImageView view_depth_color,
                        VkImageView view_depth_stencil, VkImageView view_stencil,
-                       VkImageView view_srgb, VkImageView view_color_transfer_separate,
+                       VkImageView view_color_transfer_separate,
                        size_t descriptor_set_index_transfer_source)
         : RenderTarget(key),
           render_target_cache_(render_target_cache),
@@ -311,7 +319,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
           view_depth_color_(view_depth_color),
           view_depth_stencil_(view_depth_stencil),
           view_stencil_(view_stencil),
-          view_srgb_(view_srgb),
           view_color_transfer_separate_(view_color_transfer_separate),
           descriptor_set_index_transfer_source_(descriptor_set_index_transfer_source) {}
     ~VulkanRenderTarget();
@@ -373,7 +380,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     // Optional views.
     VkImageView view_depth_stencil_;
     VkImageView view_stencil_;
-    VkImageView view_srgb_;
     VkImageView view_color_transfer_separate_;
 
     // 2 sampled images for depth / stencil, 1 sampled image for color.
@@ -530,6 +536,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // as it doesn't matter in this case.
       xenos::MsaaSamples host_depth_source_msaa_samples : xenos::kMsaaSamplesBits;
       uint32_t source_resource_format : xenos::kRenderTargetFormatBits;
+      // Scale classes of the two sides. The shader bakes each side's tile
+      // size and conversion between the scale spaces.
+      uint32_t dest_scale_native : 1;
+      uint32_t source_scale_native : 1;
 
       // Last bits because this affects the pipeline layout - after sorting,
       // only change it as fewer times as possible. Depth buffers have an
@@ -644,6 +654,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // Last bit because this affects the pipeline - after sorting, only change
       // it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
+      // Dumping to the scaled EDRAM layout duplicates this native render
+      // target's guest pixels.
+      uint32_t source_scale_native : 1;
+      // source_scale_native only.
+      // Address the EDRAM buffer with the plain 1x1 tile layout.
+      uint32_t native_layout : 1;
     };
 
     DumpPipelineKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -753,31 +769,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     }
   };
 
-  struct DirectResolvePushConstants {
-    draw_util::ResolveCopyShaderConstants resolve;
-    uint32_t source_base_tiles;
-    uint32_t source_pitch_tiles;
-    uint32_t dispatch_first_tile;
-  };
-
-  struct DirectResolvePipelineKey {
-    DumpPipelineKey dump_pipeline_key;
-    draw_util::ResolveCopyShaderIndex copy_shader;
-    bool draw_resolution_scaled;
-    uint64_t packed() const {
-      return uint64_t(dump_pipeline_key.key) | (uint64_t(size_t(copy_shader)) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
-    }
-    struct Hasher {
-      size_t operator()(const DirectResolvePipelineKey& key) const {
-        return std::hash<uint64_t>{}(key.packed());
-      }
-    };
-    bool operator==(const DirectResolvePipelineKey& other_key) const {
-      return packed() == other_key.packed();
-    }
-  };
-
   // Returns the framebuffer object, or VK_NULL_HANDLE if failed to create.
   const Framebuffer* GetHostRenderTargetsFramebuffer(
       RenderPassKey render_pass_key, uint32_t pitch_tiles_at_32bpp,
@@ -801,17 +792,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
-  VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
-  bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
-                              draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
 
   // Writes contents of host render targets within rectangles from
-  // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
-  bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
-                         uint32_t dump_pitch);
+  // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_ - with the plain 1x1
+  // tile layout if native_layout is set.
+  void DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
+                         uint32_t dump_pitch, bool native_layout);
 
   bool gamma_render_target_as_unorm16_ = false;
+
+  // ReXGlue: draw k_16_16[_16_16] as float16 where SNORM16 isn't renderable (MoltenVK).
+  bool color_rg16_draw_format_fallback_to_float_ = false;
+  bool color_rgba16_draw_format_fallback_to_float_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
   bool depth_float24_round_ = false;
@@ -819,10 +811,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool msaa_2x_attachments_supported_ = false;
   bool msaa_2x_no_attachments_supported_ = false;
-  bool color_16bit_transfer_uint_formats_supported_ = true;
-  bool color_32bit_transfer_uint_formats_supported_ = true;
-  bool color_rg16_draw_format_fallback_to_float_ = false;
-  bool color_rgba16_draw_format_fallback_to_float_ = false;
 
   // VK_NULL_HANDLE if failed to create.
   std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hasher> render_passes_;
@@ -852,10 +840,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Compute pipelines for copying host render target contents to the EDRAM
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<DumpPipelineKey, VkPipeline, DumpPipelineKey::Hasher> dump_pipelines_;
-  VkPipelineLayout direct_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;
-  VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
-  std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
-      direct_resolve_pipelines_;
 
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];
@@ -866,10 +850,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
   std::vector<DumpInvocation> dump_invocations_;
-  std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
-  uint64_t direct_resolve_attempt_count_ = 0;
-  uint64_t direct_resolve_success_count_ = 0;
-  uint64_t direct_resolve_fallback_count_ = 0;
 
   // For pixel (fragment) shader interlock.
 

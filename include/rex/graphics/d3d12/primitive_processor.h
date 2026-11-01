@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -8,8 +9,6 @@
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
-
-#pragma once
 
 #include <cstdint>
 #include <deque>
@@ -27,8 +26,9 @@ class D3D12CommandProcessor;
 class D3D12PrimitiveProcessor final : public PrimitiveProcessor {
  public:
   D3D12PrimitiveProcessor(const RegisterFile& register_file, memory::Memory& memory,
-                          SharedMemory& shared_memory, D3D12CommandProcessor& command_processor)
-      : PrimitiveProcessor(register_file, memory, shared_memory),
+                          TraceWriter& trace_writer, SharedMemory& shared_memory,
+                          D3D12CommandProcessor& command_processor)
+      : PrimitiveProcessor(register_file, memory, trace_writer, shared_memory),
         command_processor_(command_processor) {}
   ~D3D12PrimitiveProcessor();
 

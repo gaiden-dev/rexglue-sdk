@@ -9,104 +9,167 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
-#include <cinttypes>
-#include <cmath>
-#include <cstring>
-#include <string_view>
-
 #include <fmt/format.h>
 
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
-#include <rex/perf/counter.h>
-#include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/packet_disassembler.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
-#include <rex/graphics/xenos.h>
+#include <rex/graphics/xenos_zpd_report.h>
 #include <rex/logging.h>
-#include <rex/math.h>
-#include <rex/memory.h>
-#include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+#if !defined(NDEBUG)
+
+#define REX_ENABLE_GPU_REG_WRITE_LOGGING 1
+#endif
+REXCVAR_DEFINE_BOOL(log_guest_driven_gpu_register_written_values, false, "Logging",
+                    "Only does anything in debug builds, if set will log every write to a gpu "
+                    "register done by a guest. Does not log writes that are done by the CP on "
+                    "its own, just ones the guest makes or instructs it to make.");
+
+REXCVAR_DEFINE_BOOL(disassemble_pm4, false, "Logging",
+                    "Only does anything in debug builds, if set will disassemble and "
+                    "log all PM4 packets sent to the CP.");
+
+REXCVAR_DEFINE_BOOL(log_ringbuffer_kickoff_initiator_bts, false, "Logging",
+                    "Only does anything in debug builds, if set will log the pseudo-stacktrace "
+                    "of the guest thread that wrote the new read position.");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
-                    "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+                    "Refresh state of memory pages to enable gpu written data. (Use "
+                    "for 'Team Ninja' Games to fix missing character models)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
+REXCVAR_DEFINE_STRING(occlusion_query, "fast", "GPU",
+                      "Controls hardware occlusion query behavior for EVENT_WRITE_ZPD.\n"
+                      "Used for effects like lens flares, object culling, and auto-exposure.\n"
+                      " fake: Write a fake result without asking the GPU. Safe for most games,\n"
+                      "       though some effects may look slightly wrong.\n"
+                      " fast: Ask the GPU but don't wait for the answer. Writes a cached\n"
+                      "       result immediately and updates it when the GPU catches up.\n"
+                      "       Cached results bias toward visible when guessing. (default)\n"
+                      " fast-alt: Variant of fast mode that keeps cached zero results for\n"
+                      "           unresolved reports. May improve effects relying on precise\n"
+                      "           visibility, but may be less stable for occlusion culling.\n"
+                      " strict: Ask the GPU and wait for the real result before continuing.\n"
+                      "         Most accurate, but may be somewhat less performant.")
+    .allowed({"fake", "fast", "fast-alt", "strict"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(viz_query, false, "GPU",
+                    "Enables VIZ_QUERY (VIZ) visibility tests for draws with a VIZ token. "
+                    "VIZ is visibility testing for conditional rendering / predication.\n"
+                    "Titles mostly use it to combat overdraw, but it can also be used for "
+                    "post-process effects like lens flares. When enabled, binary occlusion "
+                    "queries feed predicates which, when available, can skip draws that "
+                    "aren't visible.\n"
+                    "Since VIZ is primarily a GPU mechanism, most readback sync is avoided.");
+
+REXCVAR_DEFINE_BOOL(viz_query_log, false, "GPU", "Log VIZ query decision and summary stats.");
 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
-                      " none: Disable readback (default)\n"
-                      " fast: Read previous frame (delayed, copy every frame)\n"
-                      " some: Read previous frame (delayed, copy on cache miss)\n"
-                      " full: Immediate sync readback (accurate but stalls)")
-    .allowed({"none", "fast", "some", "full"})
+                      " fast: Read from previous frame (1 frame delay, no GPU stall, slight "
+                      "performance hit)\n"
+                      " full: Wait for GPU to finish (accurate but slow, GPU-CPU sync stall)\n"
+                      " none: Disable readback completely (some games render better without it)")
+    .allowed({"none", "fast", "full"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
-                    "When draw resolution scaling is active, sample from the center of each "
-                    "scaled block during resolve readback downscale")
+                    "When resolution scaling and readback resolve are enabled, resolve "
+                    "downscaling keeps one supersample out of each scaled pixel block.\n"
+                    "This selects the center of the block instead of the top-left corner, "
+                    "which can be closer to where the GPU would have sampled the original "
+                    "pixel, and can help with thin features and edge coverage.\n"
+                    "Both choices give a real rendered value, but they can disagree where "
+                    "geometry edges fall inside a pixel block.\n"
+                    "This matters when the CPU reads the resolve as data instead of an image, "
+                    "such as for gamma correction readbacks, occlusion checks, and GPU buffers "
+                    "reused later in the frame.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
-                    "Enable CPU readback of shader memexport writes for guest memory "
-                    "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
-                    "Use fast double-buffered memexport readback when possible, with "
-                    "automatic fallback to full synchronous readback")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
-                     "Fake sample count for occlusion queries")
-    .range(1, 100000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
-                    "Compile shaders and create pipelines asynchronously in background "
-                    "threads. This reduces stutter but may cause brief visual artifacts while "
-                    "pipelines are being prepared.")
+REXCVAR_DEFINE_BOOL(readback_memexport, false, "GPU",
+                    "Read data written by memory export in shaders on the CPU. "
+                    "This may be needed in some games (but many only access exported data on "
+                    "the GPU, and this flag isn't needed to handle such behavior), but causes "
+                    "mid-frame synchronization, so it has a huge performance impact.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
 
-using namespace rex::graphics::xenos;
-
-namespace {
-
-ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
-  if (value == "fast") {
-    return ReadbackResolveMode::kFast;
+// This should be written completely differently with support for different
+// types.
+void SaveGPUSetting(GPUSetting setting, uint64_t value) {
+  switch (setting) {
+    case GPUSetting::ClearMemoryPageState:
+      REXCVAR_SET(clear_memory_page_state, static_cast<bool>(value));
+      break;
+    case GPUSetting::ReadbackMemexport:
+      REXCVAR_SET(readback_memexport, static_cast<bool>(value));
+      break;
   }
-  if (value == "some") {
-    return ReadbackResolveMode::kSome;
-  }
-  if (value == "full") {
-    return ReadbackResolveMode::kFull;
-  }
-  return ReadbackResolveMode::kDisabled;
 }
 
-}  // namespace
+bool GetGPUSetting(GPUSetting setting) {
+  switch (setting) {
+    case GPUSetting::ClearMemoryPageState:
+      return REXCVAR_GET(clear_memory_page_state);
+    case GPUSetting::ReadbackMemexport:
+      return REXCVAR_GET(readback_memexport);
+  }
+  return false;
+}
+
+ReadbackResolveMode GetReadbackResolveMode() {
+  const std::string& mode = REXCVAR_GET(readback_resolve);
+  if (mode == "full") {
+    return ReadbackResolveMode::kFull;
+  } else if (mode == "none") {
+    return ReadbackResolveMode::kDisabled;
+  } else {
+    // Default to "fast" for any unrecognized value
+    return ReadbackResolveMode::kFast;
+  }
+}
+
+void SetReadbackResolveMode(const std::string& mode) {
+  REXCVAR_SET(readback_resolve, mode);
+}
+
+ZPDMode GetZPDMode() {
+  const std::string& mode = REXCVAR_GET(occlusion_query);
+  if (mode == "fake") {
+    return ZPDMode::kFake;
+  } else if (mode == "strict") {
+    return ZPDMode::kStrict;
+  } else if (mode == "fast-alt") {
+    return ZPDMode::kFastAlt;
+  }
+  return ZPDMode::kFast;
+}
+
+void SetZPDMode(const std::string& mode) {
+  REXCVAR_SET(occlusion_query, mode);
+}
+
+using namespace rex::graphics::xenos;
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
                                    system::KernelState* kernel_state)
-    : memory_(graphics_system->memory()),
+    : reader_(nullptr, 0),
+      memory_(graphics_system->memory()),
       kernel_state_(kernel_state),
       graphics_system_(graphics_system),
       register_file_(graphics_system_->register_file()),
+      trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
@@ -148,6 +211,8 @@ bool CommandProcessor::Initialize() {
 }
 
 void CommandProcessor::Shutdown() {
+  EndTracing();
+
   worker_running_ = false;
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
@@ -155,7 +220,83 @@ void CommandProcessor::Shutdown() {
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
-                                               uint32_t title_id, bool blocking) {}
+                                               uint32_t title_id, bool blocking,
+                                               std::function<void()> completion_callback) {
+  if (completion_callback) {
+    completion_callback();
+  }
+}
+
+void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
+  if (trace_state_ == TraceState::kStreaming) {
+    REXGPU_ERROR("Streaming trace; cannot also trace frame.");
+    return;
+  }
+  if (trace_state_ == TraceState::kSingleFrame) {
+    REXGPU_ERROR("Frame trace already pending; ignoring.");
+    return;
+  }
+  trace_state_ = TraceState::kSingleFrame;
+  trace_frame_path_ = root_path;
+}
+
+void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
+  if (trace_state_ == TraceState::kStreaming) {
+    REXGPU_ERROR("Streaming already active; ignoring request.");
+    return;
+  }
+  if (trace_state_ == TraceState::kSingleFrame) {
+    REXGPU_ERROR("Frame trace pending; ignoring streaming request.");
+    return;
+  }
+  // Streaming starts on the next primary buffer execute.
+  trace_state_ = TraceState::kStreaming;
+  trace_stream_path_ = root_path;
+}
+
+void CommandProcessor::EndTracing() {
+  if (!trace_writer_.is_open()) {
+    return;
+  }
+  assert_true(trace_state_ == TraceState::kStreaming);
+  trace_state_ = TraceState::kDisabled;
+  trace_writer_.Close();
+}
+
+void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
+                                        uint32_t register_count, bool execute_callbacks) {
+  if (first_register > RegisterFile::kRegisterCount ||
+      RegisterFile::kRegisterCount - first_register < register_count) {
+    REXGPU_WARN(
+        "CommandProcessor::RestoreRegisters out of bounds (0x{:X} registers "
+        "starting with 0x{:X}, while a total of 0x{:X} registers are stored)",
+        register_count, first_register, RegisterFile::kRegisterCount);
+    if (first_register > RegisterFile::kRegisterCount) {
+      return;
+    }
+    register_count =
+        std::min(uint32_t(RegisterFile::kRegisterCount) - first_register, register_count);
+  }
+  if (execute_callbacks) {
+    for (uint32_t i = 0; i < register_count; ++i) {
+      WriteRegister(first_register + i, register_values[i]);
+    }
+  } else {
+    std::memcpy(register_file_->values + first_register, register_values,
+                sizeof(uint32_t) * register_count);
+  }
+}
+
+void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
+                                        const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
+                                        uint32_t new_gamma_ramp_rw_component) {
+  std::memcpy(gamma_ramp_256_entry_table_, new_gamma_ramp_256_entry_table,
+              sizeof(reg::DC_LUT_30_COLOR) * 256);
+  std::memcpy(gamma_ramp_pwl_rgb_, new_gamma_ramp_pwl_rgb, sizeof(reg::DC_LUT_PWL_DATA) * 3 * 128);
+  gamma_ramp_rw_component_ = new_gamma_ramp_rw_component;
+  OnGammaRamp256EntryTableValueWritten();
+  OnGammaRampPWLValueWritten();
+}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
   if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
@@ -168,26 +309,6 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
 void CommandProcessor::ClearCaches() {}
 
 void CommandProcessor::InvalidateGpuMemory() {}
-
-ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
-    bool legacy_readback_resolve_enabled) const {
-  ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
-  bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
-                                      rex::cvar::HasNonDefaultValue("readback_resolve");
-  if (shared_mode_overrides_legacy) {
-    return shared_mode;
-  }
-  return legacy_readback_resolve_enabled ? ReadbackResolveMode::kFast
-                                         : ReadbackResolveMode::kDisabled;
-}
-
-bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
-  if (legacy_readback_memexport_cvar_name_ &&
-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
-    return legacy_backend_flag;
-  }
-  return REXCVAR_GET(readback_memexport);
-}
 
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
   if (swap_post_effect_desired_ == swap_post_effect) {
@@ -221,12 +342,12 @@ void CommandProcessor::WorkerThreadMain() {
       do {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > 500) {
-          const int wait_time_ms = 5;
+          constexpr int wait_time_ms = 2;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+        } else {
+          rex::thread::MaybeYield();
         }
-
-        rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
@@ -243,9 +364,11 @@ void CommandProcessor::WorkerThreadMain() {
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
+    // Keep in mind that the gpu also updates the cpu-side copy if the write
+    // pointer and read pointer would be equal
     if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
+      rex::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                    read_ptr_index_);
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -279,7 +402,7 @@ void CommandProcessor::Resume() {
   worker_thread_->thread()->Resume();
 }
 
-bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
+bool CommandProcessor::Save(stream::ByteStream* stream) {
   assert_true(paused_);
 
   stream->Write<uint32_t>(primary_buffer_ptr_);
@@ -292,7 +415,7 @@ bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
   return true;
 }
 
-bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
+bool CommandProcessor::Restore(stream::ByteStream* stream) {
   assert_true(paused_);
 
   primary_buffer_ptr_ = stream->Read<uint32_t>();
@@ -306,15 +429,23 @@ bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
 }
 
 bool CommandProcessor::SetupContext() {
+  ResetVIZState();
+  ResetZPDState();
   return true;
 }
 
-void CommandProcessor::ShutdownContext() {}
+void CommandProcessor::ShutdownContext() {
+  ResetVIZState();
+  ResetZPDState();
+}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+
+  std::memset(kernel_state_->memory()->TranslatePhysical(primary_buffer_ptr_), 0,
+              primary_buffer_size_);
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
@@ -327,38 +458,76 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
 }
 
+REX_NOINLINE REX_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {
+  // ReXGlue: no guest pseudo-stacktrace (statically recompiled guest code).
+  REXGPU_DEBUG("Updating read ptr to {}", value);
+}
+
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
+  REX_UNLIKELY_IF(REXCVAR_GET(log_ringbuffer_kickoff_initiator_bts)) {
+    LogKickoffInitator(value);
+  }
   write_ptr_index_ = value;
-  write_ptr_index_event_->Set();
+  write_ptr_index_event_->SetBoostPriority();
 }
 
-uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
-  if (index < RegisterFile::kRegisterCount) {
-    return register_file_->values[index];
-  }
-  auto it = extended_register_values_.find(index);
-  return it != extended_register_values_.end() ? it->second : 0;
-}
+void CommandProcessor::LogRegisterSet(uint32_t register_index, uint32_t value) {
+#if REX_ENABLE_GPU_REG_WRITE_LOGGING == 1
+  if (REXCVAR_GET(log_guest_driven_gpu_register_written_values) &&
+      logging::ShouldLog(LogLevel::Debug)) {
+    const RegisterInfo* reginfo = RegisterFile::GetRegisterInfo(register_index);
 
-void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
-  RegisterFile& regs = *register_file_;
-  if (index >= RegisterFile::kRegisterCount) {
-    auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
-    (void)it;
-    if (inserted) {
-      REXGPU_WARN(
-          "CommandProcessor::WriteRegister index out of bounds: {} (stored as extended register)",
-          index);
+    if (!reginfo) {
+      REXGPU_DEBUG("Unknown_Reg{:04X} <- {:08X}\n", register_index, value);
+    } else {
+      REXGPU_DEBUG("{} <- {:08X}\n", reginfo->name, value);
     }
-    return;
   }
+#endif
+}
 
-  // Volatile for the WAIT_REG_MEM loop.
-  const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
-    REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+void CommandProcessor::LogRegisterSets(uint32_t base_register_index, const uint32_t* values,
+                                       uint32_t n_values) {
+#if REX_ENABLE_GPU_REG_WRITE_LOGGING == 1
+  if (REXCVAR_GET(log_guest_driven_gpu_register_written_values) &&
+      logging::ShouldLog(LogLevel::Debug)) {
+    auto target = logging::internal::GetThreadBuffer();
+
+    auto target_ptr = target.first;
+
+    size_t total_size = 0;
+
+    size_t rem_size = target.second;
+
+    for (uint32_t i = 0; i < n_values; ++i) {
+      uint32_t register_index = base_register_index + i;
+
+      uint32_t value = rex::load_and_swap<uint32_t>(&values[i]);
+
+      const RegisterInfo* reginfo = RegisterFile::GetRegisterInfo(register_index);
+
+      if (!reginfo) {
+        auto tmpres = fmt::format_to_n(target_ptr, rem_size, "Unknown_Reg{:04X} <- {:08X}\n",
+                                       register_index, value);
+        target_ptr = tmpres.out;
+        rem_size -= tmpres.size;
+        total_size += tmpres.size;
+
+      } else {
+        auto tmpres =
+            fmt::format_to_n(target_ptr, rem_size, "{} <- {:08X}\n", reginfo->name, value);
+        rem_size -= tmpres.size;
+        target_ptr = tmpres.out;
+        total_size += tmpres.size;
+      }
+    }
+    logging::internal::AppendLogLine(LogLevel::Debug, 'd', total_size);
   }
+#endif
+}
 
+void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index, uint32_t value) {
+  RegisterFile& regs = *register_file_;
   // Scratch register writeback.
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
     uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
@@ -366,15 +535,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      rex::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
     }
   } else {
     switch (index) {
       // If this is a COHER register, set the dirty flag.
-      // This will block the command processor the next time it WAIT_REG_MEMs
+      // This will block the command processor the next time it WAIT_MEM_REGs
       // and allow us to synchronize the memory.
       case XE_GPU_REG_COHER_STATUS_HOST: {
-        const_cast<volatile uint32_t&>(regs.values[index]) |= UINT32_C(0x80000000);
+        regs.values[index] |= UINT32_C(0x80000000);
       } break;
 
       case XE_GPU_REG_DC_LUT_RW_INDEX: {
@@ -490,57 +659,87 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     }
   }
 }
+void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // chrispy: rearrange check order, place set after checks
 
+  if (REX_LIKELY(index < RegisterFile::kRegisterCount)) {
+    register_file_->values[index] = value;
+
+    // quick pre-test
+    // todo: figure out just how unlikely this is. if very (it ought to be,
+    // theres a ton of registers other than these) make this predicate
+    // branchless and mark with unlikely, then make HandleSpecialRegisterWrite
+    // noinline yep, its very unlikely. these ORS here are meant to be bitwise
+    // ors, so that we do not do branching evaluation of the conditions (we will
+    // almost always take all of the branches)
+
+    unsigned expr = (index - XE_GPU_REG_SCRATCH_REG0 < 8) |
+                    (index == XE_GPU_REG_COHER_STATUS_HOST) |
+                    ((index - XE_GPU_REG_DC_LUT_RW_INDEX) <=
+                     (XE_GPU_REG_DC_LUT_30_COLOR - XE_GPU_REG_DC_LUT_RW_INDEX));
+    // chrispy: reordered for msvc branch probability (assumes if is taken and
+    // else is not)
+    if (REX_LIKELY(expr == 0)) {
+      REX_MSVC_REORDER_BARRIER();
+
+    } else {
+      HandleSpecialRegisterWrite(index, value);
+    }
+  } else {
+    // ReXGlue: keep out-of-range writes so packets that read them back still work.
+    if (extended_register_values_.insert_or_assign(index, value).second) {
+      REXGPU_WARN("CommandProcessor::WriteRegister index out of bounds: {}", index);
+    }
+    return;
+  }
+}
+
+uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+  if (index < RegisterFile::kRegisterCount) {
+    return register_file_->values[index];
+  }
+  auto it = extended_register_values_.find(index);
+  return it != extended_register_values_.end() ? it->second : 0;
+}
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
   for (uint32_t i = 0; i < num_registers; ++i) {
-    uint32_t data = memory::load_and_swap<uint32_t>(base + i);
-    WriteRegister(start_index + i, data);
+    uint32_t data = rex::load_and_swap<uint32_t>(base + i);
+    this->WriteRegister(start_index + i, data);
   }
 }
 
-void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
+void CommandProcessor::WriteRegisterRangeFromRing(rex::RingBuffer* ring, uint32_t base,
                                                   uint32_t num_registers) {
-  if (!num_registers) {
-    return;
+  for (uint32_t i = 0; i < num_registers; ++i) {
+    uint32_t data = ring->ReadAndSwap<uint32_t>();
+    WriteRegister(base + i, data);
   }
-  memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
-  if (range.first_length != 0) {
-    uint32_t first_count = uint32_t(range.first_length / sizeof(uint32_t));
-    WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.first)),
-                          first_count);
-    base += first_count;
-  }
-  if (range.second_length != 0) {
-    WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(range.second)),
-                          uint32_t(range.second_length / sizeof(uint32_t)));
-  }
-  ring->EndRead(range);
 }
 
-void CommandProcessor::WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base,
-                                             uint32_t num_registers) {
-  WriteRegisterRangeFromRing(ring, base + 0x4000, num_registers);
+void CommandProcessor::WriteALURangeFromRing(rex::RingBuffer* ring, uint32_t base,
+                                             uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4000, num_times);
 }
 
-void CommandProcessor::WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_t base,
-                                               uint32_t num_registers) {
-  WriteRegisterRangeFromRing(ring, base + 0x4800, num_registers);
+void CommandProcessor::WriteFetchRangeFromRing(rex::RingBuffer* ring, uint32_t base,
+                                               uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4800, num_times);
 }
 
-void CommandProcessor::WriteBoolRangeFromRing(memory::RingBuffer* ring, uint32_t base,
-                                              uint32_t num_registers) {
-  WriteRegisterRangeFromRing(ring, base + 0x4900, num_registers);
+void CommandProcessor::WriteBoolRangeFromRing(rex::RingBuffer* ring, uint32_t base,
+                                              uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4900, num_times);
 }
 
-void CommandProcessor::WriteLoopRangeFromRing(memory::RingBuffer* ring, uint32_t base,
-                                              uint32_t num_registers) {
-  WriteRegisterRangeFromRing(ring, base + 0x4908, num_registers);
+void CommandProcessor::WriteLoopRangeFromRing(rex::RingBuffer* ring, uint32_t base,
+                                              uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x4908, num_times);
 }
 
-void CommandProcessor::WriteREGISTERSRangeFromRing(memory::RingBuffer* ring, uint32_t base,
-                                                   uint32_t num_registers) {
-  WriteRegisterRangeFromRing(ring, base + 0x2000, num_registers);
+void CommandProcessor::WriteREGISTERSRangeFromRing(rex::RingBuffer* ring, uint32_t base,
+                                                   uint32_t num_times) {
+  WriteRegisterRangeFromRing(ring, base + 0x2000, num_times);
 }
 
 void CommandProcessor::WriteALURangeFromMem(uint32_t start_index, uint32_t* base,
@@ -567,7 +766,14 @@ void CommandProcessor::WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t
                                                   uint32_t num_registers) {
   WriteRegistersFromMem(start_index + 0x2000, base, num_registers);
 }
-
+REX_NOINLINE
+void CommandProcessor::WriteOneRegisterFromRing(uint32_t base, uint32_t num_times) {
+  for (uint32_t m = 0; m < num_times; m++) {
+    uint32_t reg_data = reader_.ReadAndSwap<uint32_t>();
+    uint32_t target_index = base;
+    WriteRegister(target_index, reg_data);
+  }
+}
 void CommandProcessor::MakeCoherent() {
   SCOPE_profile_cpu_f("gpu");
 
@@ -580,7 +786,6 @@ void CommandProcessor::MakeCoherent() {
   // https://web.archive.org/web/20160711162346/https://amd-dev.wpengine.netdna-cdn.com/wordpress/media/2013/10/R6xx_R7xx_3D.pdf
   // https://cgit.freedesktop.org/xorg/driver/xf86-video-radeonhd/tree/src/r6xx_accel.c?id=3f8b6eccd9dba116cc4801e7f80ce21a879c67d2#n454
 
-  // Volatile because this may be called from the WAIT_REG_MEM loop.
   volatile uint32_t* regs_volatile = register_file_->values;
   auto status_host = rex::memory::Reinterpret<reg::COHER_STATUS_HOST>(
       uint32_t(regs_volatile[XE_GPU_REG_COHER_STATUS_HOST]));
@@ -601,1014 +806,858 @@ void CommandProcessor::MakeCoherent() {
   }
 
   // TODO(benvanik): notify resource cache of base->size and type.
-  REXGPU_TRACE("Make {:08X} -> {:08X} ({}b) coherent, action = {}", base_host,
-               base_host + size_host, size_host, action);
+  REXGPU_INFO("Make {:08X} -> {:08X} ({}b) coherent, action = {}", base_host, base_host + size_host,
+              size_host, action);
 
   // Mark coherent.
   regs_volatile[XE_GPU_REG_COHER_STATUS_HOST] = 0;
 }
 
-void CommandProcessor::PrepareForWait() {}
+void CommandProcessor::PrepareForWait() {
+  trace_writer_.Flush();
+  // Poll once if the guest is likely waiting on query progress. ZPD has a
+  // retire handle. VIZ only has pending backend resolves.
+  if (zpd_pending_retire_handle_ != kInvalidReportHandle || !viz_resolves_in_flight_.empty()) {
+    PollCompletedSubmission();
+  }
+  // Give strict ZPD a chance to retire a pending report before the guest's
+  // loop polls again.
+  PumpPendingRetire();
+}
 
 void CommandProcessor::ReturnFromWait() {}
 
-uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
-  SCOPE_profile_cpu_f("gpu");
+void CommandProcessor::InitializeTrace() {
+  // Write the initial register values, to be loaded directly into the
+  // RegisterFile since all registers, including those that may have side
+  // effects on setting, will be saved.
+  trace_writer_.WriteRegisters(0, reinterpret_cast<const uint32_t*>(register_file_->values),
+                               RegisterFile::kRegisterCount, false);
 
-  // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
-  reader.set_read_offset(read_index * sizeof(uint32_t));
-  reader.set_write_offset(write_index * sizeof(uint32_t));
-  do {
-    if (!ExecutePacket(&reader)) {
-      // This probably should be fatal - but we're going to continue anyways.
-      REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
-      assert_always();
-      break;
+  trace_writer_.WriteGammaRamp(gamma_ramp_256_entry_table(), gamma_ramp_pwl_rgb(),
+                               gamma_ramp_rw_component_);
+}
+
+void CommandProcessor::BeginVIZQuery(uint32_t id) {
+  // Any open segment belongs to a previous slot sequence.
+  if (viz_segment_.active) {
+    CloseVIZSegment();
+  }
+
+  VIZSlot& slot = viz_slots_[id];
+  ++viz_stats_.queries_begun;
+
+  const uint64_t generation = slot.slot_sequence_id + 1;
+  slot = {};
+  slot.slot_sequence_id = generation;
+  slot.has_result = false;
+  slot.active = true;
+}
+
+void CommandProcessor::EndVIZQuery(uint32_t id) {
+  VIZSlot& slot = viz_slots_[id];
+  const uint64_t generation = slot.slot_sequence_id;
+  ++viz_stats_.queries_ended;
+
+  if (viz_segment_.active && viz_segment_.slot_id == id &&
+      viz_segment_.slot_sequence_id == generation) {
+    CloseVIZSegment();
+  }
+  slot.active = false;
+
+  if (slot.has_result) {
+    return;
+  }
+
+  if (!slot.draw_seen) {
+    // No survey draw ever reached the backend, a real not-visible.
+    ResolveVIZ(id, false);
+    return;
+  }
+
+  TryResolveVIZ(id);
+}
+
+void CommandProcessor::ResolveVIZ(uint32_t id, bool visible) {
+  // Both callers check has_result for the sequence.
+  VIZSlot& slot = viz_slots_[id];
+  slot.has_result = true;
+  slot.visible = visible;
+
+  if (visible) {
+    ++viz_stats_.resolved_visible;
+  } else {
+    ++viz_stats_.resolved_hidden;
+  }
+}
+
+void CommandProcessor::UpdateVIZSegment() {
+  uint32_t id = 0;
+  uint64_t generation = 0;
+  if (!REXCVAR_GET(viz_query) || !GetActiveVIZQuery(id, generation)) {
+    return;
+  }
+
+  if (viz_segment_.active) {
+    if (viz_segment_.slot_id == id && viz_segment_.slot_sequence_id == generation) {
+      return;
     }
-  } while (reader.read_count());
+    CloseVIZSegment();
+  }
 
-  OnPrimaryBufferEnd();
-
-  return write_index;
-}
-
-void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
-
-  // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
-  reader.set_write_offset(count * sizeof(uint32_t));
-  do {
-    if (!ExecutePacket(&reader)) {
-      // Return up a level if we encounter a bad packet.
-      REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
-      assert_always();
-      break;
+  VIZSlot& slot = viz_slots_[id];
+  const QueryOpenResult open_result = OpenVIZQuery(id, generation);
+  if (open_result != QueryOpenResult::kOpened) {
+    // Nothing measured the draw, so the sequence stays visible.
+    if (!slot.has_fallback) {
+      slot.has_fallback = true;
+      ++viz_stats_.fallback_sequences;
     }
-  } while (reader.read_count());
+    return;
+  }
+
+  if (slot.has_segments) {
+    ++viz_stats_.segment_splits;
+  }
+  slot.has_segments = true;
+  viz_segment_.slot_id = id;
+  viz_segment_.slot_sequence_id = generation;
+  viz_segment_.active = true;
 }
 
-void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
-  // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
-  reader.set_write_offset(count * sizeof(uint32_t));
-  do {
-    if (!ExecutePacket(&reader)) {
-      REXGPU_ERROR("**** ExecutePacket: Failed to execute packet.");
-      assert_always();
-      break;
+void CommandProcessor::CloseVIZSegment() {
+  if (!viz_segment_.active) {
+    return;
+  }
+
+  const uint32_t id = viz_segment_.slot_id;
+  const uint64_t generation = viz_segment_.slot_sequence_id;
+  viz_segment_ = {};
+
+  VIZSlot& slot = viz_slots_[id];
+  if (!CloseVIZQuery(id, generation)) {
+    // The segment is lost but its draws ran, so the sequence stays visible.
+    if (!slot.has_fallback) {
+      slot.has_fallback = true;
+      ++viz_stats_.fallback_sequences;
     }
-  } while (reader.read_count());
+    return;
+  }
+
+  ++slot.pending_segments;
 }
 
-bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-  const uint32_t packet = reader->ReadAndSwap<uint32_t>();
-  const uint32_t packet_type = packet >> 30;
-  if (packet == 0) {
-    return true;
+void CommandProcessor::OnVIZResolved(uint32_t id, uint64_t generation, bool visible) {
+  VIZSlot& slot = viz_slots_[id];
+  if (slot.slot_sequence_id != generation) {
+    ++viz_stats_.stale_resolves;
+    return;
   }
 
-  if (packet == 0xCDCDCDCD) {
-    REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+  if (slot.pending_segments) {
+    --slot.pending_segments;
   }
 
-  switch (packet_type) {
-    case 0x00:
-      return ExecutePacketType0(reader, packet);
-    case 0x01:
-      return ExecutePacketType1(reader, packet);
-    case 0x02:
-      return ExecutePacketType2(reader, packet);
-    case 0x03:
-      return ExecutePacketType3(reader, packet);
-    default:
-      assert_unhandled_case(packet_type);
-      return false;
-  }
+  slot.accumulated_visible |= visible;
+  TryResolveVIZ(id);
 }
 
-bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
-  // Type-0 packet.
-  // Write count registers in sequence to the registers starting at
-  // (base_index << 2).
-
-  uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-  if (reader->read_count() < count * sizeof(uint32_t)) {
-    REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
-                 reader->read_count(), count * sizeof(uint32_t));
-    return false;
+void CommandProcessor::TryResolveVIZ(uint32_t id) {
+  const VIZSlot& slot = viz_slots_[id];
+  // Neither answer resolves while the query is open or segments are still
+  // pending. A fallback also blocks not-visible, since part of the query was
+  // never measured.
+  if (slot.has_result || slot.active || slot.pending_segments != 0 || !slot.has_segments ||
+      (!slot.accumulated_visible && slot.has_fallback)) {
+    return;
   }
 
-  uint32_t base_index = (packet & 0x7FFF);
-  uint32_t write_one_reg = (packet >> 15) & 0x1;
-  for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+  ResolveVIZ(id, slot.accumulated_visible);
+}
+
+void CommandProcessor::ArmVIZPredicate(uint32_t id, uint64_t generation, uint32_t query_index,
+                                       bool uses_interlock_counter) {
+  VIZSlot& slot = viz_slots_[id];
+
+  assert_true(slot.predicate_state == VIZSlot::PredicateState::kNone);
+  assert_true(slot.slot_sequence_id == generation);
+  slot.predicate_query_index = query_index;
+  slot.predicate_uses_interlock_counter = uses_interlock_counter;
+  slot.predicate_state = VIZSlot::PredicateState::kArmed;
+}
+
+bool CommandProcessor::CanArmVIZPredicate(uint32_t id, uint64_t generation) const {
+  const VIZSlot& slot = viz_slots_[id];
+  return slot.slot_sequence_id == generation &&
+         slot.predicate_state == VIZSlot::PredicateState::kNone;
+}
+
+void CommandProcessor::DisarmVIZPredicate(uint32_t id, uint64_t generation) {
+  VIZSlot& slot = viz_slots_[id];
+  assert_true(slot.slot_sequence_id == generation);
+  slot.predicate_query_index = UINT32_MAX;
+  slot.predicate_uses_interlock_counter = false;
+  slot.predicate_state = VIZSlot::PredicateState::kBlocked;
+}
+
+const CommandProcessor::VIZSlot* CommandProcessor::GetVIZPredicate() const {
+  if (!viz_predicate_draw_.active) {
+    return nullptr;
   }
 
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet) {
-  // Type-1 packet.
-  // Contains two registers of data. Type-0 should be more common.
-  uint32_t reg_index_1 = packet & 0x7FF;
-  uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
-  uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
-  uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
-  WriteRegister(reg_index_1, reg_data_1);
-  WriteRegister(reg_index_2, reg_data_2);
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet) {
-  // Type-2 packet.
-  // No-op. Do nothing.
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
-  // Type-3 packet.
-  uint32_t opcode = (packet >> 8) & 0x7F;
-  uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-  auto data_start_offset = reader->read_offset();
-
-  if (reader->read_count() < count * sizeof(uint32_t)) {
-    REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
-                 reader->read_count(), count * sizeof(uint32_t));
-    return false;
+  const VIZSlot& slot = viz_slots_[viz_predicate_draw_.slot_id];
+  if (slot.predicate_state != VIZSlot::PredicateState::kArmed) {
+    return nullptr;
   }
 
-  // & 1 == predicate - when set, we do bin check to see if we should execute
-  // the packet. Only type 3 packets are affected.
-  // We also skip predicated swaps, as they are never valid (probably?).
-  if (packet & 1) {
-    bool any_pass = (bin_select_ & bin_mask_) != 0;
-    if (!any_pass || opcode == PM4_XE_SWAP) {
-      reader->AdvanceRead(count * sizeof(uint32_t));
-      return true;
-    }
-  }
-
-  bool result = false;
-  switch (opcode) {
-    case PM4_ME_INIT:
-      result = ExecutePacketType3_ME_INIT(reader, packet, count);
-      break;
-    case PM4_NOP:
-      result = ExecutePacketType3_NOP(reader, packet, count);
-      break;
-    case PM4_INTERRUPT:
-      result = ExecutePacketType3_INTERRUPT(reader, packet, count);
-      break;
-    case PM4_XE_SWAP:
-      result = ExecutePacketType3_XE_SWAP(reader, packet, count);
-      break;
-    case PM4_INDIRECT_BUFFER:
-    case PM4_INDIRECT_BUFFER_PFD:
-      result = ExecutePacketType3_INDIRECT_BUFFER(reader, packet, count);
-      break;
-    case PM4_WAIT_REG_MEM:
-      result = ExecutePacketType3_WAIT_REG_MEM(reader, packet, count);
-      break;
-    case PM4_REG_RMW:
-      result = ExecutePacketType3_REG_RMW(reader, packet, count);
-      break;
-    case PM4_REG_TO_MEM:
-      result = ExecutePacketType3_REG_TO_MEM(reader, packet, count);
-      break;
-    case PM4_MEM_WRITE:
-      result = ExecutePacketType3_MEM_WRITE(reader, packet, count);
-      break;
-    case PM4_COND_WRITE:
-      result = ExecutePacketType3_COND_WRITE(reader, packet, count);
-      break;
-    case PM4_EVENT_WRITE:
-      result = ExecutePacketType3_EVENT_WRITE(reader, packet, count);
-      break;
-    case PM4_EVENT_WRITE_SHD:
-      result = ExecutePacketType3_EVENT_WRITE_SHD(reader, packet, count);
-      break;
-    case PM4_EVENT_WRITE_EXT:
-      result = ExecutePacketType3_EVENT_WRITE_EXT(reader, packet, count);
-      break;
-    case PM4_EVENT_WRITE_ZPD:
-      result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
-      break;
-    case PM4_DRAW_INDX:
-      result = ExecutePacketType3_DRAW_INDX(reader, packet, count);
-      break;
-    case PM4_DRAW_INDX_2:
-      result = ExecutePacketType3_DRAW_INDX_2(reader, packet, count);
-      break;
-    case PM4_SET_CONSTANT:
-      result = ExecutePacketType3_SET_CONSTANT(reader, packet, count);
-      break;
-    case PM4_SET_CONSTANT2:
-      result = ExecutePacketType3_SET_CONSTANT2(reader, packet, count);
-      break;
-    case PM4_LOAD_ALU_CONSTANT:
-      result = ExecutePacketType3_LOAD_ALU_CONSTANT(reader, packet, count);
-      break;
-    case PM4_SET_SHADER_CONSTANTS:
-      result = ExecutePacketType3_SET_SHADER_CONSTANTS(reader, packet, count);
-      break;
-    case PM4_IM_LOAD:
-      result = ExecutePacketType3_IM_LOAD(reader, packet, count);
-      break;
-    case PM4_IM_LOAD_IMMEDIATE:
-      result = ExecutePacketType3_IM_LOAD_IMMEDIATE(reader, packet, count);
-      break;
-    case PM4_INVALIDATE_STATE:
-      result = ExecutePacketType3_INVALIDATE_STATE(reader, packet, count);
-      break;
-    case PM4_VIZ_QUERY:
-      result = ExecutePacketType3_VIZ_QUERY(reader, packet, count);
-      break;
-
-    case PM4_SET_BIN_MASK_LO: {
-      uint32_t value = reader->ReadAndSwap<uint32_t>();
-      bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | value;
-      result = true;
-    } break;
-    case PM4_SET_BIN_MASK_HI: {
-      uint32_t value = reader->ReadAndSwap<uint32_t>();
-      bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(value) << 32);
-      result = true;
-    } break;
-    case PM4_SET_BIN_SELECT_LO: {
-      uint32_t value = reader->ReadAndSwap<uint32_t>();
-      bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | value;
-      result = true;
-    } break;
-    case PM4_SET_BIN_SELECT_HI: {
-      uint32_t value = reader->ReadAndSwap<uint32_t>();
-      bin_select_ = (bin_select_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(value) << 32);
-      result = true;
-    } break;
-    case PM4_SET_BIN_MASK: {
-      assert_true(count == 2);
-      uint64_t val_hi = reader->ReadAndSwap<uint32_t>();
-      uint64_t val_lo = reader->ReadAndSwap<uint32_t>();
-      bin_mask_ = (val_hi << 32) | val_lo;
-      result = true;
-    } break;
-    case PM4_SET_BIN_SELECT: {
-      assert_true(count == 2);
-      uint64_t val_hi = reader->ReadAndSwap<uint32_t>();
-      uint64_t val_lo = reader->ReadAndSwap<uint32_t>();
-      bin_select_ = (val_hi << 32) | val_lo;
-      result = true;
-    } break;
-    case PM4_CONTEXT_UPDATE: {
-      assert_true(count == 1);
-      uint32_t value = reader->ReadAndSwap<uint32_t>();
-      REXGPU_INFO("GPU context update = {:08X}", value);
-      assert_true(value == 0);
-      result = true;
-      break;
-    }
-    case PM4_WAIT_FOR_IDLE: {
-      // This opcode is used by 5454084E while going / being ingame.
-      assert_true(count == 1);
-      uint32_t value = reader->ReadAndSwap<uint32_t>();
-      REXGPU_INFO("GPU wait for idle = {:08X}", value);
-      result = true;
-      break;
-    }
-
-    default:
-      REXGPU_INFO("Unimplemented GPU OPCODE: 0x{:02X}\t\tCOUNT: {}\n", opcode, count);
-      assert_always();
-      reader->AdvanceRead(count * sizeof(uint32_t));
-      break;
-  }
-
-  assert_true(reader->read_offset() ==
-              (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
-  return result;
+  return &slot;
 }
 
-bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet,
-                                                  uint32_t count) {
-  // initialize CP's micro-engine
-  me_bin_.clear();
-  for (uint32_t i = 0; i < count; i++) {
-    me_bin_.push_back(reader->ReadAndSwap<uint32_t>());
+CommandProcessor::VIZDecision CommandProcessor::GetVIZDecision(uint32_t token) {
+  // PM4_DRAW_INDX uses bit 8 for VIZ and bits 0:5 for the ID.
+  VIZDecision decision;
+  if (!(token & 0x100)) {
+    return decision;
   }
 
-  return true;
-}
+  const uint32_t id = token & 0x3F;
+  decision.slot_id = id;
+  ++viz_stats_.token_draws;
+  VIZSlot& slot = viz_slots_[id];
+  decision.slot_sequence_id = slot.slot_sequence_id;
 
-bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
-                                              uint32_t count) {
-  // skip N 32-bit words to get to the next packet
-  // No-op, ignore some data.
-  reader->AdvanceRead(count * sizeof(uint32_t));
-  return true;
-}
+  if (!slot.has_result) {
+    // Pick up resolves that already completed.
+    PumpVIZResolves();
+  }
 
-bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet,
-                                                    uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
-
-  // generate interrupt from the command stream
-  uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
-  for (int n = 0; n < 6; n++) {
-    if (cpu_mask & (1 << n)) {
-      if (graphics_system_) {
-        graphics_system_->DispatchInterruptCallback(1, n);
+  const PendingVIZResolve* in_flight = nullptr;
+  if (!slot.has_result) {
+    // Pushed in submission order, so the newest match is the answer.
+    for (auto it = viz_resolves_in_flight_.rbegin(); it != viz_resolves_in_flight_.rend(); ++it) {
+      if (it->slot_id == id && it->slot_sequence_id == decision.slot_sequence_id) {
+        in_flight = &*it;
+        break;
       }
     }
   }
-  return true;
-}
 
-bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
-                                                  uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
-
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  {
-    static uint64_t last_frame_tick = 0;
-    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-    if (last_frame_tick) {
-      uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
-      int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
-      PROFILE_FRAME_TIME_US(dt_us);
-      PROFILE_FPS(freq / (now - last_frame_tick));
+  if (in_flight) {
+    if (!slot.has_fallback &&
+        // Not in the predicate yet.
+        !(viz_segment_.active && viz_segment_.slot_id == id) &&
+        slot.predicate_state == VIZSlot::PredicateState::kArmed) {
+      decision.use_predicate = true;
+      return decision;
     }
-    last_frame_tick = now;
+
+    AwaitSubmittedVIZResolve(in_flight->end_submission);
   }
-#endif
-  rex::perf::Profiler::Flip();
 
-  // Xenia-specific VdSwap hook.
-  // VdSwap will post this to tell us we need to swap the screen/fire an
-  // interrupt.
-  // 63 words here, but only the first has any data.
-  uint32_t magic = reader->ReadAndSwap<memory::fourcc_t>();
-  assert_true(magic == kSwapSignature);
+  if (slot.has_result && !slot.visible) {
+    decision.draw = false;
+  }
 
-  // TODO(benvanik): only swap frontbuffer ptr.
-  uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
-  uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
-  uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
-
-  IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-
-  ++counter_;
-  return true;
+  return decision;
 }
 
-bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
-                                                          uint32_t packet, uint32_t count) {
-  // indirect buffer dispatch
-  uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
-  uint32_t list_length = reader->ReadAndSwap<uint32_t>();
-  assert_zero(list_length & ~0xFFFFF);
-  list_length &= 0xFFFFF;
-  ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
-  return true;
+void CommandProcessor::LogVIZStats(uint64_t frame_current) {
+  if (!REXCVAR_GET(viz_query) || !REXCVAR_GET(viz_query_log) ||
+      frame_current - viz_stats_.last_log_frame < 100) {
+    return;
+  }
+
+  REXGPU_INFO(
+      "VIZ Query Stats (last 100 frames): "
+      "Begun={}, Ended={}, Visible={}, Hidden={}, Stale={}, "
+      "Fallbacks={}, SegSplits={}, TokenDraws={}, Culled={}, "
+      "Predicated={}, Memexport={}, CopyPass={}, Waits={}",
+      viz_stats_.queries_begun, viz_stats_.queries_ended, viz_stats_.resolved_visible,
+      viz_stats_.resolved_hidden, viz_stats_.stale_resolves, viz_stats_.fallback_sequences,
+      viz_stats_.segment_splits, viz_stats_.token_draws, viz_stats_.draws_culled,
+      viz_stats_.draws_predicated, viz_stats_.memexport_draws, viz_stats_.copy_passthroughs,
+      viz_stats_.waits);
+
+  viz_stats_.Reset(frame_current);
 }
 
-bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
-                                                       uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
+void CommandProcessor::NoteVIZDraw(bool measured) {
+  uint32_t id = 0;
+  uint64_t generation = 0;
+  if (GetActiveVIZQuery(id, generation)) {
+    VIZSlot& slot = viz_slots_[id];
+    slot.draw_seen = true;
+    if (!measured && !slot.has_fallback) {
+      // Query geometry existed, but we don't have a result.
+      slot.has_fallback = true;
+      ++viz_stats_.fallback_sequences;
+    }
+  }
+}
 
-  // wait until a register or memory location is a specific value
+bool CommandProcessor::GetActiveVIZQuery(uint32_t& id, uint64_t& generation) const {
+  const reg::PA_SC_VIZ_QUERY viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  if (!viz_query.viz_query_ena) {
+    return false;
+  }
 
-  uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
-  uint32_t poll_reg_addr = reader->ReadAndSwap<uint32_t>();
-  uint32_t ref = reader->ReadAndSwap<uint32_t>();
-  uint32_t mask = reader->ReadAndSwap<uint32_t>();
-  uint32_t wait = reader->ReadAndSwap<uint32_t>();
+  id = viz_query.viz_query_id;
+  const VIZSlot& slot = viz_slots_[id];
+  generation = slot.slot_sequence_id;
+  return slot.active;
+}
 
-  bool is_memory = (wait_info & 0x10) != 0;
+void CommandProcessor::ResetVIZState() {
+  viz_segment_ = {};
+  viz_predicate_draw_ = {};
+  viz_resolves_in_flight_.clear();
+  for (VIZSlot& slot : viz_slots_) {
+    slot = {};
+  }
 
-  bool matched = false;
-  do {
-    uint32_t value = 0;
-    if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
-      value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
-    } else {
-      value = ReadRegisterValue(poll_reg_addr);
-      if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
-        MakeCoherent();
-        value = ReadRegisterValue(poll_reg_addr);
+  viz_stats_.Reset(0);
+}
+
+CommandProcessor::PendingZPDSlot CommandProcessor::GetPendingZPDSlot(uint32_t slot_base,
+                                                                     uint32_t end_record) const {
+  PendingZPDSlot pending_slot;
+
+  for (const auto& report_pair : logical_zpd_reports_) {
+    const ZPDReport& report = report_pair.second;
+    if (!report.ended || report.pending_segments == 0 || report.slot_base != slot_base) {
+      continue;
+    }
+
+    // Wait on the oldest unresolved report for this slot first.
+    if (pending_slot.report_handle == kInvalidReportHandle ||
+        report_pair.first < pending_slot.report_handle) {
+      pending_slot.report_handle = report_pair.first;
+    }
+
+    // Slot reuse needs to be handled carefully in fast mode. Keep the biggest
+    // cached delta, not the newest one. A stale zero is a lot more dangerous
+    // than a stale nonzero.
+    if (report.has_cached_delta) {
+      if (!pending_slot.has_cached_delta || report.cached_delta > pending_slot.cached_delta) {
+        pending_slot.cached_delta = report.cached_delta;
       }
+      pending_slot.has_cached_delta = true;
     }
-    switch (wait_info & 0x7) {
-      case 0x0:  // Never.
-        matched = false;
-        break;
-      case 0x1:  // Less than reference.
-        matched = (value & mask) < ref;
-        break;
-      case 0x2:  // Less than or equal to reference.
-        matched = (value & mask) <= ref;
-        break;
-      case 0x3:  // Equal to reference.
-        matched = (value & mask) == ref;
-        break;
-      case 0x4:  // Not equal to reference.
-        matched = (value & mask) != ref;
-        break;
-      case 0x5:  // Greater than or equal to reference.
-        matched = (value & mask) >= ref;
-        break;
-      case 0x6:  // Greater than reference.
-        matched = (value & mask) > ref;
-        break;
-      case 0x7:  // Always
-        matched = true;
-        break;
-    }
-    if (!matched) {
-      // Wait.
-      if (wait >= 0x100) {
-        PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
-          rex::thread::MaybeYield();
-        } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+
+    if (report.end_record) {
+      auto report_cache_it = fast_zpd_report_cached_values_.find(report.end_record);
+      if (report_cache_it != fast_zpd_report_cached_values_.end()) {
+        if (!pending_slot.has_cached_delta || report_cache_it->second > pending_slot.cached_delta) {
+          pending_slot.cached_delta = report_cache_it->second;
         }
-        rex::thread::SyncMemory();
-        ReturnFromWait();
+        pending_slot.has_cached_delta = true;
+      }
+    }
+  }
 
-        if (!worker_running_) {
-          // Short-circuited exit.
-          return false;
+  auto end_record_cache_it = fast_zpd_report_cached_values_.find(end_record);
+  if (end_record_cache_it != fast_zpd_report_cached_values_.end()) {
+    if (!pending_slot.has_cached_delta || end_record_cache_it->second > pending_slot.cached_delta) {
+      pending_slot.cached_delta = end_record_cache_it->second;
+    }
+    pending_slot.has_cached_delta = true;
+  }
+
+  return pending_slot;
+}
+
+bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
+  if (GetZPDMode() == ZPDMode::kFake) {
+    return false;
+  }
+
+  // Track any delta to carry forward if the same slot is immediately reused.
+  uint32_t carried_cached_delta = 0;
+  bool has_carried_cached_delta = false;
+  uint32_t carried_from_slot_base = 0;
+
+  if (zpd_active_segment_.logical_active) {
+    // New BEGIN while a prior report is open. Hardware has one register for
+    // the query address, so a new BEGIN implicitly ends the prior one.
+    if (zpd_active_segment_.end_record) {
+      EndZPDReport(zpd_active_segment_.end_record, true);
+    } else {
+      carried_from_slot_base = zpd_active_segment_.slot_base;
+
+      auto dying_report = logical_zpd_reports_.find(zpd_active_segment_.report_handle);
+      if (dying_report != logical_zpd_reports_.end() && dying_report->second.has_cached_delta) {
+        carried_cached_delta = dying_report->second.cached_delta;
+        has_carried_cached_delta = true;
+      }
+
+      if (zpd_active_segment_.segment_active) {
+        // Deactivate the segment before DiscardZPDQuery so that
+        // EndSubmission -> CloseQuerySegment does not re-enter and
+        // issue a second EndQuery on the same slot.
+        zpd_active_segment_.segment_active = false;
+        DiscardZPDQuery();
+      }
+      logical_zpd_reports_.erase(zpd_active_segment_.report_handle);
+      zpd_active_segment_ = {};
+    }
+  }
+
+  uint32_t slot_base = XenosZPDReport::GetSlotBase(report_address);
+  uint32_t begin_record = XenosZPDReport::GetBeginRecordBase(slot_base);
+  uint32_t end_record = XenosZPDReport::GetEndRecordBase(slot_base);
+  if (!slot_base) {
+    return false;
+  }
+
+  // Resolve same slot hazards before invalidating pending writes from the prior
+  // lifetime. For finished strict queries with unpolled completion, refresh now
+  // and drain, avoiding unnecessary AwaitQueryResolve blocking.
+  if (GetZPDMode() == ZPDMode::kStrict) {
+    PollCompletedSubmission();
+  } else {
+    PumpQueryResolves();
+  }
+
+  PendingZPDSlot pending_slot = GetPendingZPDSlot(slot_base, end_record);
+
+  if (pending_slot.report_handle != kInvalidReportHandle) {
+    if (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt) {
+      if (pending_slot.has_cached_delta) {
+        carried_cached_delta = pending_slot.cached_delta;
+        has_carried_cached_delta = true;
+        carried_from_slot_base = slot_base;
+      }
+    } else {
+      while (pending_slot.report_handle != kInvalidReportHandle) {
+        auto report_it = logical_zpd_reports_.find(pending_slot.report_handle);
+        if (report_it == logical_zpd_reports_.end()) {
+          break;
         }
-      } else {
-        rex::thread::MaybeYield();
+
+        uint64_t wait_for_submission = report_it->second.last_segment_end_submission;
+
+        bool wait_succeeded = AwaitQueryResolve(pending_slot.report_handle, wait_for_submission);
+
+        if (!wait_succeeded) {
+          if (pending_slot.cached_delta != 0) {
+            carried_cached_delta = pending_slot.cached_delta;
+            carried_from_slot_base = slot_base;
+          }
+          break;
+        }
+
+        PumpQueryResolves();
+
+        pending_slot = GetPendingZPDSlot(slot_base, end_record);
       }
     }
-  } while (!matched);
-
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet,
-                                                  uint32_t count) {
-  // register read/modify/write
-  // ? (used during shader upload and edram setup)
-  uint32_t rmw_info = reader->ReadAndSwap<uint32_t>();
-  uint32_t and_mask = reader->ReadAndSwap<uint32_t>();
-  uint32_t or_mask = reader->ReadAndSwap<uint32_t>();
-  uint32_t value = register_file_->values[rmw_info & 0x1FFF];
-  if ((rmw_info >> 31) & 0x1) {
-    // & reg
-    value &= register_file_->values[and_mask & 0x1FFF];
-  } else {
-    // & imm
-    value &= and_mask;
-  }
-  if ((rmw_info >> 30) & 0x1) {
-    // | reg
-    value |= register_file_->values[or_mask & 0x1FFF];
-  } else {
-    // | imm
-    value |= or_mask;
-  }
-  WriteRegister(rmw_info & 0x1FFF, value);
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader, uint32_t packet,
-                                                     uint32_t count) {
-  // Copy Register to Memory (?)
-  // Count is 2, assuming a Register Addr and a Memory Addr.
-
-  uint32_t reg_addr = reader->ReadAndSwap<uint32_t>();
-  uint32_t mem_addr = reader->ReadAndSwap<uint32_t>();
-
-  uint32_t reg_val = ReadRegisterValue(reg_addr);
-
-  auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
-  mem_addr &= ~0x3;
-  reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
-
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
-                                                    uint32_t count) {
-  uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
-  for (uint32_t i = 0; i < count - 1; i++) {
-    uint32_t write_data = reader->ReadAndSwap<uint32_t>();
-
-    auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
-    auto addr = write_addr & ~0x3;
-    write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
-    write_addr += 4;
   }
 
-  return true;
-}
+  // Bump slot sequence - invalidates pending writes from prior lifetime.
+  uint64_t slot_sequence_id = ++zpd_slot_sequences_[slot_base];
 
-bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader, uint32_t packet,
-                                                     uint32_t count) {
-  // conditional write to memory or register
-  uint32_t wait_info = reader->ReadAndSwap<uint32_t>();
-  uint32_t poll_reg_addr = reader->ReadAndSwap<uint32_t>();
-  uint32_t ref = reader->ReadAndSwap<uint32_t>();
-  uint32_t mask = reader->ReadAndSwap<uint32_t>();
-  uint32_t write_reg_addr = reader->ReadAndSwap<uint32_t>();
-  uint32_t write_data = reader->ReadAndSwap<uint32_t>();
-  uint32_t value;
-  if (wait_info & 0x10) {
-    // Memory.
-    auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
-    poll_reg_addr &= ~0x3;
-    value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
-    value = GpuSwap(value, endianness);
-  } else {
-    // Register.
-    value = ReadRegisterValue(poll_reg_addr);
-  }
-  bool matched = false;
-  switch (wait_info & 0x7) {
-    case 0x0:  // Never.
-      matched = false;
-      break;
-    case 0x1:  // Less than reference.
-      matched = (value & mask) < ref;
-      break;
-    case 0x2:  // Less than or equal to reference.
-      matched = (value & mask) <= ref;
-      break;
-    case 0x3:  // Equal to reference.
-      matched = (value & mask) == ref;
-      break;
-    case 0x4:  // Not equal to reference.
-      matched = (value & mask) != ref;
-      break;
-    case 0x5:  // Greater than or equal to reference.
-      matched = (value & mask) >= ref;
-      break;
-    case 0x6:  // Greater than reference.
-      matched = (value & mask) > ref;
-      break;
-    case 0x7:  // Always
-      matched = true;
-      break;
-  }
-  if (matched) {
-    // Write.
-    if (wait_info & 0x100) {
-      // Memory.
-      auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
-      write_reg_addr &= ~0x3;
-      write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
-    } else {
-      // Register.
-      WriteRegister(write_reg_addr, write_data);
-    }
-  }
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader, uint32_t packet,
-                                                      uint32_t count) {
-  // generate an event that creates a write to memory when completed
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-  if (count == 1) {
-    // Just an event flag? Where does this write?
-  } else {
-    // Write to an address.
-    assert_always();
-    reader->AdvanceRead((count - 1) * sizeof(uint32_t));
-  }
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* reader,
-                                                          uint32_t packet, uint32_t count) {
-  // generate a VS|PS_done event
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  uint32_t address = reader->ReadAndSwap<uint32_t>();
-  uint32_t value = reader->ReadAndSwap<uint32_t>();
-
-  // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-  uint32_t data_value;
-  if ((initiator >> 31) & 0x1) {
-    // Write counter (GPU vblank counter?).
-    data_value = counter_;
-  } else {
-    // Write value.
-    data_value = value;
-  }
-  auto endianness = static_cast<xenos::Endian>(address & 0x3);
-  address &= ~0x3;
-  data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
-                                                          uint32_t packet, uint32_t count) {
-  // generate a screen extent event
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  uint32_t address = reader->ReadAndSwap<uint32_t>();
-  // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-  auto endianness = static_cast<xenos::Endian>(address & 0x3);
-  address &= ~0x3;
-
-  // Let us hope we can fake this.
-  // This callback tells the driver the xy coordinates affected by a previous
-  // drawcall.
-  // https://www.google.com/patents/US20060055701
-  uint16_t extents[] = {
-      0 >> 3,                                    // min x
-      xenos::kTexture2DCubeMaxWidthHeight >> 3,  // max x
-      0 >> 3,                                    // min y
-      xenos::kTexture2DCubeMaxWidthHeight >> 3,  // max y
-      0,                                         // min z
-      1,                                         // max z
-  };
-  assert_true(endianness == xenos::Endian::k8in16);
-  memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
-                                     rex::countof(extents));
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
-                                                          uint32_t packet, uint32_t count) {
-  // Set by D3D as BE but struct ABI is LE
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
-  assert_true(count == 1);
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  // Writeback initiator.
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-
-  // Occlusion queries:
-  // This command is send on query begin and end.
-  // As a workaround report some fixed amount of passed samples.
-  auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
-  if (fake_sample_count >= 0) {
-    auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
-    if (!pSampleCounts) {
-      return true;
-    }
-    // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
-    // and used to detect a finished query.
-    bool is_end_via_z_pass =
-        pSampleCounts->ZPass_A == kQueryFinished || pSampleCounts->ZPass_B == kQueryFinished;
-    // Older versions of D3D also checks for ZFail (4D5307D5).
-    bool is_end_via_z_fail =
-        pSampleCounts->ZFail_A == kQueryFinished || pSampleCounts->ZFail_B == kQueryFinished;
-    std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
-      pSampleCounts->ZPass_A = fake_sample_count;
-      pSampleCounts->Total_A = fake_sample_count;
+  // By default, BEGIN drops the cached value so an orphaned END doesn't replay
+  // something from a prior lifetime. The alternate fast path keeps it around
+  // long enough for an async zero to help the next unresolved write.
+  if (GetZPDMode() != ZPDMode::kFastAlt) {
+    auto cache_it = fast_zpd_report_cached_values_.find(end_record);
+    if (cache_it != fast_zpd_report_cached_values_.end() && cache_it->second == 0) {
+      fast_zpd_report_cached_values_.erase(cache_it);
     }
   }
 
+  ReportHandle report_handle = zpd_next_report_handle_++;
+  if (report_handle == kInvalidReportHandle) {
+    report_handle = zpd_next_report_handle_++;
+  }
+
+  ZPDReport& logical = logical_zpd_reports_[report_handle];
+  logical.slot_base = slot_base;
+  logical.slot_sequence_id = slot_sequence_id;
+  logical.begin_record = begin_record;
+  logical.end_record = end_record;
+  logical.begin_value = zpd_slot_values_[slot_base];
+  logical.accumulated_samples = 0;
+  logical.first_segment_end_submission = 0;
+  logical.last_segment_end_submission = 0;
+  logical.pending_segments = 0;
+  logical.cached_delta = 0;
+  logical.has_cached_delta = false;
+  logical.ended = false;
+
+  if (slot_base == carried_from_slot_base && has_carried_cached_delta) {
+    logical.cached_delta = carried_cached_delta;
+    logical.has_cached_delta = true;
+  }
+
+  zpd_active_segment_.report_handle = report_handle;
+  zpd_active_segment_.slot_base = slot_base;
+  zpd_active_segment_.begin_record = begin_record;
+  zpd_active_segment_.end_record = end_record;
+  zpd_active_segment_.segment_active = false;
+  // Opens lazily. OpenQuerySegment will open it at the next valid opportunity.
+  zpd_active_segment_.segment_pending_begin = true;
+  zpd_active_segment_.logical_active = true;
+
+  OpenQuerySegment(true);
   return true;
 }
 
-bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
-                                              const char* opcode_name, uint32_t viz_query_condition,
-                                              uint32_t count_remaining) {
-  // if viz_query_condition != 0, this is a conditional draw based on viz query.
-  // This ID matches the one issued in PM4_VIZ_QUERY
-  // uint32_t viz_id = viz_query_condition & 0x3F;
-  // when true, render conditionally based on query result
-  // uint32_t viz_use = viz_query_condition & 0x100;
-
-  assert_not_zero(count_remaining);
-  if (!count_remaining) {
-    REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
+// Guest END closes the logical lifetime, but the final value may still depend
+// on in flight query segments.
+bool CommandProcessor::EndZPDReport(uint32_t report_address, bool guest_forced_end) {
+  if (GetZPDMode() == ZPDMode::kFake) {
     return false;
   }
-  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
-  vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
-  --count_remaining;
-  WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
 
-  bool draw_succeeded = true;
-  // TODO(Triang3l): Remove IndexBufferInfo and replace handling of all this
-  // with PrimitiveProcessor when the old Vulkan renderer is removed.
-  bool is_indexed = false;
-  IndexBufferInfo index_buffer_info;
-  switch (vgt_draw_initiator.source_select) {
-    case xenos::SourceSelect::kDMA: {
-      // Indexed draw.
-      is_indexed = true;
-
-      // Two separate bounds checks so if there's only one missing register
-      // value out of two, one uint32_t will be skipped in the command buffer,
-      // not two.
-      assert_not_zero(count_remaining);
-      if (!count_remaining) {
-        REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
-        return false;
-      }
-      uint32_t vgt_dma_base = reader->ReadAndSwap<uint32_t>();
-      --count_remaining;
-      WriteRegister(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
-      reg::VGT_DMA_SIZE vgt_dma_size;
-      assert_not_zero(count_remaining);
-      if (!count_remaining) {
-        REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_SIZE", opcode_name);
-        return false;
-      }
-      vgt_dma_size.value = reader->ReadAndSwap<uint32_t>();
-      --count_remaining;
-      WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
-
-      uint32_t index_size_bytes = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16
-                                      ? sizeof(uint16_t)
-                                      : sizeof(uint32_t);
-      // The base address must already be word-aligned according to the R6xx
-      // documentation, but for safety.
-      index_buffer_info.guest_base = vgt_dma_base & ~(index_size_bytes - 1);
-      index_buffer_info.endianness = vgt_dma_size.swap_mode;
-      index_buffer_info.format = vgt_draw_initiator.index_size;
-      index_buffer_info.length = vgt_dma_size.num_words * index_size_bytes;
-      index_buffer_info.count = vgt_draw_initiator.num_indices;
-    } break;
-    case xenos::SourceSelect::kImmediate: {
-      // TODO(Triang3l): VGT_IMMED_DATA.
-      REXGPU_ERROR(
-          "{}: Using immediate vertex indices, which are not supported yet. "
-          "Report the game to Xenia developers!",
-          opcode_name, uint32_t(vgt_draw_initiator.source_select));
-      draw_succeeded = false;
-      assert_always();
-    } break;
-    case xenos::SourceSelect::kAutoIndex: {
-      // Auto draw.
-      index_buffer_info.guest_base = 0;
-      index_buffer_info.length = 0;
-    } break;
-    default: {
-      // Invalid source selection.
-      draw_succeeded = false;
-      assert_unhandled_case(vgt_draw_initiator.source_select);
-    } break;
+  CommandProcessor::ReportHandle report_handle = zpd_active_segment_.report_handle;
+  uint32_t stored_end_record = zpd_active_segment_.end_record;
+  uint32_t report_record_base = XenosZPDReport::GetRecordBase(report_address);
+  if (!report_record_base) {
+    report_record_base = stored_end_record;
   }
 
-  // Skip to the next command, for example, if there are immediate indexes that
-  // we don't support yet.
-  reader->AdvanceRead(count_remaining * sizeof(uint32_t));
-
-  if (draw_succeeded) {
-    auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
-      // TODO(Triang3l): Don't drop the draw call completely if the vertex
-      // shader has memexport.
-      // TODO(Triang3l || JoelLinn): Handle this properly in the render
-      // backends.
-
-      bool major_mode_explicit =
-          xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
-      if (!draw_succeeded) {
-        auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
-        auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
-        auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
-        REXGPU_ERROR(
-            "{}({}, {}, {}): Failed in backend "
-            "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
-            opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
-            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
-            uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
-            uint32_t(rb_modecontrol.edram_mode));
-      }
-    }
+  if (zpd_active_segment_.segment_active) {
+    CloseQuerySegment();
   }
 
-  // If read the packed correctly, but merely couldn't execute it (because of,
-  // for instance, features not supported by the host), don't terminate command
-  // buffer processing as that would leave rendering in a way more inconsistent
-  // state than just a single dropped draw command.
-  return true;
-}
+  zpd_active_segment_.segment_pending_begin = false;
 
-bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
-                                                    uint32_t count) {
-  // "initiate fetch of index buffer and draw"
-  // Generally used by Xbox 360 Direct3D 9 for kDMA and kAutoIndex sources.
-  // With a viz query token as the first one.
-  uint32_t count_remaining = count;
-  assert_not_zero(count_remaining);
-  if (!count_remaining) {
-    REXGPU_ERROR("PM4_DRAW_INDX: Packet too small, can't read the viz query token");
+  if (!report_record_base) {
+    logical_zpd_reports_.erase(report_handle);
+    zpd_active_segment_ = {};
     return false;
   }
-  uint32_t viz_query_condition = reader->ReadAndSwap<uint32_t>();
-  --count_remaining;
-  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX", viz_query_condition,
-                                count_remaining);
-}
 
-bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet,
-                                                      uint32_t count) {
-  // "draw using supplied indices in packet"
-  // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
-  // No viz query token.
-  return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0, count);
-}
+  bool resolved_immediately = false;
+  uint32_t begin_record = 0;
+  uint32_t begin_value = 0;
+  uint32_t final_value = 0;
+  uint32_t cached_delta = 0;
+  bool has_cached_delta = false;
 
-bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reader, uint32_t packet,
-                                                       uint32_t count) {
-  // load constant into chip and to memory
-  // PM4_REG(reg) ((0x4 << 16) | (GSL_HAL_SUBBLOCK_OFFSET(reg)))
-  //                                     reg - 0x2000
-  uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
-  uint32_t index = offset_type & 0x7FF;
-  uint32_t type = (offset_type >> 16) & 0xFF;
-  uint32_t count_registers = count - 1;
-  switch (type) {
-    case 0:  // ALU
-      WriteALURangeFromRing(reader, index, count_registers);
-      break;
-    case 1:  // FETCH
-      WriteFetchRangeFromRing(reader, index, count_registers);
-      break;
-    case 2:  // BOOL
-      WriteBoolRangeFromRing(reader, index, count_registers);
-      break;
-    case 3:  // LOOP
-      WriteLoopRangeFromRing(reader, index, count_registers);
-      break;
-    case 4:  // REGISTERS
-      WriteREGISTERSRangeFromRing(reader, index, count_registers);
-      break;
-    default:
-      assert_always();
-      reader->AdvanceRead((count - 1) * sizeof(uint32_t));
-      return true;
+  auto it = logical_zpd_reports_.find(report_handle);
+  if (it == logical_zpd_reports_.end()) {
+    zpd_active_segment_ = {};
+    return false;
   }
-  return true;
-}
 
-bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* reader, uint32_t packet,
-                                                        uint32_t count) {
-  uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
-  uint32_t index = offset_type & 0xFFFF;
-  WriteRegisterRangeFromRing(reader, index, count - 1);
-  return true;
-}
+  ZPDReport& logical = it->second;
+  logical.ended = true;
+  logical.end_record = report_record_base;
+  begin_record = logical.begin_record;
+  begin_value = logical.begin_value;
 
-bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* reader,
-                                                            uint32_t packet, uint32_t count) {
-  // load constants from memory
-  uint32_t address = reader->ReadAndSwap<uint32_t>();
-  address &= 0x3FFFFFFF;
-  uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
-  uint32_t index = offset_type & 0x7FF;
-  uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
-  size_dwords &= 0xFFF;
-  uint32_t type = (offset_type >> 16) & 0xFF;
-  uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
-  switch (type) {
-    case 0:  // ALU
-      WriteALURangeFromMem(index, xlat_address, size_dwords);
-      break;
-    case 1:  // FETCH
-      WriteFetchRangeFromMem(index, xlat_address, size_dwords);
-      break;
-    case 2:  // BOOL
-      WriteBoolRangeFromMem(index, xlat_address, size_dwords);
-      break;
-    case 3:  // LOOP
-      WriteLoopRangeFromMem(index, xlat_address, size_dwords);
-      break;
-    case 4:  // REGISTERS
-      WriteREGISTERSRangeFromMem(index, xlat_address, size_dwords);
-      break;
-    default:
-      assert_always();
-      return true;
-  }
-  return true;
-}
+  if (logical.pending_segments == 0) {
+    resolved_immediately = true;
+    // Segments were already normalized as they resolved.
+    final_value =
+        static_cast<uint32_t>(std::min<uint64_t>(logical.accumulated_samples, UINT32_MAX));
 
-bool CommandProcessor::ExecutePacketType3_SET_SHADER_CONSTANTS(memory::RingBuffer* reader,
-                                                               uint32_t packet, uint32_t count) {
-  uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
-  uint32_t index = offset_type & 0xFFFF;
-  WriteRegisterRangeFromRing(reader, index, count - 1);
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, uint32_t packet,
-                                                  uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
-
-  // load sequencer instruction memory (pointer-based)
-  uint32_t addr_type = reader->ReadAndSwap<uint32_t>();
-  auto shader_type = static_cast<xenos::ShaderType>(addr_type & 0x3);
-  uint32_t addr = addr_type & ~0x3;
-  uint32_t start_size = reader->ReadAndSwap<uint32_t>();
-  uint32_t start = start_size >> 16;
-  uint32_t size_dwords = start_size & 0xFFFF;  // dwords
-  assert_true(start == 0);
-
-  auto shader =
-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
-  switch (shader_type) {
-    case xenos::ShaderType::kVertex:
-      active_vertex_shader_ = shader;
-      break;
-    case xenos::ShaderType::kPixel:
-      active_pixel_shader_ = shader;
-      break;
-    default:
-      assert_unhandled_case(shader_type);
-      return false;
-  }
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* reader,
-                                                            uint32_t packet, uint32_t count) {
-  SCOPE_profile_cpu_f("gpu");
-
-  // load sequencer instruction memory (code embedded in packet)
-  uint32_t dword0 = reader->ReadAndSwap<uint32_t>();
-  uint32_t dword1 = reader->ReadAndSwap<uint32_t>();
-  auto shader_type = static_cast<xenos::ShaderType>(dword0);
-  uint32_t start_size = dword1;
-  uint32_t start = start_size >> 16;
-  uint32_t size_dwords = start_size & 0xFFFF;  // dwords
-  assert_true(start == 0);
-  assert_true(reader->read_count() >= size_dwords * 4);
-  assert_true(count - 2 >= size_dwords);
-  auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
-                           reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
-  switch (shader_type) {
-    case xenos::ShaderType::kVertex:
-      active_vertex_shader_ = shader;
-      break;
-    case xenos::ShaderType::kPixel:
-      active_pixel_shader_ = shader;
-      break;
-    default:
-      assert_unhandled_case(shader_type);
-      return false;
-  }
-  reader->AdvanceRead(size_dwords * sizeof(uint32_t));
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* reader,
-                                                           uint32_t packet, uint32_t count) {
-  // selective invalidation of state pointers
-  /*uint32_t mask =*/reader->ReadAndSwap<uint32_t>();
-  // driver_->InvalidateState(mask);
-  return true;
-}
-
-bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, uint32_t packet,
-                                                    uint32_t count) {
-  // begin/end initiator for viz query extent processing
-  // https://www.google.com/patents/US20050195186
-  assert_true(count == 1);
-
-  uint32_t dword0 = reader->ReadAndSwap<uint32_t>();
-
-  uint32_t id = dword0 & 0x3F;
-  uint32_t end = dword0 & 0x100;
-  if (!end) {
-    // begin a new viz query @ id
-    // On hardware this clears the internal state of the scan converter (which
-    // is different to the register)
-    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
-    REXGPU_INFO("Begin viz query ID {:02X}", id);
+    cached_delta = final_value;
+    has_cached_delta = true;
+    logical.cached_delta = cached_delta;
+    logical.has_cached_delta = true;
+    if (fast_zpd_report_cached_values_.size() >= kFastZPDCacheMaxEntries &&
+        !fast_zpd_report_cached_values_.count(report_record_base)) {
+      fast_zpd_report_cached_values_.clear();
+    }
+    fast_zpd_report_cached_values_[report_record_base] = cached_delta;
+    final_value = cached_delta;
   } else {
-    // end the viz query
-    WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
-    REXGPU_INFO("End viz query ID {:02X}", id);
-    // The scan converter writes the internal result back to the register here.
-    // We just fake it and say it was visible in case it is read back.
-    if (id < 32) {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1) << id;
-    } else {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |= uint32_t(1) << (id - 32);
+    if (logical.has_cached_delta) {
+      cached_delta = logical.cached_delta;
+      has_cached_delta = true;
+    }
+    auto cache_it = fast_zpd_report_cached_values_.find(report_record_base);
+    if (cache_it != fast_zpd_report_cached_values_.end()) {
+      cached_delta = cache_it->second;
+      has_cached_delta = true;
     }
   }
 
+  if (resolved_immediately) {
+    CommitZPDReport(logical, final_value);
+    logical_zpd_reports_.erase(it);
+  }
+
+  bool has_cross_slot_end = stored_end_record && stored_end_record != report_record_base;
+  if (has_cross_slot_end) {
+    // The guest ended a different ZPD record than the one opened by BEGIN.
+    // Preserve the prior running slot value in the stored END record before
+    // writing the actual END selected by the packet.
+    WriteZPDReport(0, stored_end_record, 0, begin_value, false);
+  }
+
+  if (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt) {
+    bool write_begin = begin_record && report_record_base && begin_record != report_record_base;
+    // Unknown still means visible in fast mode. Reusing cached zeroes can help
+    // flares stop shining through walls (545107FC, 454108D4, 4D5307D2), but it
+    // also tends to break occlusion culling (4D5308AB, 4D530805), so only do it
+    // in the alternate fast path.
+    uint32_t speculative = cached_delta;
+    if (!resolved_immediately) {
+      speculative = 1;
+      if (has_cached_delta && (cached_delta != 0 || GetZPDMode() == ZPDMode::kFastAlt)) {
+        speculative = cached_delta;
+      }
+    }
+    WriteZPDReport(begin_record, report_record_base, begin_value, speculative, write_begin);
+  } else if (!resolved_immediately) {
+    PumpQueryResolves();
+
+    // Recheck after the drain. The report may have resolved synchronously if
+    // all segments were already complete by the time we got here.
+    if (!logical_zpd_reports_.count(report_handle)) {
+      // OnZPDQueryResolved already committed and erased the report; nothing
+      // left to defer.
+    } else if (zpd_pending_retire_handle_ != report_handle) {
+      zpd_pending_retire_handle_ = report_handle;
+      zpd_pending_retire_stalls_ = 0;
+      zpd_pending_retire_start_ms_ = chrono::Clock::QueryHostUptimeMillis();
+    }
+  }
+
+  zpd_active_segment_ = {};
   return true;
 }
 
+void CommandProcessor::OpenQuerySegment(bool can_close_submission) {
+  if (GetZPDMode() == ZPDMode::kFake || zpd_force_fake_fallback_ ||
+      !zpd_active_segment_.logical_active || !zpd_active_segment_.segment_pending_begin ||
+      !CanOpenZPDQuery()) {
+    return;
+  }
+
+  EnsureZPDQueryResources();
+
+  // Resource setup failed. Drop the logical report and fall back to fake mode.
+  if (!IsZPDQueryPoolReady()) {
+    zpd_force_fake_fallback_ = true;
+    logical_zpd_reports_.erase(zpd_active_segment_.report_handle);
+    zpd_active_segment_ = {};
+    return;
+  }
+
+  // Frees any slots from completed submissions before asking for new ones.
+  PumpQueryResolves();
+
+  QueryOpenResult open_result =
+      OpenZPDQuery(zpd_active_segment_.report_handle, can_close_submission);
+  switch (open_result) {
+    case QueryOpenResult::kOpened:
+      break;
+    case QueryOpenResult::kDeferred:
+      return;
+    case QueryOpenResult::kPoolExhausted: {
+      if (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt) {
+        // Fast mode favors forward progress over accuracy. Keep a minimal
+        // accumulated value instead of waiting for a slot to become available.
+        auto it = logical_zpd_reports_.find(zpd_active_segment_.report_handle);
+        if (it != logical_zpd_reports_.end()) {
+          it->second.accumulated_samples =
+              std::max<uint64_t>(it->second.accumulated_samples, uint64_t{1});
+        }
+        zpd_active_segment_.segment_pending_begin = false;
+        return;
+      }
+      return;
+    }
+    case QueryOpenResult::kFailed:
+    default:
+      return;
+  }
+
+  zpd_active_segment_.segment_active = true;
+  zpd_active_segment_.segment_pending_begin = false;
+}
+
+// Closes the active host segment without ending the logical report.
+// BeginQuery/EndQuery can't cross D3D12 command list or Vulkan render pass
+// boundaries. The result accumulates across all pieces.
+void CommandProcessor::CloseQuerySegment() {
+  if (GetZPDMode() == ZPDMode::kFake || !zpd_active_segment_.segment_active) {
+    return;
+  }
+
+  uint64_t submission = 0;
+  if (!CloseZPDQuery(zpd_active_segment_.report_handle, submission)) {
+    zpd_active_segment_.segment_active = false;
+    zpd_active_segment_.scale_area = 0;
+    zpd_active_segment_.segment_pending_begin = zpd_active_segment_.logical_active;
+    return;
+  }
+
+  auto it = logical_zpd_reports_.find(zpd_active_segment_.report_handle);
+  if (it != logical_zpd_reports_.end()) {
+    // Lets PumpPendingRetire drain early segments without blocking on the
+    // final segment's submission.
+    if (it->second.pending_segments == 0) {
+      it->second.first_segment_end_submission = submission;
+    }
+    it->second.pending_segments++;
+    it->second.last_segment_end_submission = submission;
+  }
+
+  zpd_active_segment_.segment_active = false;
+  zpd_active_segment_.scale_area = 0;
+
+  zpd_active_segment_.segment_pending_begin = zpd_active_segment_.logical_active;
+}
+
+void CommandProcessor::UpdateZPDScale(uint32_t scale_area) {
+  if (GetZPDMode() == ZPDMode::kFake || !zpd_active_segment_.logical_active) {
+    return;
+  }
+  if (zpd_active_segment_.segment_active && zpd_active_segment_.scale_area &&
+      zpd_active_segment_.scale_area != scale_area) {
+    // Draw scale changed in the middle of a report, so close the segment so
+    // normalization divides correctly, and start a fresh one for this draw.
+    CloseQuerySegment();
+    OpenQuerySegment(false);
+  }
+  zpd_active_segment_.scale_area = scale_area;
+}
+
+void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle, uint64_t raw_samples,
+                                          uint32_t scale_area) {
+  auto it = logical_zpd_reports_.find(report_handle);
+  if (it == logical_zpd_reports_.end()) {
+    return;
+  }
+
+  ZPDReport& logical = it->second;
+
+  if (logical.pending_segments) {
+    logical.pending_segments--;
+  }
+
+  logical.accumulated_samples += NormalizeSampleCount(raw_samples, scale_area);
+
+  if (logical.ended && logical.pending_segments == 0) {
+    uint32_t final_value =
+        static_cast<uint32_t>(std::min<uint64_t>(logical.accumulated_samples, UINT32_MAX));
+
+    logical.cached_delta = final_value;
+    logical.has_cached_delta = true;
+    if (logical.end_record) {
+      if (fast_zpd_report_cached_values_.size() >= kFastZPDCacheMaxEntries &&
+          !fast_zpd_report_cached_values_.count(logical.end_record)) {
+        fast_zpd_report_cached_values_.clear();
+      }
+      fast_zpd_report_cached_values_[logical.end_record] = final_value;
+    }
+    if (IsZPDReportCurrent(logical)) {
+      CommitZPDReport(logical, final_value);
+    }
+    logical_zpd_reports_.erase(it);
+  }
+}
+
+void CommandProcessor::PumpPendingRetire() {
+  ReportHandle handle_to_await = zpd_pending_retire_handle_;
+  if (handle_to_await == kInvalidReportHandle) {
+    return;
+  }
+
+  auto logical_report = logical_zpd_reports_.find(handle_to_await);
+  if (logical_report == logical_zpd_reports_.end()) {
+    // If the report is already gone it retired through another path.
+    // Clear so we don't spin on a handle that no longer exists.
+    zpd_pending_retire_handle_ = kInvalidReportHandle;
+    zpd_pending_retire_stalls_ = 0;
+    return;
+  }
+
+  uint64_t wait_for_submission = logical_report->second.last_segment_end_submission;
+  uint64_t first_submission = logical_report->second.first_segment_end_submission;
+
+  // Early segments can be retired here and, in the best case, the report
+  // fully resolves without any wait.
+  if (first_submission != 0 && first_submission < wait_for_submission &&
+      first_submission <= GetCompletedSubmission()) {
+    PumpQueryResolves();
+    logical_report = logical_zpd_reports_.find(handle_to_await);
+    if (logical_report == logical_zpd_reports_.end()) {
+      zpd_pending_retire_handle_ = kInvalidReportHandle;
+      zpd_pending_retire_stalls_ = 0;
+      return;
+    }
+    wait_for_submission = logical_report->second.last_segment_end_submission;
+  }
+
+  if (AwaitQueryResolve(handle_to_await, wait_for_submission)) {
+    zpd_pending_retire_handle_ = kInvalidReportHandle;
+    zpd_pending_retire_stalls_ = 0;
+    return;
+  }
+
+  if (wait_for_submission == 0 || GetCompletedSubmission() >= wait_for_submission) {
+    ++zpd_pending_retire_stalls_;
+  }
+
+  // Abandon if the deadline has elapsed or the stall limit has been reached.
+  // Both are checked to account for varied guest polling behavior.
+  bool deadline_exceeded = (chrono::Clock::QueryHostUptimeMillis() - zpd_pending_retire_start_ms_ >=
+                            kStrictZPDRetireDeadlineMs);
+  if (deadline_exceeded || zpd_pending_retire_stalls_ >= kStrictZPDRetireMaxStalls) {
+    // Write the cached delta to guest memory to avoid a sudden occlusion flash.
+    if (IsZPDReportCurrent(logical_report->second)) {
+      uint32_t fallback_delta =
+          logical_report->second.cached_delta ? logical_report->second.cached_delta : 1;
+      CommitZPDReport(logical_report->second, fallback_delta);
+    }
+    logical_zpd_reports_.erase(logical_report);
+    zpd_pending_retire_handle_ = kInvalidReportHandle;
+    zpd_pending_retire_stalls_ = 0;
+  }
+}
+
+void CommandProcessor::WriteZPDReport(uint32_t begin_record, uint32_t end_record,
+                                      uint32_t begin_value, uint32_t delta_value,
+                                      bool write_begin_record) {
+  xenos::xe_gpu_depth_sample_counts* begin =
+      begin_record ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(begin_record)
+                   : nullptr;
+  if (!end_record) {
+    return;
+  }
+  xenos::xe_gpu_depth_sample_counts* end =
+      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(end_record);
+
+  XenosZPDReport::WriteReportDelta(begin, end, begin_value, delta_value, write_begin_record);
+}
+
+void CommandProcessor::CommitZPDReport(ZPDReport& report, uint32_t delta_value) {
+  uint32_t end_record =
+      report.end_record ? report.end_record : XenosZPDReport::GetEndRecordBase(report.slot_base);
+  WriteZPDReport(report.begin_record, end_record, report.begin_value, delta_value,
+                 report.begin_record != 0);
+
+  // Advance running total so the next BeginReport on this slot picks up
+  // the correct begin_value.
+  uint32_t saturated_delta = XenosZPDReport::SaturateSampleCount(delta_value);
+  uint32_t end_value = report.begin_value + saturated_delta;
+  zpd_slot_values_[report.slot_base] = end_value;
+}
+
+bool CommandProcessor::IsZPDReportCurrent(const ZPDReport& report) const {
+  auto it = zpd_slot_sequences_.find(report.slot_base);
+  uint64_t current_sequence = it != zpd_slot_sequences_.end() ? it->second : 0;
+  return current_sequence == report.slot_sequence_id;
+}
+
+uint32_t CommandProcessor::NormalizeSampleCount(uint64_t samples, uint32_t scale_area) {
+  if (samples == 0) {
+    return 0;
+  }
+
+  uint64_t scale = scale_area;
+  // Round, don't truncate. 1 guest sample at 2x = 4 host samples, need >= 1.
+  uint64_t normalized = scale <= 1 ? samples : (samples + (scale >> 1)) / scale;
+
+  return static_cast<uint32_t>(std::min<uint64_t>(normalized, UINT32_MAX));
+}
+#define COMMAND_PROCESSOR CommandProcessor
+#include <rex/graphics/pm4_command_processor_implement.h>
 }  // namespace rex::graphics

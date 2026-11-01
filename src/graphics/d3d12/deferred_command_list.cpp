@@ -29,12 +29,13 @@ void DeferredCommandList::Reset() {
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
-                                  ID3D12GraphicsCommandList1* command_list_1) {
+                                  ID3D12GraphicsCommandList1* command_list_1,
+                                  ID3D12GraphicsCommandList2* command_list_2) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
+  const uintmax_t* stream = (const uintmax_t*)command_stream_.data();
+  size_t stream_remaining = command_stream_.size() / sizeof(uintmax_t);
   ID3D12PipelineState* current_pipeline_state = nullptr;
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
@@ -102,17 +103,21 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kD3DBeginQuery: {
         auto& args = *reinterpret_cast<const D3DQueryArguments*>(stream);
-        command_list->BeginQuery(args.query_heap, args.type, args.index);
+        command_list->BeginQuery(args.query_heap, args.query_type, args.query_index);
       } break;
       case Command::kD3DEndQuery: {
         auto& args = *reinterpret_cast<const D3DQueryArguments*>(stream);
-        command_list->EndQuery(args.query_heap, args.type, args.index);
+        command_list->EndQuery(args.query_heap, args.query_type, args.query_index);
       } break;
       case Command::kD3DResolveQueryData: {
         auto& args = *reinterpret_cast<const D3DResolveQueryDataArguments*>(stream);
-        command_list->ResolveQueryData(args.query_heap, args.type, args.start_index,
-                                       args.num_queries, args.destination_buffer,
-                                       args.aligned_destination_buffer_offset);
+        command_list->ResolveQueryData(args.query_heap, args.query_type, args.start_index,
+                                       args.query_count, args.destination_buffer,
+                                       args.destination_offset);
+      } break;
+      case Command::kD3DSetPredication: {
+        auto& args = *reinterpret_cast<const D3DSetPredicationArguments*>(stream);
+        command_list->SetPredication(args.buffer, args.aligned_buffer_offset, args.operation);
       } break;
       case Command::kD3DIASetIndexBuffer: {
         auto view = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(stream);
@@ -138,7 +143,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
         auto& args = *reinterpret_cast<const D3DOMSetRenderTargetsArguments*>(stream);
         command_list->OMSetRenderTargets(
             args.num_render_target_descriptors, args.render_target_descriptors,
-            args.rts_single_handle_to_descriptor_range ? TRUE : FALSE,
+            args.rts_single_handle_to_descriptor_range ? true : false,
             args.depth_stencil ? &args.depth_stencil_descriptor : nullptr);
       } break;
       case Command::kD3DOMSetStencilRef: {
@@ -171,12 +176,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                                                     args->dest_offset_in_32bit_values);
       } break;
       case Command::kD3DSetComputeRootConstantBufferView: {
-        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        auto& args = *reinterpret_cast<const SetRootDescriptorArguments*>(stream);
         command_list->SetComputeRootConstantBufferView(args.root_parameter_index,
                                                        args.buffer_location);
       } break;
       case Command::kD3DSetGraphicsRootConstantBufferView: {
-        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        auto& args = *reinterpret_cast<const SetRootDescriptorArguments*>(stream);
         command_list->SetGraphicsRootConstantBufferView(args.root_parameter_index,
                                                         args.buffer_location);
       } break;
@@ -191,12 +196,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                                                      args.base_descriptor);
       } break;
       case Command::kD3DSetComputeRootShaderResourceView: {
-        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        auto& args = *reinterpret_cast<const SetRootDescriptorArguments*>(stream);
         command_list->SetComputeRootShaderResourceView(args.root_parameter_index,
                                                        args.buffer_location);
       } break;
       case Command::kD3DSetGraphicsRootShaderResourceView: {
-        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        auto& args = *reinterpret_cast<const SetRootDescriptorArguments*>(stream);
         command_list->SetGraphicsRootShaderResourceView(args.root_parameter_index,
                                                         args.buffer_location);
       } break;
@@ -209,12 +214,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
             *reinterpret_cast<ID3D12RootSignature* const*>(stream));
       } break;
       case Command::kD3DSetComputeRootUnorderedAccessView: {
-        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        auto& args = *reinterpret_cast<const SetRootDescriptorArguments*>(stream);
         command_list->SetComputeRootUnorderedAccessView(args.root_parameter_index,
                                                         args.buffer_location);
       } break;
       case Command::kD3DSetGraphicsRootUnorderedAccessView: {
-        auto& args = *reinterpret_cast<const SetRootConstantBufferViewArguments*>(stream);
+        auto& args = *reinterpret_cast<const SetRootDescriptorArguments*>(stream);
         command_list->SetGraphicsRootUnorderedAccessView(args.root_parameter_index,
                                                          args.buffer_location);
       } break;
@@ -253,6 +258,16 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                   : nullptr);
         }
       } break;
+      case Command::kD3DWriteBufferImmediate: {
+        if (command_list_2 != nullptr) {
+          auto& args = *reinterpret_cast<const D3DWriteBufferImmediateArguments*>(stream);
+          D3D12_WRITEBUFFERIMMEDIATE_PARAMETER param;
+          param.Dest = args.dest;
+          param.Value = args.value;
+          D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+          command_list_2->WriteBufferImmediate(1, &param, &mode);
+        }
+      } break;
       case Command::kBeginDebugMarker: {
         auto& args = *reinterpret_cast<const DebugMarkerHeader*>(stream);
         const char* label_name = reinterpret_cast<const char*>(
@@ -278,14 +293,15 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
-  size_t arguments_size_elements =
-      (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+  size_t arguments_size_elements = round_up(arguments_size_bytes, sizeof(uintmax_t), false);
+
   size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+  constexpr size_t kCommandHeaderSizeBytes = kCommandHeaderSizeElements * sizeof(uintmax_t);
+  command_stream_.resize(offset + kCommandHeaderSizeBytes + arguments_size_elements);
   CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
   header.command = command;
-  header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  header.arguments_size_elements = uint32_t(arguments_size_elements) / sizeof(uintmax_t);
+  return command_stream_.data() + (offset + kCommandHeaderSizeBytes);
 }
 
 }  // namespace rex::graphics::d3d12

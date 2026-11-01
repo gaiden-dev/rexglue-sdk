@@ -9,14 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <algorithm>
 #include <cfloat>
-#include <cstdint>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
-#include <rex/graphics/flags.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -24,38 +21,28 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
-                    "Execute unclipped draw vertex shader on CPU");
-
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
-                    "Execute unclipped draw VS on CPU with scissor");
-
-// DEFINE_bool(
-//     execute_unclipped_draw_vs_on_cpu, true,
-//     "Execute the vertex shader for draws with clipping disabled, primarily "
-//     "screen-space draws (such as clears), on the CPU when possible to estimate "
-//     "the extent of the EDRAM involved in the draw.\n"
-//     "Enabling this may significantly improve GPU performance as otherwise up "
-//     "to the entire EDRAM may be considered used in draws without clipping, "
-//     "potentially resulting in spurious EDRAM range ownership transfer round "
-//     "trips between host render targets.\n"
-//     "Also, on hosts where certain render target formats have to be emulated in "
-//     "a lossy way (for instance, 16-bit fixed-point via 16-bit floating-point), "
-//     "this prevents corruption of other render targets located after the "
-//     "current ones in the EDRAM by lossy range ownership transfers done for "
-//     "those draws.",
-//     "GPU");
-// DEFINE_bool(
-//     execute_unclipped_draw_vs_on_cpu_with_scissor, false,
-//     "Don't restrict the usage of execute_unclipped_draw_vs_on_cpu to only "
-//     "non-scissored draws (with the right and the bottom sides of the scissor "
-//     "rectangle at 8192 or beyond) even though if the scissor rectangle is "
-//     "present, it's usually sufficient for esimating the height of the render "
-//     "target.\n"
-//     "Enabling this may cause excessive processing of vertices on the CPU, as "
-//     "some games draw rectangles (for their UI, for instance) without clipping, "
-//     "but with a proper scissor rectangle.",
-//     "GPU");
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU.Debug",
+                    "Execute the vertex shader for draws with clipping disabled, primarily "
+                    "screen-space draws (such as clears), on the CPU when possible to estimate "
+                    "the extent of the EDRAM involved in the draw.\n"
+                    "Enabling this may significantly improve GPU performance as otherwise up "
+                    "to the entire EDRAM may be considered used in draws without clipping, "
+                    "potentially resulting in spurious EDRAM range ownership transfer round "
+                    "trips between host render targets.\n"
+                    "Also, on hosts where certain render target formats have to be emulated in "
+                    "a lossy way (for instance, 16-bit fixed-point via 16-bit floating-point), "
+                    "this prevents corruption of other render targets located after the "
+                    "current ones in the EDRAM by lossy range ownership transfers done for "
+                    "those draws.");
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU.Debug",
+                    "Don't restrict the usage of execute_unclipped_draw_vs_on_cpu to only "
+                    "non-scissored draws (with the right and the bottom sides of the scissor "
+                    "rectangle at 8192 or beyond) even though if the scissor rectangle is "
+                    "present, it's usually sufficient for esimating the height of the render "
+                    "target.\n"
+                    "Enabling this may cause excessive processing of vertices on the CPU, as "
+                    "some games draw rectangles (for their UI, for instance) without clipping, "
+                    "but with a proper scissor rectangle.");
 
 namespace rex::graphics {
 
@@ -116,6 +103,8 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
     xenos::IndexFormat index_format = vgt_draw_initiator.index_size;
     uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+    uint32_t index_buffer_read_count =
+        std::min(uint32_t(vgt_draw_initiator.num_indices), uint32_t(vgt_dma_size.num_words));
     if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
       // Handle the index endianness to same way as the PrimitiveProcessor.
       if (index_endian == xenos::Endian::k8in32) {
@@ -124,9 +113,17 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
         index_endian = xenos::Endian::kNone;
       }
       index_buffer_base &= ~uint32_t(sizeof(uint16_t) - 1);
+      if (trace_writer_) {
+        trace_writer_->WriteMemoryRead(index_buffer_base,
+                                       sizeof(uint16_t) * index_buffer_read_count);
+      }
     } else {
       assert_true(vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32);
       index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
+      if (trace_writer_) {
+        trace_writer_->WriteMemoryRead(index_buffer_base,
+                                       sizeof(uint32_t) * index_buffer_read_count);
+      }
     }
     index_buffer = memory_.TranslatePhysical(index_buffer_base);
   }

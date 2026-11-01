@@ -10,8 +10,6 @@
  */
 
 #include <cstdarg>
-#include <set>
-#include <string>
 
 #include <rex/graphics/pipeline/shader/translator.h>
 #include <rex/math.h>

@@ -39,12 +39,12 @@ set(REXUI_VULKAN_SOURCES
     vulkan/spirv_tools_context.cpp
     vulkan/ui_samplers.cpp
     vulkan/vulkan_device.cpp
+    vulkan/vulkan_gpu_completion_timeline.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
     vulkan/vulkan_mem_alloc.cpp
     vulkan/vulkan_presenter.cpp
     vulkan/vulkan_provider.cpp
-    vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
 )
@@ -54,10 +54,10 @@ if(REXGLUE_USE_D3D12)
     set(REXUI_D3D12_SOURCES
         d3d12/d3d12_cpu_descriptor_pool.cpp
         d3d12/d3d12_descriptor_heap_pool.cpp
+        d3d12/d3d12_gpu_completion_timeline.cpp
         d3d12/d3d12_immediate_drawer.cpp
         d3d12/d3d12_presenter.cpp
         d3d12/d3d12_provider.cpp
-        d3d12/d3d12_submission_tracker.cpp
         d3d12/d3d12_upload_buffer_pool.cpp
         d3d12/d3d12_util.cpp
     )

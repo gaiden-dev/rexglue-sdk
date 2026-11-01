@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -8,8 +9,6 @@
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
-
-#pragma once
 
 #include <atomic>
 #include <vector>
@@ -50,7 +49,7 @@ class DxbcShader : public Shader {
   const std::vector<TextureBinding>& GetTextureBindingsAfterTranslation() const {
     return texture_bindings_;
   }
-  uint32_t GetUsedTextureMaskAfterTranslation() const { return used_texture_mask_; }
+  const uint32_t GetUsedTextureMaskAfterTranslation() const { return used_texture_mask_; }
 
   static constexpr uint32_t kMaxSamplerBindingIndexBits =
       DxbcShaderTranslator::kMaxSamplerBindingIndexBits;

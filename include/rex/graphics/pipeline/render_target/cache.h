@@ -21,12 +21,22 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/xenos.h>
+
+REXCVAR_DECLARE(bool, debug_msaa_2x_as_4x);
+REXCVAR_DECLARE(bool, depth_transfer_not_equal_test);
+REXCVAR_DECLARE(bool, depth_float24_round);
+REXCVAR_DECLARE(bool, depth_float24_convert_in_pixel_shader);
+REXCVAR_DECLARE(bool, draw_resolution_scaled_texture_offsets);
+REXCVAR_DECLARE(bool, gamma_render_target_as_unorm16);
+REXCVAR_DECLARE(bool, native_stencil_value_output);
+REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
 
 namespace rex::graphics {
 
@@ -62,12 +72,16 @@ class RenderTargetCache {
     // - 16_16_FLOAT, k_16_16_16_16_FLOAT - the Xenos float16 doesn't have
     //   special values.
     // Significant differences:
-    // - 8_8_8_8_GAMMA - the piecewise linear gamma curve is very different than
-    //   sRGB, one possible path is conversion in shaders (resulting in
-    //   incorrect blending, especially visible on decals in 4D5307E6), another
-    //   is using sRGB render targets and either conversion on resolve or
-    //   reading the resolved data as a true sRGB texture (incorrect when the
-    //   game accesses the data directly, like 4541080F).
+    // - 8_8_8_8_GAMMA - the piecewise linear gamma precision distribution
+    //   encoding is very different from sRGB. Linear space blending can be
+    //   obtained by promoting to R16G16B16A16_UNORM, but for compact storage,
+    //   conversion in pixel shader output may be done, though it results in
+    //   incorrect blending, especially visible on decals in 4D5307E6. Emulating
+    //   by replacing the encoding with sRGB for render target writes and
+    //   resolved texture reads could work for some games, but certain games,
+    //   such as 4541080F, perform piecewise gamma encoding calculations in
+    //   their code, and that produces noticeably incorrect results if the
+    //   encoding is changed in guest texture memory.
     // - 2_10_10_10_FLOAT - ranges significantly different than in float16, much
     //   smaller RGB range, and alpha is fixed-point and has only 2 bits.
     // - 16_16, 16_16_16_16 - has -32 to 32 range, not -1 to 1 - need either to
@@ -164,6 +178,18 @@ class RenderTargetCache {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
 
+  // Whether surfaces with this pitch render native per the scale threshold.
+  // Compares the tile-aligned width, so it's a pure function of key fields.
+  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples) const;
+  // Same for RB_SURFACE_INFO
+  bool IsDrawScaleNative() const;
+  // Scale of the current draw, the global scale or 1x1 under the threshold.
+  // Everything per-draw must use these so a draw never mixes scales.
+  // Quietly assuming the global scale all but promises a bunch of mixed-
+  // space artifacts (trust me).
+  uint32_t GetDrawScaleX() const { return IsDrawScaleNative() ? 1 : draw_resolution_scale_x(); }
+  uint32_t GetDrawScaleY() const { return IsDrawScaleNative() ? 1 : draw_resolution_scale_y(); }
+
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
   // also).
@@ -182,11 +208,12 @@ class RenderTargetCache {
 
  protected:
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
-                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
+                    TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
+                    uint32_t draw_resolution_scale_y)
       : register_file_(register_file),
-        draw_extent_estimator_(register_file, memory),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y) {
+        draw_resolution_scale_y_(draw_resolution_scale_y),
+        draw_extent_estimator_(register_file, memory, trace_writer) {
     assert_not_zero(draw_resolution_scale_x);
     assert_not_zero(draw_resolution_scale_y);
   }
@@ -231,8 +258,14 @@ class RenderTargetCache {
       uint32_t pitch_tiles_at_32bpp : 8;                          // 19
       xenos::MsaaSamples msaa_samples : xenos::kMsaaSamplesBits;  // 21
       uint32_t is_depth : 1;                                      // 22
-      // Ignoring the blending precision and sRGB.
+      // Ignoring the blending precision.
       uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      // 1 if this render target is kept at native guest resolution because of
+      // draw_resolution_scale_threshold. Native and scaled targets at the same
+      // base are distinct objects and ownership can be transferred. One bit is
+      // enough. The only classes are the global scale and 1x1. Keys never
+      // carry arbitrary scales.
+      uint32_t scale_native : 1;  // 27
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -279,10 +312,19 @@ class RenderTargetCache {
     uint32_t GetWidth() const { return GetWidth(pitch_tiles_at_32bpp, msaa_samples); }
 
     std::string GetDebugName() const {
-      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}", base_tiles, GetPitchTiles(),
-                         uint32_t(1) << uint32_t(msaa_samples), GetFormatName());
+      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}{}", base_tiles, GetPitchTiles(),
+                         uint32_t(1) << uint32_t(msaa_samples), GetFormatName(),
+                         scale_native ? ", native" : "");
     }
   };
+
+  // The scale this render target is actually created and drawn at.
+  uint32_t GetKeyScaleX(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetKeyScaleY(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_y();
+  }
 
   class RenderTarget {
    public:
@@ -451,15 +493,6 @@ class RenderTargetCache {
     }
   };
 
-  // A flattened dispatch extracted from ResolveCopyDumpRectangle.
-  struct ResolveCopyDispatch {
-    uint32_t rectangle_index;
-    ResolveCopyDumpRectangle::Dispatch dispatch;
-    ResolveCopyDispatch(uint32_t rectangle_index,
-                        const ResolveCopyDumpRectangle::Dispatch& dispatch)
-        : rectangle_index(rectangle_index), dispatch(dispatch) {}
-  };
-
   virtual uint32_t GetMaxRenderTargetWidth() const = 0;
   virtual uint32_t GetMaxRenderTargetHeight() const = 0;
 
@@ -492,6 +525,7 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
   }
+
   const std::vector<Transfer>* last_update_transfers() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
@@ -522,10 +556,14 @@ class RenderTargetCache {
   void GetResolveCopyRectanglesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
                                       uint32_t pitch,
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out) const;
-  void GetResolveCopyDispatchesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
-                                      uint32_t pitch,
-                                      std::vector<ResolveCopyDumpRectangle>& rectangles_out,
-                                      std::vector<ResolveCopyDispatch>& dispatches_out) const;
+
+  // True if everything owning the resolve source region is native scale, in
+  // which case the resolve can be done at 1x1 into shared memory instead of
+  // duplicating pixels into the scaled layout (which ruins linear filtering).
+  // Decided from actual ownership rather than resolve dimensions since one
+  // range can span both classes.
+  bool IsResolveSourceNativeOnly(uint32_t base, uint32_t row_length, uint32_t rows,
+                                 uint32_t pitch) const;
 
   // Sets up the needed render targets and transfers to perform a clear in a
   // resolve operation via a host render target clear. resolve_info is expected
@@ -539,6 +577,16 @@ class RenderTargetCache {
                                             std::vector<Transfer>& depth_transfers_out,
                                             RenderTarget*& color_render_target_out,
                                             std::vector<Transfer>& color_transfers_out);
+
+  // For restoring EDRAM contents from frame traces, obtains or creates a render
+  // target at base 0 with of 1280 (only 1 sample and color because copying
+  // between MSAA render targets and buffers is not possible in Direct3D 12, and
+  // depth may require additional format conversions, not needed really) and
+  // transfers ownership of the entire EDRAM to that render target. If a
+  // full-EDRAM render target can't be created (for instance, due to size
+  // limitations on the host), nullptr is returned.
+  RenderTarget* PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+      xenos::ColorRenderTargetFormat color_format);
 
   // For pixel shader interlock.
 

@@ -14,7 +14,6 @@
 #include <memory>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -43,8 +42,11 @@ class VulkanTextureCache final : public TextureCache {
       xenos::AnisoFilter aniso_filter : 3;  // 17
       uint32_t mip_min_level : 4;           // 21
       uint32_t mip_base_map : 1;            // 22
+      // Force the border color alpha to 1.0 (only meaningful with a border
+      // clamp mode).
+      uint32_t force_bc_w_to_max : 1;  // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
-      // can be used to limit fetching to mip_min_level.
+      // limits fetching to mip_min_level (level 0 when the base is available).
     };
 
     SamplerParameters() : value(0) { static_assert_size(*this, sizeof(value)); }
@@ -76,8 +78,6 @@ class VulkanTextureCache final : public TextureCache {
   ~VulkanTextureCache();
 
   void BeginSubmission(uint64_t new_submission_index) override;
-  void BeginFrame() override;
-  void EndFrame();
 
   // Must be called within a frame - creates and untiles textures needed by
   // shaders, and enqueues transitioning them into the sampled usage. This may
@@ -88,6 +88,14 @@ class VulkanTextureCache final : public TextureCache {
 
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
+
+  // Descriptor set (kStorageBufferCompute layout) binding the whole shared
+  // memory buffer for compute load/store, or VK_NULL_HANDLE if the buffer
+  // doesn't fit in maxStorageBufferRange. When valid, the byte offset into the
+  // buffer must be supplied via push constants. Shared with resolve.
+  VkDescriptorSet shared_memory_persistent_descriptor_set() const {
+    return shared_memory_persistent_descriptor_set_;
+  }
 
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
@@ -110,32 +118,81 @@ class VulkanTextureCache final : public TextureCache {
   // Returns the 2D view of the front buffer texture (for fragment shader
   // reading - the barrier will be pushed in the command processor if needed),
   // or VK_NULL_HANDLE in case of failure. May call LoadTextureData.
-  // If swap_source_needs_rb_swap_out is not nullptr, writes whether the final
-  // guest-to-host swizzle requires swapping red and blue (R <- B, B <- R) with
-  // green preserved, which is needed by the presentation fallback path on
-  // devices without imageViewFormatSwizzle.
   VkImageView RequestSwapTexture(uint32_t& width_scaled_out, uint32_t& height_scaled_out,
-                                 xenos::TextureFormat& format_out,
-                                 uint32_t* width_unscaled_out = nullptr,
-                                 uint32_t* height_unscaled_out = nullptr,
-                                 bool* swap_source_needs_rb_swap_out = nullptr);
+                                 xenos::TextureFormat& format_out);
 
-  bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
-                             uint32_t length_scaled_alignment_log2, uint64_t& start_scaled_out,
-                             uint64_t& length_scaled_out) const;
-  bool CommitScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
-                                uint32_t length_scaled_alignment_log2 = 0) {
+  // Scaled resolve buffer management (for use by VulkanRenderTargetCache)
+  // Simple non-overlapping buffer (fallback when sparse binding unavailable)
+  struct ScaledResolveBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    uint64_t size = 0;
+    uint64_t range_start_scaled = 0;
+    uint64_t range_length_scaled = 0;
+  };
+
+  // Sparse buffer wrapper for overlapping 2GB windows
+  class ScaledResolveSparseBuffer {
+   public:
+    explicit ScaledResolveSparseBuffer(VkBuffer buffer) : buffer_(buffer) {}
+
+    VkBuffer buffer() const { return buffer_; }
+
+   private:
+    VkBuffer buffer_ = VK_NULL_HANDLE;
+  };
+
+  // Constants for sparse scaled resolve
+  static constexpr uint32_t kScaledResolveHeapSizeLog2 = 24;  // 16MB heaps
+  static constexpr uint32_t kScaledResolveHeapSize = uint32_t(1) << kScaledResolveHeapSizeLog2;
+  static constexpr uint64_t kScaledResolveSparseBufferSize = uint64_t(2) << 30;  // 2GB per buffer
+
+  // Public scaled resolve buffer methods for use by VulkanRenderTargetCache
+  bool EnsureScaledResolveMemoryCommittedPublic(uint32_t start_unscaled, uint32_t length_unscaled,
+                                                uint32_t length_scaled_alignment_log2 = 0) {
     return EnsureScaledResolveMemoryCommitted(start_unscaled, length_unscaled,
                                               length_scaled_alignment_log2);
   }
-  VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
-  void UseScaledResolveBufferForRead();
-  void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
-                                      uint64_t written_length_scaled);
+
+  bool MakeScaledResolveRangeCurrent(uint32_t start_unscaled, uint32_t length_unscaled,
+                                     uint32_t length_scaled_alignment_log2 = 0);
+
+  VkBuffer GetCurrentScaledResolveBuffer() const;
+
+  // Returns the base scaled address that the current buffer starts at.
+  // For sparse buffers: buffer N starts at N GB (N << 30)
+  // For simple buffers: returns the buffer's range_start_scaled
+  uint64_t GetCurrentScaledResolveBufferBaseOffset() const {
+    if (sparse_scaled_resolve_supported_) {
+      return uint64_t(scaled_resolve_current_buffer_index_) << 30;
+    }
+    if (scaled_resolve_current_buffer_index_ < scaled_resolve_buffers_.size()) {
+      return scaled_resolve_buffers_[scaled_resolve_current_buffer_index_].range_start_scaled;
+    }
+    return 0;
+  }
+
+  size_t GetScaledResolveCurrentBufferIndex() const { return scaled_resolve_current_buffer_index_; }
+
+  // The range specified in the last successful MakeScaledResolveRangeCurrent
+  // call, in the scaled physical memory address space.
+  uint64_t GetCurrentScaledResolveRangeStartScaled() const {
+    return scaled_resolve_current_range_start_scaled_;
+  }
+  uint64_t GetCurrentScaledResolveRangeLengthScaled() const {
+    return scaled_resolve_current_range_length_scaled_;
+  }
+
+  const ScaledResolveBuffer* GetScaledResolveBufferInfo(size_t index) const {
+    if (index < scaled_resolve_buffers_.size()) {
+      return &scaled_resolve_buffers_[index];
+    }
+    return nullptr;
+  }
 
  protected:
-  bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
+  bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   uint32_t GetHostFormatSwizzle(TextureKey key) const override;
 
   uint32_t GetMaxHostTextureWidthHeight(xenos::DataDimension dimension) const override;
@@ -143,11 +200,11 @@ class VulkanTextureCache final : public TextureCache {
 
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
 
-  bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
-                                          uint32_t length_scaled_alignment_log2 = 0) override;
-
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
+
+  bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
+                                          uint32_t length_scaled_alignment_log2 = 0) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
@@ -161,10 +218,10 @@ class VulkanTextureCache final : public TextureCache {
   struct HostFormat {
     LoadShaderIndex load_shader;
     // Do NOT add integer formats to this - they are not filterable, can only be
-    // read with ImageFetch, not ImageSample! If any game is seen using
-    // num_format 1 for fixed-point formats (for floating-point, it's normally
-    // set to 1 though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // read with ImageFetch, not ImageSample! Games that fetch fixed-point
+    // formats are handled after sampling by scaling the normalized host value
+    // back to the guest integer range (see GetIntegerScaleBits). Keep these as
+    // sampled float/normalized views.
     VkFormat format;
     // Whether the format is block-compressed on the host (the host block size
     // matches the guest format block size in this case), and isn't decompressed
@@ -196,6 +253,7 @@ class VulkanTextureCache final : public TextureCache {
     };
 
     // Takes ownership of the image and its memory.
+    // track_usage: if false, texture won't participate in LRU cache eviction.
     explicit VulkanTexture(VulkanTextureCache& texture_cache, const TextureKey& key, VkImage image,
                            VmaAllocation allocation, bool track_usage = true);
     ~VulkanTexture();
@@ -210,6 +268,8 @@ class VulkanTextureCache final : public TextureCache {
     }
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
+
+    // For 3D textures sampled as 2D - creates a 2D copy of slice 0.
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
 
    private:
@@ -266,6 +326,9 @@ class VulkanTextureCache final : public TextureCache {
     Usage usage_ = Usage::kUndefined;
 
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
+
+    // For 3D textures sampled as 2D - cached 2D texture loaded from slice 0.
+    // Uses a modified key (depth=1) with 3D tiling to read from guest memory.
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
@@ -285,7 +348,6 @@ class VulkanTextureCache final : public TextureCache {
 
   struct Sampler {
     VkSampler sampler;
-    bool uses_custom_border_color;
     uint64_t last_usage_submission;
     std::pair<const SamplerParameters, Sampler>* used_previous;
     std::pair<const SamplerParameters, Sampler>* used_next;
@@ -314,18 +376,24 @@ class VulkanTextureCache final : public TextureCache {
                               VkPipelineStageFlags guest_shader_pipeline_stages);
 
   bool Initialize();
-  bool InitializeScaledResolveBuffer();
-  void ShutdownScaledResolveBuffer();
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
 
   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
-  bool EnsureScaledResolveBufferAllocated(uint64_t start_scaled, uint64_t length_scaled);
-  void GetScaledResolveUsageMasks(VkPipelineStageFlags& stage_mask_out,
-                                  VkAccessFlags& access_mask_out, bool write) const;
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
+
+  // Sparse scaled resolve helper functions
+  bool InitializeSparseScaledResolve();
+  void ShutdownSparseScaledResolve();
+  size_t GetScaledResolveSparseBufferCount() const;
+  std::array<size_t, 2> GetPossibleScaledResolveBufferIndices(uint64_t address_scaled) const;
+  bool EnsureScaledResolveMemoryCommittedSparse(uint32_t start_unscaled, uint32_t length_unscaled,
+                                                uint32_t length_scaled_alignment_log2);
+  bool MakeScaledResolveRangeCurrentSparse(uint32_t start_unscaled, uint32_t length_unscaled,
+                                           uint32_t length_scaled_alignment_log2);
+  void BindHeapToOverlappingBuffers(uint32_t heap_index, VkDeviceMemory heap);
 
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
@@ -339,16 +407,21 @@ class VulkanTextureCache final : public TextureCache {
   static const HostFormatPair kBestHostFormats[64];
   static const HostFormatPair kHostFormatGBGRUnaligned;
   static const HostFormatPair kHostFormatBGRGUnaligned;
-  static const HostFormatPair kHostFormatDXT1Unaligned;
-  static const HostFormatPair kHostFormatDXT2_3Unaligned;
-  static const HostFormatPair kHostFormatDXT4_5Unaligned;
-  static const HostFormatPair kHostFormatDXNUnaligned;
-  static const HostFormatPair kHostFormatDXT5AUnaligned;
   HostFormatPair host_formats_[64];
 
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
+
+  // Persistent descriptor binding the whole shared memory buffer
+  // (kStorageBufferCompute layout) for compute load/store, so per-operation
+  // transient descriptors don't need to be allocated and written. Only created
+  // when the buffer fits in maxStorageBufferRange. The byte offset into the
+  // buffer is passed via push constants instead. Used as the source of texture
+  // loads here, and shared as the destination of resolves in the render target
+  // cache.
+  VkDescriptorPool shared_memory_persistent_descriptor_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet shared_memory_persistent_descriptor_set_ = VK_NULL_HANDLE;
 
   // If both images can be placed in the same allocation, it's one allocation,
   // otherwise it's two separate.
@@ -362,15 +435,6 @@ class VulkanTextureCache final : public TextureCache {
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
 
-  // Unsupported texture formats used during this frame (for research and
-  // testing).
-  enum : uint8_t {
-    kUnsupportedResourceBit = 1,
-    kUnsupportedUnormBit = kUnsupportedResourceBit << 1,
-    kUnsupportedSnormBit = kUnsupportedUnormBit << 1,
-  };
-  uint8_t unsupported_format_features_used_[64] = {};
-
   uint32_t sampler_max_count_;
 
   xenos::AnisoFilter max_anisotropy_;
@@ -378,17 +442,31 @@ class VulkanTextureCache final : public TextureCache {
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
-  uint32_t custom_border_color_sampler_count_ = 0;
 
-  VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
-  uint64_t scaled_resolve_buffer_size_ = 0;
-  bool scaled_resolve_buffer_sparse_ = false;
-  uint32_t scaled_resolve_buffer_memory_type_ = UINT32_MAX;
-  std::vector<VkDeviceMemory> scaled_resolve_buffer_memory_;
-  uint32_t scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;
-  std::vector<uint64_t> scaled_resolve_sparse_allocated_;
-  bool scaled_resolve_last_usage_write_ = false;
-  std::pair<uint64_t, uint64_t> scaled_resolve_last_written_range_{0, 0};
+  // Scaled resolve buffer storage (simple non-overlapping, fallback path)
+  std::vector<ScaledResolveBuffer> scaled_resolve_buffers_;
+  // Current scaled resolve range tracking
+  uint64_t scaled_resolve_current_range_start_scaled_ = 0;
+  uint64_t scaled_resolve_current_range_length_scaled_ = 0;
+  size_t scaled_resolve_current_buffer_index_ = SIZE_MAX;
+
+  // Sparse scaled resolve (overlapping 2GB windows)
+  bool sparse_scaled_resolve_supported_ = false;
+  // 2GB overlapping sparse buffers - buffer N covers [N GB ... (N+2) GB)
+  // For 3x3 scale (4.5GB), need 4 buffers: 0:[0-2GB), 1:[1-3GB), 2:[2-4GB),
+  // 3:[3-4.5GB)
+  static constexpr size_t kMaxScaledResolveSparseBuffers =
+      (uint64_t(SharedMemory::kBufferSize) * kMaxDrawResolutionScaleAlongAxis *
+           kMaxDrawResolutionScaleAlongAxis -
+       1) >>
+      30;
+  std::array<std::unique_ptr<ScaledResolveSparseBuffer>, kMaxScaledResolveSparseBuffers>
+      scaled_resolve_sparse_buffers_;
+  // 16MB heaps that can be mapped to multiple buffer regions
+  std::vector<VkDeviceMemory> scaled_resolve_heaps_;
+  uint32_t scaled_resolve_heap_count_ = 0;
+  // Memory type for sparse allocations
+  uint32_t scaled_resolve_memory_type_ = UINT32_MAX;
 };
 
 }  // namespace rex::graphics::vulkan

@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <set>
@@ -21,10 +22,9 @@
 
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/registers.h>
-#include <rex/graphics/xenos.h>
 #include <rex/math.h>
+#include <rex/memory.h>
 #include <rex/string/buffer.h>
-#include <rex/types.h>
 
 namespace rex::graphics {
 
@@ -118,11 +118,11 @@ constexpr SwizzleSource GetSwizzledAluSourceComponent(uint32_t swizzle, uint32_t
       ucode::AluInstruction::GetSwizzledComponentIndex(swizzle, component_index));
 }
 inline char GetCharForComponentIndex(uint32_t i) {
-  const static char kChars[] = {'x', 'y', 'z', 'w'};
+  constexpr static char kChars[] = {'x', 'y', 'z', 'w'};
   return kChars[i];
 }
 inline char GetCharForSwizzle(SwizzleSource swizzle_source) {
-  const static char kChars[] = {'x', 'y', 'z', 'w', '0', '1'};
+  constexpr static char kChars[] = {'x', 'y', 'z', 'w', '0', '1'};
   return kChars[static_cast<uint32_t>(swizzle_source)];
 }
 
@@ -966,8 +966,21 @@ class Shader {
   // An externally managed identifier of the shader storage the microcode of the
   // shader was last written to, or was loaded from, to only write the shader
   // microcode to the storage once. UINT32_MAX by default.
-  uint32_t ucode_storage_index() const { return ucode_storage_index_; }
-  void set_ucode_storage_index(uint32_t storage_index) { ucode_storage_index_ = storage_index; }
+  uint32_t ucode_storage_index() const {
+    return ucode_storage_index_.load(std::memory_order_relaxed);
+  }
+  void set_ucode_storage_index(uint32_t storage_index) {
+    ucode_storage_index_.store(storage_index, std::memory_order_relaxed);
+  }
+  // Atomically set storage index if changed. Returns true if updated.
+  bool try_set_ucode_storage_index(uint32_t new_index) {
+    uint32_t expected = ucode_storage_index_.load(std::memory_order_relaxed);
+    if (expected == new_index) {
+      return false;
+    }
+    return ucode_storage_index_.compare_exchange_strong(expected, new_index,
+                                                        std::memory_order_relaxed);
+  }
 
   // Dumps the shader's microcode binary and, if analyzed, disassembly, to files
   // in the given directory based on ucode hash. Returns the name of the written
@@ -1005,7 +1018,7 @@ class Shader {
   std::string ucode_disassembly_;
   std::vector<VertexBinding> vertex_bindings_;
   std::vector<TextureBinding> texture_bindings_;
-  ConstantRegisterMap constant_register_map_ = {};
+  ConstantRegisterMap constant_register_map_ = {0};
   std::set<uint32_t> label_addresses_;
   uint32_t cf_pair_index_bound_ = 0;
   uint32_t register_static_address_bound_ = 0;
@@ -1031,7 +1044,7 @@ class Shader {
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
 
-  uint32_t ucode_storage_index_ = UINT32_MAX;
+  std::atomic<uint32_t> ucode_storage_index_{UINT32_MAX};
 
  private:
   void GatherExecInformation(const ParsedExecInstruction& instr,

@@ -9,8 +9,6 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <cstddef>
-#include <cstdint>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -68,11 +66,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, args.contents);
       } break;
 
-      case Command::kVkBeginQuery: {
-        auto& args = *reinterpret_cast<const ArgsVkBeginQuery*>(stream);
-        dfn.vkCmdBeginQuery(command_buffer, args.query_pool, args.query, args.flags);
-      } break;
-
       case Command::kVkBindDescriptorSets: {
         auto& args = *reinterpret_cast<const ArgsVkBindDescriptorSets*>(stream);
         size_t offset_bytes =
@@ -114,6 +107,38 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdBindVertexBuffers(command_buffer, args.first_binding, args.binding_count, buffers,
                                    offsets);
       } break;
+      case Command::kVkBeginQuery: {
+        auto& args = *reinterpret_cast<const ArgsVkBeginQuery*>(stream);
+        dfn.vkCmdBeginQuery(command_buffer, args.query_pool, args.query, args.flags);
+      } break;
+      case Command::kVkEndQuery: {
+        auto& args = *reinterpret_cast<const ArgsVkEndQuery*>(stream);
+        dfn.vkCmdEndQuery(command_buffer, args.query_pool, args.query);
+      } break;
+      case Command::kVkCopyQueryPoolResults: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
+        dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
+                                      args.query_count, args.dst_buffer, args.dst_offset,
+                                      args.stride, args.flags);
+      } break;
+      case Command::kVkResetQueryPool: {
+        auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
+        dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
+                                args.query_count);
+      } break;
+      case Command::kVkBeginConditionalRenderingEXT: {
+        auto& args = *reinterpret_cast<const ArgsVkBeginConditionalRenderingEXT*>(stream);
+        VkConditionalRenderingBeginInfoEXT begin_info;
+        begin_info.sType = VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT;
+        begin_info.pNext = nullptr;
+        begin_info.buffer = args.buffer;
+        begin_info.offset = args.offset;
+        begin_info.flags = args.flags;
+        dfn.vkCmdBeginConditionalRenderingEXT(command_buffer, &begin_info);
+      } break;
+      case Command::kVkEndConditionalRenderingEXT: {
+        dfn.vkCmdEndConditionalRenderingEXT(command_buffer);
+      } break;
 
       case Command::kVkClearAttachments: {
         auto& args = *reinterpret_cast<const ArgsVkClearAttachments*>(stream);
@@ -146,6 +171,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                 rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy))));
       } break;
 
+      case Command::kVkFillBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
+        dfn.vkCmdFillBuffer(command_buffer, args.dst_buffer, args.dst_offset, args.size, args.data);
+      } break;
+
       case Command::kVkCopyBufferToImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
         dfn.vkCmdCopyBufferToImage(
@@ -156,11 +186,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
-      case Command::kVkCopyQueryPoolResults: {
-        auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
-        dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
-                                      args.query_count, args.dst_buffer, args.dst_offset,
-                                      args.stride, args.flags);
+      case Command::kVkBlitImage: {
+        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
+        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, args.region_count,
+                           reinterpret_cast<const VkImageBlit*>(
+                               reinterpret_cast<const uint8_t*>(stream) +
+                               rex::align(sizeof(ArgsVkBlitImage), alignof(VkImageBlit))),
+                           args.filter);
       } break;
 
       case Command::kVkDispatch: {
@@ -181,52 +214,8 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                              args.first_index, args.vertex_offset, args.first_instance);
       } break;
 
-      case Command::kVkEndQuery: {
-        auto& args = *reinterpret_cast<const ArgsVkEndQuery*>(stream);
-        dfn.vkCmdEndQuery(command_buffer, args.query_pool, args.query);
-      } break;
-
       case Command::kVkEndRenderPass:
         dfn.vkCmdEndRenderPass(command_buffer);
-        break;
-
-      case Command::kVkBeginRendering: {
-        auto& args = *reinterpret_cast<const ArgsVkBeginRendering*>(stream);
-        size_t offset_bytes =
-            rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
-        const VkRenderingAttachmentInfo* color_attachments =
-            args.color_attachment_count
-                ? reinterpret_cast<const VkRenderingAttachmentInfo*>(
-                      reinterpret_cast<const uint8_t*>(stream) + offset_bytes)
-                : nullptr;
-        offset_bytes += sizeof(VkRenderingAttachmentInfo) * args.color_attachment_count;
-        const VkRenderingAttachmentInfo* depth_attachment =
-            args.has_depth_attachment ? reinterpret_cast<const VkRenderingAttachmentInfo*>(
-                                            reinterpret_cast<const uint8_t*>(stream) + offset_bytes)
-                                      : nullptr;
-        if (args.has_depth_attachment) {
-          offset_bytes += sizeof(VkRenderingAttachmentInfo);
-        }
-        const VkRenderingAttachmentInfo* stencil_attachment =
-            args.has_stencil_attachment
-                ? reinterpret_cast<const VkRenderingAttachmentInfo*>(
-                      reinterpret_cast<const uint8_t*>(stream) + offset_bytes)
-                : nullptr;
-        VkRenderingInfo rendering_info = {};
-        rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        rendering_info.flags = args.flags;
-        rendering_info.renderArea = args.render_area;
-        rendering_info.layerCount = args.layer_count;
-        rendering_info.viewMask = args.view_mask;
-        rendering_info.colorAttachmentCount = args.color_attachment_count;
-        rendering_info.pColorAttachments = color_attachments;
-        rendering_info.pDepthAttachment = depth_attachment;
-        rendering_info.pStencilAttachment = stencil_attachment;
-        dfn.vkCmdBeginRendering(command_buffer, &rendering_info);
-      } break;
-
-      case Command::kVkEndRendering:
-        dfn.vkCmdEndRendering(command_buffer);
         break;
 
       case Command::kVkPipelineBarrier: {
@@ -264,12 +253,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdPushConstants(
             command_buffer, args.layout, args.stage_flags, args.offset, args.size,
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
-      } break;
-
-      case Command::kVkResetQueryPool: {
-        auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
-        dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
-                                args.query_count);
       } break;
 
       case Command::kVkSetBlendConstants: {
@@ -369,47 +352,6 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
   if (image_memory_barrier_count) {
     std::memcpy(args_ptr + image_memory_barriers_offset, image_memory_barriers,
                 sizeof(VkImageMemoryBarrier) * image_memory_barrier_count);
-  }
-}
-
-void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
-  assert_null(rendering_info->pNext);
-
-  size_t arguments_size =
-      rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
-  size_t color_attachments_offset = arguments_size;
-  arguments_size += sizeof(VkRenderingAttachmentInfo) * rendering_info->colorAttachmentCount;
-  size_t depth_attachment_offset = arguments_size;
-  if (rendering_info->pDepthAttachment) {
-    arguments_size += sizeof(VkRenderingAttachmentInfo);
-  }
-  size_t stencil_attachment_offset = arguments_size;
-  if (rendering_info->pStencilAttachment) {
-    arguments_size += sizeof(VkRenderingAttachmentInfo);
-  }
-
-  uint8_t* args_ptr =
-      reinterpret_cast<uint8_t*>(WriteCommand(Command::kVkBeginRendering, arguments_size));
-  auto& args = *reinterpret_cast<ArgsVkBeginRendering*>(args_ptr);
-  args.flags = rendering_info->flags;
-  args.render_area = rendering_info->renderArea;
-  args.layer_count = rendering_info->layerCount;
-  args.view_mask = rendering_info->viewMask;
-  args.color_attachment_count = rendering_info->colorAttachmentCount;
-  args.has_depth_attachment = rendering_info->pDepthAttachment != nullptr;
-  args.has_stencil_attachment = rendering_info->pStencilAttachment != nullptr;
-
-  if (rendering_info->colorAttachmentCount) {
-    std::memcpy(args_ptr + color_attachments_offset, rendering_info->pColorAttachments,
-                sizeof(VkRenderingAttachmentInfo) * rendering_info->colorAttachmentCount);
-  }
-  if (rendering_info->pDepthAttachment) {
-    std::memcpy(args_ptr + depth_attachment_offset, rendering_info->pDepthAttachment,
-                sizeof(VkRenderingAttachmentInfo));
-  }
-  if (rendering_info->pStencilAttachment) {
-    std::memcpy(args_ptr + stencil_attachment_offset, rendering_info->pStencilAttachment,
-                sizeof(VkRenderingAttachmentInfo));
   }
 }
 

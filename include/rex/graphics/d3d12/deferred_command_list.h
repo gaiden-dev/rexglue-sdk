@@ -1,3 +1,4 @@
+#pragma once
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -9,8 +10,6 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#pragma once
-
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -19,21 +18,28 @@
 #include <rex/assert.h>
 #include <rex/literals.h>
 #include <rex/math.h>
+#include <rex/memory.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 
 namespace rex::graphics::d3d12 {
 
-using namespace ::rex::literals;
+using namespace rex::literals;
 
 class D3D12CommandProcessor;
 
 class DeferredCommandList {
  public:
+  static constexpr size_t MAX_SIZEOF_COMMANDLIST = 65536 * 128;  // around 8 mb
+  /*
+        chrispy: upped from 1_MiB to 4_MiB, m:durandal hits frequent resizes in
+     large open maps
+  */
   DeferredCommandList(const D3D12CommandProcessor& command_processor,
-                      size_t initial_size_bytes = 1_MiB);
+                      size_t initial_size_bytes = MAX_SIZEOF_COMMANDLIST);
 
   void Reset();
-  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1,
+               ID3D12GraphicsCommandList2* command_list_2);
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -167,33 +173,42 @@ class DeferredCommandList {
     args.start_instance_location = start_instance_location;
   }
 
-  void D3DBeginQuery(ID3D12QueryHeap* query_heap, D3D12_QUERY_TYPE type, UINT index) {
+  void D3DBeginQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
     auto& args = *reinterpret_cast<D3DQueryArguments*>(
         WriteCommand(Command::kD3DBeginQuery, sizeof(D3DQueryArguments)));
-    args.query_heap = query_heap;
-    args.type = type;
-    args.index = index;
+    args.query_heap = heap;
+    args.query_type = type;
+    args.query_index = index;
   }
 
-  void D3DEndQuery(ID3D12QueryHeap* query_heap, D3D12_QUERY_TYPE type, UINT index) {
+  void D3DEndQuery(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
     auto& args = *reinterpret_cast<D3DQueryArguments*>(
         WriteCommand(Command::kD3DEndQuery, sizeof(D3DQueryArguments)));
-    args.query_heap = query_heap;
-    args.type = type;
-    args.index = index;
+    args.query_heap = heap;
+    args.query_type = type;
+    args.query_index = index;
   }
 
-  void D3DResolveQueryData(ID3D12QueryHeap* query_heap, D3D12_QUERY_TYPE type, UINT start_index,
-                           UINT num_queries, ID3D12Resource* destination_buffer,
-                           UINT64 aligned_destination_buffer_offset) {
+  void D3DResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT start_index,
+                           UINT query_count, ID3D12Resource* destination_buffer,
+                           UINT64 destination_offset) {
     auto& args = *reinterpret_cast<D3DResolveQueryDataArguments*>(
         WriteCommand(Command::kD3DResolveQueryData, sizeof(D3DResolveQueryDataArguments)));
-    args.query_heap = query_heap;
-    args.type = type;
+    args.query_heap = heap;
+    args.query_type = type;
     args.start_index = start_index;
-    args.num_queries = num_queries;
+    args.query_count = query_count;
     args.destination_buffer = destination_buffer;
-    args.aligned_destination_buffer_offset = aligned_destination_buffer_offset;
+    args.destination_offset = destination_offset;
+  }
+
+  void D3DSetPredication(ID3D12Resource* buffer, UINT64 aligned_buffer_offset,
+                         D3D12_PREDICATION_OP operation) {
+    auto& args = *reinterpret_cast<D3DSetPredicationArguments*>(
+        WriteCommand(Command::kD3DSetPredication, sizeof(D3DSetPredicationArguments)));
+    args.buffer = buffer;
+    args.aligned_buffer_offset = aligned_buffer_offset;
+    args.operation = operation;
   }
 
   void D3DIASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) {
@@ -223,7 +238,7 @@ class DeferredCommandList {
     }
     static_assert(alignof(D3D12_VERTEX_BUFFER_VIEW) <= alignof(uintmax_t));
     const size_t header_size =
-        ::rex::align(sizeof(D3DIASetVertexBuffersHeader), alignof(D3D12_VERTEX_BUFFER_VIEW));
+        rex::align(sizeof(D3DIASetVertexBuffersHeader), alignof(D3D12_VERTEX_BUFFER_VIEW));
     auto args = reinterpret_cast<D3DIASetVertexBuffersHeader*>(
         WriteCommand(Command::kD3DIASetVertexBuffers,
                      header_size + num_views * sizeof(D3D12_VERTEX_BUFFER_VIEW)));
@@ -273,7 +288,7 @@ class DeferredCommandList {
       return;
     }
     static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));
-    const size_t header_size = ::rex::align(sizeof(UINT), alignof(D3D12_RESOURCE_BARRIER));
+    constexpr size_t header_size = rex::align(sizeof(UINT), alignof(D3D12_RESOURCE_BARRIER));
     uint8_t* args = reinterpret_cast<uint8_t*>(WriteCommand(
         Command::kD3DResourceBarrier, header_size + num_barriers * sizeof(D3D12_RESOURCE_BARRIER)));
     *reinterpret_cast<UINT*>(args) = num_barriers;
@@ -322,17 +337,16 @@ class DeferredCommandList {
 
   void D3DSetComputeRootConstantBufferView(UINT root_parameter_index,
                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(WriteCommand(
-        Command::kD3DSetComputeRootConstantBufferView, sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetComputeRootConstantBufferView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
 
   void D3DSetGraphicsRootConstantBufferView(UINT root_parameter_index,
                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetGraphicsRootConstantBufferView,
-                     sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetGraphicsRootConstantBufferView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
@@ -355,35 +369,16 @@ class DeferredCommandList {
 
   void D3DSetComputeRootShaderResourceView(UINT root_parameter_index,
                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(WriteCommand(
-        Command::kD3DSetComputeRootShaderResourceView, sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetComputeRootShaderResourceView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
 
   void D3DSetGraphicsRootShaderResourceView(UINT root_parameter_index,
                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetGraphicsRootShaderResourceView,
-                     sizeof(SetRootConstantBufferViewArguments)));
-    args.root_parameter_index = root_parameter_index;
-    args.buffer_location = buffer_location;
-  }
-
-  void D3DSetComputeRootUnorderedAccessView(UINT root_parameter_index,
-                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetComputeRootUnorderedAccessView,
-                     sizeof(SetRootConstantBufferViewArguments)));
-    args.root_parameter_index = root_parameter_index;
-    args.buffer_location = buffer_location;
-  }
-
-  void D3DSetGraphicsRootUnorderedAccessView(UINT root_parameter_index,
-                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetGraphicsRootUnorderedAccessView,
-                     sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetGraphicsRootShaderResourceView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
@@ -398,6 +393,22 @@ class DeferredCommandList {
     auto& arg = *reinterpret_cast<ID3D12RootSignature**>(
         WriteCommand(Command::kD3DSetGraphicsRootSignature, sizeof(ID3D12RootSignature*)));
     arg = root_signature;
+  }
+
+  void D3DSetComputeRootUnorderedAccessView(UINT root_parameter_index,
+                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetComputeRootUnorderedAccessView, sizeof(SetRootDescriptorArguments)));
+    args.root_parameter_index = root_parameter_index;
+    args.buffer_location = buffer_location;
+  }
+
+  void D3DSetGraphicsRootUnorderedAccessView(UINT root_parameter_index,
+                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetGraphicsRootUnorderedAccessView, sizeof(SetRootDescriptorArguments)));
+    args.root_parameter_index = root_parameter_index;
+    args.buffer_location = buffer_location;
   }
 
   void SetDescriptorHeaps(ID3D12DescriptorHeap* cbv_srv_uav_descriptor_heap,
@@ -431,6 +442,14 @@ class DeferredCommandList {
         std::min(num_samples_per_pixel * num_pixels, UINT(16)) * sizeof(D3D12_SAMPLE_POSITION));
   }
 
+  void D3DWriteBufferImmediate(D3D12_GPU_VIRTUAL_ADDRESS dest, UINT value) {
+    auto& args = *reinterpret_cast<D3DWriteBufferImmediateArguments*>(
+        WriteCommand(Command::kD3DWriteBufferImmediate, sizeof(D3DWriteBufferImmediateArguments)));
+    args.dest = dest;
+    args.value = value;
+  }
+
+  // ReXGlue: PIX / RenderDoc debug markers.
   void BeginDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
@@ -466,6 +485,7 @@ class DeferredCommandList {
     kD3DBeginQuery,
     kD3DEndQuery,
     kD3DResolveQueryData,
+    kD3DSetPredication,
     kD3DIASetIndexBuffer,
     kD3DIASetPrimitiveTopology,
     kD3DIASetVertexBuffers,
@@ -491,6 +511,7 @@ class DeferredCommandList {
     kD3DSetPipelineState,
     kSetPipelineStateHandle,
     kD3DSetSamplePositions,
+    kD3DWriteBufferImmediate,
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
@@ -579,17 +600,23 @@ class DeferredCommandList {
 
   struct D3DQueryArguments {
     ID3D12QueryHeap* query_heap;
-    D3D12_QUERY_TYPE type;
-    UINT index;
+    D3D12_QUERY_TYPE query_type;
+    UINT query_index;
   };
 
   struct D3DResolveQueryDataArguments {
     ID3D12QueryHeap* query_heap;
-    D3D12_QUERY_TYPE type;
+    D3D12_QUERY_TYPE query_type;
     UINT start_index;
-    UINT num_queries;
+    UINT query_count;
     ID3D12Resource* destination_buffer;
-    UINT64 aligned_destination_buffer_offset;
+    UINT64 destination_offset;
+  };
+
+  struct D3DSetPredicationArguments {
+    ID3D12Resource* buffer;
+    UINT64 aligned_buffer_offset;
+    D3D12_PREDICATION_OP operation;
   };
 
   struct D3DIASetVertexBuffersHeader {
@@ -612,7 +639,7 @@ class DeferredCommandList {
     UINT dest_offset_in_32bit_values;
   };
 
-  struct SetRootConstantBufferViewArguments {
+  struct SetRootDescriptorArguments {
     UINT root_parameter_index;
     D3D12_GPU_VIRTUAL_ADDRESS buffer_location;
   };
@@ -633,6 +660,11 @@ class DeferredCommandList {
     D3D12_SAMPLE_POSITION sample_positions[16];
   };
 
+  struct D3DWriteBufferImmediateArguments {
+    D3D12_GPU_VIRTUAL_ADDRESS dest;
+    UINT value;
+  };
+
   struct DebugMarkerHeader {
     uint32_t label_length;
     // Followed by null-terminated label string.
@@ -643,7 +675,8 @@ class DeferredCommandList {
   const D3D12CommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
-  std::vector<uintmax_t> command_stream_;
+  // std::vector<uintmax_t> command_stream_;
+  FixedVMemVector<MAX_SIZEOF_COMMANDLIST> command_stream_;
 };
 
 }  // namespace rex::graphics::d3d12

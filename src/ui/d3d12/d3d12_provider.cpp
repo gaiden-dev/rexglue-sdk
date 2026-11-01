@@ -17,6 +17,7 @@
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
+#include <rex/ui/d3d12/d3d12_util.h>
 
 #include <malloc.h>
 
@@ -46,6 +47,20 @@ bool D3D12Provider::IsD3D12APIAvailable() {
   }
   FreeLibrary(library_d3d12);
   return true;
+}
+
+const std::string& D3D12Provider::GetAdapterDescription() const {
+  return adapter_description_;
+}
+
+// Check for Intel Arc cards and Intel Graphics iGPUs which use
+// the same architecture.
+bool D3D12Provider::IsIntelArcGpu() const {
+  if (adapter_vendor_id_ != GpuVendorID::kIntel) {
+    return false;
+  }
+  return adapter_description_.starts_with("Intel(R) Arc(TM)") ||
+         adapter_description_.starts_with("Intel(R) Graphics");
 }
 
 std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
@@ -292,12 +307,15 @@ bool D3D12Provider::Initialize() {
     return false;
   }
   adapter_vendor_id_ = GpuVendorID(adapter_desc.VendorId);
+  adapter_device_id_ = adapter_desc.DeviceId;
+
   int adapter_name_mb_size =
       WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, nullptr, 0, nullptr, nullptr);
   if (adapter_name_mb_size != 0) {
     char* adapter_name_mb = reinterpret_cast<char*>(alloca(adapter_name_mb_size));
     if (WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name_mb,
                             adapter_name_mb_size, nullptr, nullptr) != 0) {
+      adapter_description_ = adapter_name_mb;
       REXGPU_INFO("DXGI adapter: {} (vendor 0x{:04X}, device 0x{:04X})", adapter_name_mb,
                   adapter_desc.VendorId, adapter_desc.DeviceId);
     }
@@ -435,6 +453,12 @@ bool D3D12Provider::Initialize() {
           device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS8, &options8, sizeof(options8)))) {
     unaligned_block_textures_supported_ = bool(options8.UnalignedBlockTexturesSupported);
   }
+  alpha_blend_factor_supported_ = false;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS13 options13 = {};
+  if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS13, &options13,
+                                            sizeof(options13)))) {
+    alpha_blend_factor_supported_ = bool(options13.AlphaBlendFactorSupported);
+  }
   virtual_address_bits_per_resource_ = 0;
   D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT virtual_address_support;
   if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT,
@@ -450,6 +474,7 @@ bool D3D12Provider::Initialize() {
       "* Pixel-shader-specified stencil reference: {}\n"
       "* Programmable sample positions: tier {}\n"
       "* Rasterizer-ordered views: {}\n"
+      "* Scalar alpha blend factor: {}\n"
       "* Resource binding: tier {}\n"
       "* Tiled resources: tier {}\n"
       "* Unaligned block-compressed textures: {}",
@@ -457,16 +482,31 @@ bool D3D12Provider::Initialize() {
       (heap_flag_create_not_zeroed_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) ? "yes" : "no",
       ps_specified_stencil_reference_supported_ ? "yes" : "no",
       uint32_t(programmable_sample_positions_tier_),
-      rasterizer_ordered_views_supported_ ? "yes" : "no", uint32_t(resource_binding_tier_),
+      rasterizer_ordered_views_supported_ ? "yes" : "no",
+      alpha_blend_factor_supported_ ? "yes" : "no", uint32_t(resource_binding_tier_),
       uint32_t(tiled_resources_tier_), unaligned_block_textures_supported_ ? "yes" : "no");
 
   // Get the graphics analysis interface, will silently fail if PIX is not
   // attached.
   pfn_dxgi_get_debug_interface1_(0, IID_PPV_ARGS(&graphics_analysis_));
-
   return true;
 }
+uint32_t D3D12Provider::CreateUploadResource(D3D12_HEAP_FLAGS HeapFlags,
+                                             _In_ const D3D12_RESOURCE_DESC* pDesc,
+                                             D3D12_RESOURCE_STATES InitialResourceState,
+                                             REFIID riidResource, void** ppvResource,
+                                             const D3D12_CLEAR_VALUE* pOptimizedClearValue) const {
+  auto device = GetDevice();
 
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload, HeapFlags,
+                                             pDesc, InitialResourceState, pOptimizedClearValue,
+                                             riidResource, ppvResource))) {
+    REXLOG_ERROR("Failed to create the gamma ramp upload buffer");
+    return UPLOAD_RESULT_CREATE_FAILED;
+  }
+
+  return UPLOAD_RESULT_CREATE_SUCCESS;
+}
 std::unique_ptr<Presenter> D3D12Provider::CreatePresenter(
     Presenter::HostGpuLossCallback host_gpu_loss_callback) {
   return D3D12Presenter::Create(host_gpu_loss_callback, *this);
@@ -474,6 +514,64 @@ std::unique_ptr<Presenter> D3D12Provider::CreatePresenter(
 
 std::unique_ptr<ImmediateDrawer> D3D12Provider::CreateImmediateDrawer() {
   return D3D12ImmediateDrawer::Create(*this);
+}
+
+void D3D12Provider::LogD3D12DebugMessages() const {
+  if (!device_) {
+    return;
+  }
+
+  ID3D12InfoQueue* info_queue = nullptr;
+  if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&info_queue)))) {
+    return;
+  }
+
+  UINT64 message_count = info_queue->GetNumStoredMessages();
+  for (UINT64 i = 0; i < message_count; ++i) {
+    SIZE_T message_size = 0;
+    if (FAILED(info_queue->GetMessage(i, nullptr, &message_size))) {
+      continue;
+    }
+
+    D3D12_MESSAGE* message = reinterpret_cast<D3D12_MESSAGE*>(alloca(message_size));
+    if (FAILED(info_queue->GetMessage(i, message, &message_size))) {
+      continue;
+    }
+
+    const char* severity_str = "INFO";
+    switch (message->Severity) {
+      case D3D12_MESSAGE_SEVERITY_CORRUPTION:
+        severity_str = "CORRUPTION";
+        break;
+      case D3D12_MESSAGE_SEVERITY_ERROR:
+        severity_str = "ERROR";
+        break;
+      case D3D12_MESSAGE_SEVERITY_WARNING:
+        severity_str = "WARNING";
+        break;
+      case D3D12_MESSAGE_SEVERITY_INFO:
+        severity_str = "INFO";
+        break;
+      case D3D12_MESSAGE_SEVERITY_MESSAGE:
+        severity_str = "MESSAGE";
+        break;
+    }
+
+    if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR ||
+        message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION) {
+      REXLOG_ERROR("D3D12 {}: [ID {}] {}", severity_str, static_cast<int>(message->ID),
+                   message->pDescription);
+    } else if (message->Severity == D3D12_MESSAGE_SEVERITY_WARNING) {
+      REXLOG_WARN("D3D12 {}: [ID {}] {}", severity_str, static_cast<int>(message->ID),
+                  message->pDescription);
+    } else {
+      REXLOG_INFO("D3D12 {}: [ID {}] {}", severity_str, static_cast<int>(message->ID),
+                  message->pDescription);
+    }
+  }
+
+  info_queue->ClearStoredMessages();
+  info_queue->Release();
 }
 
 }  // namespace rex::ui::d3d12

@@ -308,5 +308,74 @@ constexpr inline fourcc_t make_fourcc(const std::string_view fourcc) {
   return make_fourcc(fourcc[0], fourcc[1], fourcc[2], fourcc[3]);
 }
 
+// Bulk copy from a host GPU readback/upload mapping to guest physical memory
+// (xenia's SIMD non-temporal copy; a plain memcpy here).
+inline void vastcpy(uint8_t* REX_RESTRICT physaddr, uint8_t* REX_RESTRICT rdmapping,
+                    uint32_t written_length) {
+  std::memcpy(physaddr, rdmapping, written_length);
+}
+
+// Copies a compile-time-constant number of bytes; ported from xenia-canary.
+template <unsigned Size>
+inline void smallcpy_const(void* destination, const void* source) {
+#if REX_ARCH_AMD64 && REX_COMPILER_MSVC
+  if constexpr ((Size & 7) == 0) {
+    __movsq((unsigned long long*)destination, (const unsigned long long*)source, Size / 8);
+  } else if constexpr ((Size & 3) == 0) {
+    __movsd((unsigned long*)destination, (const unsigned long*)source, Size / 4);
+  } else {
+    __movsb((unsigned char*)destination, (const unsigned char*)source, Size);
+  }
+#else
+  std::memcpy(destination, source, Size);
+#endif
+}
+
 }  // namespace memory
+
+// Unqualified spellings used by code ported from xenia-canary.
+using memory::copy_and_swap;
+using memory::fourcc_t;
+using memory::load;
+using memory::load_and_swap;
+using memory::store;
+using memory::store_and_swap;
+
+// Byte vector backed by a fixed reservation of virtual memory (ported from
+// xenia-canary); resizing never reallocates or memsets.
+template <size_t sz>
+class FixedVMemVector {
+  static_assert((sz & 65535) == 0,
+                "Always give FixedVMemVector a size divisible by 65536 to avoid wasting memory "
+                "on Windows");
+
+  uint8_t* data_;
+  size_t nbytes_;
+
+ public:
+  FixedVMemVector()
+      : data_(reinterpret_cast<uint8_t*>(memory::AllocFixed(
+            nullptr, sz, memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite))),
+        nbytes_(0) {}
+  ~FixedVMemVector() {
+    if (data_) {
+      memory::DeallocFixed(data_, sz, memory::DeallocationType::kRelease);
+      data_ = nullptr;
+    }
+    nbytes_ = 0;
+  }
+
+  uint8_t* data() const { return data_; }
+  size_t size() const { return nbytes_; }
+
+  void resize(size_t newsize) {
+    nbytes_ = newsize;
+    assert_true(newsize < sz);
+  }
+  size_t alloc() const { return sz; }
+
+  void clear() { resize(0); }
+  void reserve(size_t size) { assert_true(size < sz); }
+};
+
 }  // namespace rex
