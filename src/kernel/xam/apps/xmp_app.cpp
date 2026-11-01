@@ -461,9 +461,10 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       return X_E_SUCCESS;
     }
     case 0x0007003D: {
-      // XMPCaptureOutput - not sure how this works :/
-      REXKRNL_DEBUG("XMPCaptureOutput(...)");
-      assert_always("XMP output not unimplemented");
+      // XMPCaptureOutput - registers a callback for mixed XMP audio
+      assert_true(!buffer_length || buffer_length == 16);
+      // We don't render XMP audio, so no need to capture
+      REXKRNL_WARN("XMPCaptureOutput unimplemented, ignoring");
       return X_E_FAIL;
     }
   }
