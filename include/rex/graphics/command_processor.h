@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -135,6 +136,9 @@ class CommandProcessor {
   virtual bool Initialize();
   virtual void Shutdown();
 
+  // Safe from any thread, even while the context is being torn down.
+  std::string GetTitleStateSuffix() const;
+
   void CallInThread(std::function<void()> fn);
 
   virtual void ClearCaches();
@@ -221,6 +225,8 @@ class CommandProcessor {
   void WorkerThreadMain();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
+  // Built once the context is set up, and kept until it shuts down.
+  virtual std::string MakeTitleStateSuffix() const { return {}; }
   // rarely needed, most register writes have no special logic here
   REX_NOINLINE
   void HandleSpecialRegisterWrite(uint32_t index, uint32_t value);
@@ -279,6 +285,35 @@ class CommandProcessor {
   // Used by strict ZPD to distinguish normal in flight latency from a
   // genuinely stuck report.
   virtual uint64_t GetCompletedSubmission() const { return 0; }
+
+  // At a fence, interrupt or wait for idle: the submission whose completion
+  // puts the export output ahead of it in guest RAM, or 0 once it is there,
+  // which may take a wait. See command_processor_memexport.inc.
+  virtual uint64_t TakeMemexportSignalSubmission() { return 0; }
+  // Ends a submission held-back signals wait for if it is still being
+  // recorded.
+  virtual void EndSubmissionForHeldSignals(uint64_t submission) {}
+  // Waits for a submission held-back signals wait for, ending it first if it is
+  // still being recorded.
+  virtual void AwaitSubmissionForHeldSignals(uint64_t submission) {}
+
+  // Fences and interrupts, which the guest takes as the GPU being past the
+  // commands before them. One is held back until export output ahead of it is
+  // in guest RAM. Later ones wait behind it so the guest sees them in order.
+  // value is in guest byte order. physical_address is where the fence lands,
+  // whichever view destination points through.
+  void WriteGuestFence(uint8_t* destination, uint32_t physical_address,
+                       uint32_t value);
+  void DispatchGuestInterrupt(uint32_t cpu_mask);
+  // Performs held-back signals whose submission has completed, awaiting any
+  // held for too long.
+  void PerformCompletedHeldSignals();
+  // Same, first ending the submission they wait for if it is still being
+  // recorded, for when something may be waiting for one.
+  void SubmitHeldSignals();
+  // Performs held-back signals up to the last one writing physical_address,
+  // waiting for the GPU so the command processor can read it.
+  void AwaitHeldSignalsWriting(uint32_t physical_address);
 
   virtual void OnPrimaryBufferEnd() {}
 
@@ -567,6 +602,26 @@ class CommandProcessor {
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* REX_RESTRICT register_file_ = nullptr;
 
+  struct HeldGuestSignal {
+    // Has to complete before this is performed
+    uint64_t submission = 0;
+    // Null for an interrupt
+    uint8_t* destination = nullptr;
+    uint32_t physical_address = UINT32_MAX;
+    // In guest byte order, or the CPU mask of an interrupt.
+    uint32_t value = 0;
+    std::chrono::steady_clock::time_point held_since;
+  };
+  std::deque<HeldGuestSignal> held_guest_signals_;
+  // The latest submission a held-back signal waits for.
+  uint64_t held_guest_signals_submission_ = 0;
+  void HoldOrPerformGuestSignal(const HeldGuestSignal& signal);
+  void PerformGuestSignal(const HeldGuestSignal& signal);
+  // Performs the first await_count held-back signals, waiting for the GPU, and
+  // any after them whose submission has completed or that were held for too
+  // long, awaiting those.
+  void PerformHeldSignals(size_t await_count);
+
   ReportHandle zpd_next_report_handle_ = 1;
   std::unordered_map<uint32_t, uint64_t> zpd_slot_sequences_;
   std::unordered_map<uint32_t, uint32_t> zpd_slot_values_;
@@ -654,9 +709,14 @@ class CommandProcessor {
   SwapPostEffect swap_post_effect_actual_ = SwapPostEffect::kNone;
 
  private:
+  void SetTitleStateSuffix(std::string suffix);
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+
+  mutable std::mutex title_state_suffix_mutex_;
+  std::string title_state_suffix_;
 
   REX_NOINLINE REX_COLD void LogKickoffInitator(uint32_t value);
 };

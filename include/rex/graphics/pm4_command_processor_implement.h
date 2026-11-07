@@ -598,14 +598,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(uint32_t packet, uint32_t c
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader_.ReadAndSwap<uint32_t>();
-  for (int n = 0; n < 6; n++) {
-    if (cpu_mask & (1 << n)) {
-      // ReXGlue: graphics_system_ may be null in tests.
-      if (graphics_system_) {
-        graphics_system_->DispatchInterruptCallback(1, n);
-      }
-    }
-  }
+
+  COMMAND_PROCESSOR::DispatchGuestInterrupt(cpu_mask);
   return true;
 }
 REX_NOINLINE
@@ -690,6 +684,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(uint32_t packet,
           : register_file_->values[is_extended_register ? 0 : poll_reg_addr];
 
   bool matched = false;
+  // Don't read what a held-back fence is yet to write there.
+  if (is_memory) {
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr & ~uint32_t(0x3));
+  }
 
   do {
     uint32_t value = is_extended_register ? COMMAND_PROCESSOR::ReadRegisterValue(poll_reg_addr)
@@ -706,6 +704,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(uint32_t packet,
     matched = MatchValueAndRef(value & mask, ref, wait_info);
 
     if (!matched) {
+      // The guest may be waiting for a held-back signal before it writes what
+      // this waits for. Checked again before waiting if any was performed.
+      if (!held_guest_signals_.empty()) {
+        size_t held_count = held_guest_signals_.size();
+        COMMAND_PROCESSOR::SubmitHeldSignals();
+        if (held_guest_signals_.size() != held_count) {
+            continue;
+        }
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -801,9 +808,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(uint32_t packet,
   uint32_t write_data = reader_.ReadAndSwap<uint32_t>();
   uint32_t value;
   if (wait_info & 0x10) {
-    // Memory.
+    // Memory, which a held-back fence may be yet to write.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    COMMAND_PROCESSOR::AwaitHeldSignalsWriting(poll_reg_addr);
     trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
     value = rex::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
@@ -871,6 +879,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(uint32_t packet,
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   uint8_t* write_destination = memory_->TranslatePhysical(address);
+  uint32_t write_physical_address = address;
   if (address > 0x1FFFFFFF) {
     uint32_t writeback_base = register_file_->values[XE_GPU_REG_WRITEBACK_START];
     uint32_t writeback_size = register_file_->values[XE_GPU_REG_WRITEBACK_SIZE];
@@ -879,9 +888,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(uint32_t packet,
     // the offset check
     if (writeback_base != 0 && writeback_offset < writeback_size) {
       write_destination = memory_->TranslateVirtual(0x7F000000 + writeback_offset);
+      // The same memory as this physical address.
+      write_physical_address = writeback_offset;
     }
   }
-  rex::store(write_destination, data_value);
+  // The guest treats this fence as "the GPU is done", export output ahead of it
+  // included.
+  COMMAND_PROCESSOR::WriteGuestFence(write_destination, write_physical_address,
+                                     data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
@@ -1455,7 +1469,17 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
   // prefetch the wraparound range
   // it likely is already in L3 cache, but in a zen system it may be another
   // chiplets l3
-  reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(GetCurrentRingReadCount());
+  uint32_t remaining = GetCurrentRingReadCount();
+  reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(remaining);
+
+  // The guest polls the read pointer write-back to see how much ring space it
+  // has, and hardware advances it as the ring drains. Publishing only once the
+  // burst ends leaves the guest waiting on work we have already done, so
+  // republish every RB_BLKSZ dwords on the way through. A zero stride means
+  // the guest never armed the write-back
+  const uint32_t writeback_stride =
+    read_ptr_update_freq_ * uint32_t(sizeof(uint32_t));
+  uint32_t remaining_at_writeback = remaining;
   do {
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       // This probably should be fatal - but we're going to continue anyways.
@@ -1463,7 +1487,27 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
       assert_always();
       break;
     }
-  } while (reader_.read_count());
+    remaining = GetCurrentRingReadCount();
+    // remaining only grows back if a malformed packet ran the read offset past
+    // the end of the burst, and then there is nothing honest to publish.
+    if (writeback_stride && remaining <= remaining_at_writeback &&
+        remaining_at_writeback - remaining >= writeback_stride) {
+        // Held-back signals the GPU is past go out at the same pace.
+        COMMAND_PROCESSOR::PerformCompletedHeldSignals();
+        // Re-read the target, the guest can re-point or disable the write-back
+        // from its own thread while we are draining.
+        uint32_t writeback_ptr = read_ptr_writeback_ptr_;
+        if (writeback_ptr) {
+            // Publishing the read pointer hands that ring space back, so it has to
+            // land after our reads of it.
+            std::atomic_thread_fence(std::memory_order_release);
+            rex::store_and_swap<uint32_t>(
+                memory_->TranslatePhysical(writeback_ptr),
+                uint32_t(reader_.read_offset() / sizeof(uint32_t)));
+        }
+        remaining_at_writeback = remaining;
+    }
+  } while (remaining);
 
   COMMAND_PROCESSOR::OnPrimaryBufferEnd();
 

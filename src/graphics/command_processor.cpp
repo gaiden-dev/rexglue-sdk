@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <fmt/format.h>
 
 #include <rex/chrono/clock.h>
@@ -318,11 +319,22 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
   CallInThread([this, swap_post_effect]() { swap_post_effect_actual_ = swap_post_effect; });
 }
 
+std::string CommandProcessor::GetTitleStateSuffix() const {
+    std::lock_guard<std::mutex> lock(title_state_suffix_mutex_);
+    return title_state_suffix_;
+}
+
+void CommandProcessor::SetTitleStateSuffix(std::string suffix) {
+    std::lock_guard<std::mutex> lock(title_state_suffix_mutex_);
+    title_state_suffix_ = std::move(suffix);
+}
+
 void CommandProcessor::WorkerThreadMain() {
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+  SetTitleStateSuffix(MakeTitleStateSuffix());
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -349,6 +361,8 @@ void CommandProcessor::WorkerThreadMain() {
           rex::thread::MaybeYield();
         }
         loop_count++;
+        // The guest may be spinning on a held-back signal
+        SubmitHeldSignals();
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -361,6 +375,7 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    PerformCompletedHeldSignals();
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -374,7 +389,10 @@ void CommandProcessor::WorkerThreadMain() {
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
   }
-
+  
+  SetTitleStateSuffix({});
+  // The guest they are for is going away.
+  held_guest_signals_.clear();
   ShutdownContext();
 }
 
@@ -524,6 +542,108 @@ void CommandProcessor::LogRegisterSets(uint32_t base_register_index, const uint3
     logging::internal::AppendLogLine(LogLevel::Debug, 'd', total_size);
   }
 #endif
+}
+
+void CommandProcessor::WriteGuestFence(uint8_t* destination,
+                                       uint32_t physical_address,
+                                       uint32_t value) {
+    HeldGuestSignal signal;
+    signal.destination = destination;
+    signal.physical_address = physical_address;
+    signal.value = value;
+    HoldOrPerformGuestSignal(signal);
+}
+
+void CommandProcessor::DispatchGuestInterrupt(uint32_t cpu_mask) {
+    HeldGuestSignal signal;
+    signal.value = cpu_mask;
+    HoldOrPerformGuestSignal(signal);
+}
+
+void CommandProcessor::HoldOrPerformGuestSignal(const HeldGuestSignal& signal) {
+    uint64_t submission = TakeMemexportSignalSubmission();
+    PerformCompletedHeldSignals();
+    if (held_guest_signals_.empty() && submission <= GetCompletedSubmission()) {
+        PerformGuestSignal(signal);
+        return;
+    }
+    HeldGuestSignal& held = held_guest_signals_.emplace_back(signal);
+    held.submission = submission;
+    held.held_since = std::chrono::steady_clock::now();
+    held_guest_signals_submission_ = 
+        std::max(held_guest_signals_submission_, submission);
+    // A trace records the write right after and has to see it.
+    if (trace_writer_.is_open()) {
+        PerformHeldSignals(held_guest_signals_.size());
+    }
+}
+
+void CommandProcessor::PerformGuestSignal(const HeldGuestSignal& signal) {
+    if (signal.destination) {
+        rex::store(signal.destination, signal.value);
+        return;
+    }
+    for (int n = 0; n < 6; n++) {
+        if (signal.value & (1 << n)) {
+            graphics_system_->DispatchInterruptCallback(1,n);
+        }
+    }
+}
+
+void CommandProcessor::PerformCompletedHeldSignals() {
+    if (!held_guest_signals_.empty()) {
+        PerformHeldSignals(0);
+    }
+}
+
+void CommandProcessor::SubmitHeldSignals() {
+    if (!held_guest_signals_.empty()) {
+        EndSubmissionForHeldSignals(held_guest_signals_submission_);
+        PerformHeldSignals(0);
+    }
+}
+
+void CommandProcessor::AwaitHeldSignalsWriting(uint32_t physical_address) {
+    size_t await_count = held_guest_signals_.size();
+    for (; await_count; --await_count) {
+        const HeldGuestSignal& signal = held_guest_signals_[await_count - 1];
+        // Masked as TranslatePhysical does.
+        if (signal.destination &&
+            !((signal.physical_address ^ physical_address) & 0x1FFFFFFF)) {
+            break;
+        }
+    }
+    PerformHeldSignals(await_count);
+}
+
+void CommandProcessor::PerformHeldSignals(size_t await_count) {
+    // A held-back signal is awaited after this long so a lost device that stops
+    // anything from completing doesn't leave the guest waiting for it forever.
+    constexpr auto kMaxHold = std::chrono::seconds(1);
+    while (!held_guest_signals_.empty()) {
+        const HeldGuestSignal& signal = held_guest_signals_.front();
+        if (signal.submission > GetCompletedSubmission()) {
+            PollCompletedSubmission();
+            if (signal.submission > GetCompletedSubmission()) {
+                if (!await_count && 
+                    std::chrono::steady_clock::now() - signal.held_since < kMaxHold) {
+                    return;
+                }
+                AwaitSubmissionForHeldSignals(signal.submission);
+                if (signal.submission > GetCompletedSubmission()) {
+                    REXLOG_ERROR(
+                        "A guest signal was held back for submission {}, which didn't "
+                        "complete",
+                        signal.submission);
+                }
+            }
+        }
+        PerformGuestSignal(signal);
+        held_guest_signals_.pop_front();
+        if (await_count) {
+            --await_count;
+        }
+    }
 }
 
 void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index, uint32_t value) {
