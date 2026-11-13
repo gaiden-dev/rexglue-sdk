@@ -483,9 +483,11 @@ kernel::X_HRESULT XMPApp::DispatchMessageSync(u32 message, u32 buffer_ptr, u32 b
       return kernel::X_E_SUCCESS;
     }
     case 0x0007003D: {
+      // XMPCaptureOutput - registers a callback for mixed XMP audio
       REXXAM_DEBUG("XMPCaptureOutput(...)");
-      REX_ASSERT_ALWAYS("XMP output unimplemented");
-      return kernel::X_E_FAIL;
+      // We don't register XMP audio, so no need to capture
+      REXXAM_WARN("XMP output unimplemented");
+      return kernel::X_E_SUCCESS;
     }
     default:
       break;
